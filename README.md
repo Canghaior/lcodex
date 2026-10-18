@@ -13,6 +13,7 @@
 - [P1 环境与本地通信结果](docs/validation/P1_ENVIRONMENT.md)：固定版本、运行命令、已通过检查与未验证范围。
 - [P1 直接 API 结果](docs/validation/P1_RESPONSES.md)：首个失败、两轮合成工具调用复测、用量与预算；不代表引擎兼容通过。
 - [P1 引擎文本链路](docs/validation/P1_ENGINE_TEXT.md)：本地模拟与实际 DeepSeek 文本请求、引擎状态回读，以及尚未验证的工具执行范围。
+- [P1 Windows 执行边界](docs/validation/P1_WINDOWS.md)：旧版限制、隔离新版本 MXC 样本及待解决问题。
 - [开发约定](AGENTS.md)：后续开发必须遵守的范围和工作流程。
 - [文件清理规则](docs/WORKSPACE_HYGIENE.md)：测试与临时数据的保留边界、磁盘检查和安全清理方式。
 

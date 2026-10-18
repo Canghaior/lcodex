@@ -190,6 +190,8 @@ Codex 的官方接入要求包括 Responses 协议、流式事件、连续对话
 
 候选配置为本地 app-server 的 stdio 连接，以及 DeepSeek 官方 `https://api.deepseek.com` 的 HTTP Responses 接口；模型 ID、完整配置和限额尚未选定。应用到引擎的本地连接与引擎到模型的 HTTP/SSE 连接分开验证。P1 使用独立应用配置目录，不改用户现有 Codex 账户与设置。
 
+执行记录更新：deepseek-flash 最小直接工具往返和 0.140.0 的受限文本链路已实测；其 unelevated 沙箱不能满足项目读取边界。现增加独立目录中的 0.162.0 + MXC 候选，CLI 的部分边界样本通过，仍需该版本的 app-server/模型和临时目录验证。具体证据见 [Windows 验证](validation/P1_WINDOWS.md)，不同版本的局部结果不能合并为 P1 通过。
+
 优先验证原生 Windows 的实际 shell 与有效沙箱，原生不达标才评估 WSL；切换 WSL 的安装、路径、运行时和使用成本按 D03 决定，不能静默降级为无沙箱。官方文档支持原生 Windows 路线，但具体能力依赖系统、版本和策略，不能作为本项目的测试结果。[Windows 沙箱](https://learn.chatgpt.com/docs/windows/windows-sandbox)
 
 ### 三类独立验证
