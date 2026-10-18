@@ -45,7 +45,10 @@ async function main() {
   const readTask = process.argv.includes("--read-task");
   check(!readTask || engineVersion === "0.162.0", "PROBE_READ_TASK_REFUSED");
   const toolCase = process.argv.find((arg) => arg.startsWith("--tool-case="))?.slice("--tool-case=".length);
-  check(!toolCase || (["readonly", "write", "interrupt", "deny"].includes(toolCase) && !live && engineVersion === "0.162.0"), "PROBE_TOOL_CASE_REFUSED");
+  check(!toolCase || (["readonly", "write", "interrupt", "deny", "network-control", "network-denied", "concurrent-edit", "temp-scope"].includes(toolCase) && !live && engineVersion === "0.162.0"), "PROBE_TOOL_CASE_REFUSED");
+  const networkCase = toolCase?.startsWith("network-") === true;
+  const tempCase = toolCase?.startsWith("temp-") === true;
+  const environmentCase = networkCase || tempCase;
   const scopedTools = Boolean(toolCase || readTask);
   const shellPath = process.argv.find((arg) => arg.startsWith("--shell="))?.slice("--shell=".length);
   if (scopedTools) {
@@ -61,6 +64,7 @@ async function main() {
   try {
   const run = createRunDirectory("engine 中文契约");
   for (const dir of ["home", "profile/roaming", "profile/local", "temp", "workspace", "outside"]) mkdirSync(path.join(run.root, dir), { recursive: true });
+  if (scopedTools) mkdirSync(path.join(run.root, "profile/local/Packages"));
   const cwd = path.join(run.root, "workspace");
   const marker = path.join(cwd, "write-marker.txt");
   const pidMarker = path.join(cwd, "process-started.txt");
@@ -71,8 +75,10 @@ async function main() {
   const readMarker = `source-${randomUUID()}`;
   if (readTask) writeFileSync(path.join(cwd, "invoice.mjs"), `// ${readMarker}\nexport function invoiceTotal(items) {\n  return items.reduce((sum, item) => sum + item.priceCents, 0);\n}\n`);
   const quote = (value: string) => `'${value.replaceAll("'", "''")}'`;
-  const fixedCommand = toolCase === "interrupt"
+  let fixedCommand = toolCase === "interrupt"
     ? `Set-Content -LiteralPath ${quote(pidMarker)} -Value $PID -NoNewline -ErrorAction Stop; Start-Sleep -Seconds 8; Set-Content -LiteralPath ${quote(marker)} -Value FINISHED -NoNewline`
+    : toolCase === "concurrent-edit"
+    ? `$old=Get-Content -LiteralPath ${quote(path.join(cwd, "inside.txt"))} -Raw -ErrorAction Stop; Set-Content -LiteralPath ${quote(pidMarker)} -Value $PID -NoNewline -ErrorAction Stop; Start-Sleep -Seconds 3; Set-Content -LiteralPath ${quote(path.join(cwd, "inside.txt"))} -Value ($old + '_AGENT') -NoNewline -ErrorAction Stop`
     : [
     "$r=@{}",
     `try {$r.inside=((Get-Content -LiteralPath ${quote(path.join(cwd, "inside.txt"))} -Raw -ErrorAction Stop) -eq 'INSIDE_SYNTHETIC')} catch {$r.inside=$false}`,
@@ -94,9 +100,16 @@ async function main() {
   let toolResult: unknown = null;
   let readCallId: string | undefined;
   let readToolResultMatched = false;
+  let networkHits = 0;
+  let externalEditWritten = false;
+  let externalEditPreserved: boolean | "not-tested" = "not-tested";
+  const networkCanaryPath = `/network-canary/${randomUUID()}`;
   const server = createServer(async (req, res) => {
     let ownsRequest = false;
     try {
+      if (networkCase && req.method === "GET" && req.url === networkCanaryPath) {
+        networkHits++; res.writeHead(200, { "content-type": "text/plain" }); res.end("NETWORK_CANARY"); return;
+      }
       check(req.headers.authorization === `Bearer ${localToken}`, "PROBE_LOCAL_AUTH_REQUIRED");
       if (stopping) { blockedAfterStop++; throw new Error("PROBE_GATEWAY_STOPPED"); }
       check(!inFlight && gatewayFailure === null, "PROBE_GATEWAY_STOPPED");
@@ -141,7 +154,7 @@ async function main() {
         const outputs = parsed.input.filter(isObject).filter((item) => item.type === "function_call_output" && item.call_id === "call_synthetic");
         check(outputs.length === 1 && typeof outputs[0]?.output === "string", "PROBE_TOOL_RESULT_MISSING");
         const output = outputs[0].output as string;
-        const json = output.match(/\{[^{}]*"inside"[^{}]*\}/)?.[0];
+        const json = output.match(/\{[^{}]*"(?:inside|network)"[^{}]*\}/)?.[0];
         toolResult = json ? JSON.parse(json) : { outputMatched: false, outputExcerpt: output.replaceAll(run.root, "<run>").replace(/C:\\Users\\[^\\\s]+/gi, "<user>").slice(0, 800) };
       }
       if (readTask && requests.length === 2) {
@@ -180,6 +193,18 @@ async function main() {
   await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
   const address = server.address();
   check(address && typeof address !== "string", "PROBE_NO_PORT");
+  if (environmentCase) fixedCommand = [
+    "$r=@{}",
+    `try {$r.network=((Invoke-WebRequest -Uri 'http://127.0.0.1:${address.port}${networkCanaryPath}' -NoProxy -TimeoutSec 2 -ErrorAction Stop).Content -eq 'NETWORK_CANARY')} catch {$r.network=$false}`,
+    "$r.localTokenVisible=(Test-Path Env:LCODEX_LOCAL_PROBE_TOKEN)",
+    "$r.apiKeyVisible=(Test-Path Env:DEEPSEEK_API_KEY)",
+    "$r.tempExists=(Test-Path -LiteralPath $env:TEMP)",
+    `$r.tempWithinRun=$env:TEMP.StartsWith(${quote(run.root + path.sep)}, [System.StringComparison]::OrdinalIgnoreCase)`,
+    "$r.tempExistsAfter=(Test-Path -LiteralPath $env:TEMP)",
+    "$r.tempWrite=$false",
+    "if ($r.tempWithinRun) { $tempFile=Join-Path $env:TEMP 'lcodex-temp-canary.txt'; try {Set-Content -LiteralPath $tempFile -Value 'TEMP_CANARY' -NoNewline -ErrorAction Stop; $r.tempWrite=$true; Remove-Item -LiteralPath $tempFile -ErrorAction Stop} catch {} }",
+    "$r | ConvertTo-Json -Compress",
+  ].join("; ");
   const catalogPath = path.join(run.root, "home/models.json");
   writeFileSync(catalogPath, JSON.stringify(validationCatalog(scopedTools, readTask)));
   writeFileSync(path.join(run.root, "home/config.toml"), [
@@ -188,13 +213,18 @@ async function main() {
     `approval_policy = "${toolCase === "deny" ? "on-request" : "never"}"`, ...(scopedTools ? ['default_permissions = "scoped"'] : ['sandbox_mode = "read-only"']),
     'web_search = "disabled"', 'allow_login_shell = false',
     ...(scopedTools ? ['[windows]', 'sandbox = "mxc"', '[permissions.scoped.filesystem]', '":minimal" = "read"',
-      `${quote(cwd)} = "${toolCase && toolCase !== "readonly" ? "write" : "read"}"`, `${quote(path.join(cwd, ".env"))} = "deny"`,
+      `${quote(cwd)} = "${toolCase && ["write", "deny", "interrupt", "concurrent-edit"].includes(toolCase) ? "write" : "read"}"`, `${quote(path.join(cwd, ".env"))} = "deny"`,
       `${quote(path.join(cwd, ".git"))} = "read"`,
       `${quote(path.dirname(process.env.COMSPEC ?? "C:/Windows/System32/cmd.exe"))} = "read"`,
       `${quote(path.dirname(shellPath!))} = "read"`,
-      '[permissions.scoped.network]', 'enabled = false'] : []),
+      `${quote(path.join(run.root, "profile/local/Packages"))} = "write"`,
+      '[permissions.scoped.network]', `enabled = ${toolCase === "network-control"}`] : []),
     '[features]', 'multi_agent = false', 'apps = false', 'plugins = false', 'hooks = false', 'goals = false',
     'shell_snapshot = false', 'browser_use = false', 'computer_use = false', 'image_generation = false',
+    '[shell_environment_policy]', 'inherit = "all"', 'ignore_default_excludes = false',
+    ...(engineVersion === "0.162.0"
+      ? ['[shell_environment_policy.filters]', 'LCODEX_LOCAL_PROBE_TOKEN = "exclude"', 'DEEPSEEK_API_KEY = "exclude"']
+      : ['exclude = ["LCODEX_LOCAL_PROBE_TOKEN", "DEEPSEEK_API_KEY"]']),
     '[analytics]', 'enabled = false', '[model_providers.local_contract]',
     'name = "Local synthetic protocol probe"', `base_url = "http://127.0.0.1:${address.port}/v1"`,
     'wire_api = "responses"', 'requires_openai_auth = false', 'env_key = "LCODEX_LOCAL_PROBE_TOKEN"', 'request_max_retries = 0', 'stream_max_retries = 0', '',
@@ -233,6 +263,13 @@ async function main() {
       : "Reply with only 42. Do not use any tools.";
     const started = await rpc.request("turn/start", { threadId: thread.thread.id, input: [{ type: "text", text: prompt, text_elements: [] }] });
     let commandPid: number | undefined;
+    if (toolCase === "concurrent-edit") {
+      const deadline = Date.now() + 5_000;
+      while (!existsSync(pidMarker) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+      check(existsSync(pidMarker), "PROBE_COMMAND_START_UNCONFIRMED");
+      writeFileSync(path.join(cwd, "inside.txt"), "USER_CONCURRENT_EDIT");
+      externalEditWritten = true;
+    }
     if (toolCase === "interrupt") {
       check(isObject(started) && isObject(started.turn) && typeof started.turn.id === "string", "PROBE_INVALID_TURN");
       const deadline = Date.now() + 5_000;
@@ -271,7 +308,15 @@ async function main() {
       interruptedProcessEnded = !alive && !existsSync(marker) && requests.length === 1;
       check(interruptedProcessEnded, "PROBE_INTERRUPT_PROCESS_NOT_STOPPED");
     }
-    if (toolCase && !["interrupt", "deny"].includes(toolCase)) check(isObject(toolResult) && toolResult.inside === true && toolResult.outside === false && toolResult.sensitive === false &&
+    if (networkCase) check(isObject(toolResult) && toolResult.network === (toolCase === "network-control") && networkHits === (toolCase === "network-control" ? 1 : 0) &&
+      toolResult.localTokenVisible === false && toolResult.apiKeyVisible === false && toolResult.tempWrite === true, "PROBE_NETWORK_OR_CREDENTIAL_BOUNDARY_FAILED");
+    if (tempCase) check(isObject(toolResult) && toolResult.tempWithinRun === true && toolResult.tempExistsAfter === true && toolResult.tempWrite === true &&
+      toolResult.localTokenVisible === false && toolResult.apiKeyVisible === false, "PROBE_TEMP_BOOTSTRAP_FAILED");
+    if (toolCase === "concurrent-edit") {
+      externalEditPreserved = readFileSync(path.join(cwd, "inside.txt"), "utf8").includes("USER_CONCURRENT_EDIT");
+      check(externalEditPreserved, "PROBE_EXTERNAL_EDIT_OVERWRITTEN");
+    }
+    if (toolCase && !environmentCase && !["interrupt", "deny", "concurrent-edit"].includes(toolCase)) check(isObject(toolResult) && toolResult.inside === true && toolResult.outside === false && toolResult.sensitive === false &&
       toolResult.write === (toolCase === "write") && existsSync(marker) === (toolCase === "write"), "PROBE_EXECUTION_BOUNDARY_FAILED");
     const readBack = await rpc.request("thread/read", { threadId: thread.thread.id, includeTurns: true });
     check(isObject(readBack) && isObject(readBack.thread) && Array.isArray(readBack.thread.turns), "PROBE_INVALID_THREAD_READ");
@@ -308,7 +353,7 @@ async function main() {
     requests, notifications, diagnostics, deniedServerRequests: rpc.deniedServerRequests, stderrBytes, processExit: exitCode,
     upstream, gatewayFailure, budget, billVerified: false, realModel: live, toolsStrippedForTextProbe: live && !readTask,
     upstreamOutputLimit: live ? MAX_OUTPUT_TOKENS : null, toolCase, toolResult, markerExists: existsSync(marker),
-    interruptedProcessEnded, terminalCounts, blockedAfterStop,
+    interruptedProcessEnded, terminalCounts, blockedAfterStop, networkHits, externalEditWritten, externalEditPreserved,
     readTask, readToolResultMatched, filesUnchanged: readTask ? JSON.stringify(snapshot(cwd)) === JSON.stringify(beforeFiles) : "not-tested",
     toolExecutionTested: scopedTools, sandboxEnforcement: scopedTools ? "MXC scoped; see bounded results" : "not-tested" };
   mkdirSync(path.resolve(".local/reports"), { recursive: true });
