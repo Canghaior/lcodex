@@ -1,6 +1,7 @@
 import { isObject } from "./rpc.js";
 
 export class ResponsesStream {
+  constructor(private onEvent?: (event: Record<string, unknown>) => void) {}
   private buffer = "";
   private lastSequence = -1;
   private totalBytes = 0;
@@ -28,6 +29,7 @@ export class ResponsesStream {
       if (eventName && eventName !== event.type) throw new Error("SSE_TYPE_MISMATCH");
       this.lastSequence = Number(event.sequence_number);
       this.events++;
+      this.onEvent?.(event);
       if (["response.completed", "response.incomplete", "response.failed"].includes(event.type)) {
         if (!isObject(event.response)) throw new Error("SSE_INVALID_TERMINAL");
         if (event.response.status !== event.type.slice("response.".length)) throw new Error("SSE_STATUS_MISMATCH");

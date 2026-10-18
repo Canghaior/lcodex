@@ -20,8 +20,7 @@ export async function requestDeepSeek(
     stream: true, max_output_tokens: MAX_OUTPUT_TOKENS, reasoning: { effort: "none" }, store: false }, fetchImpl);
 }
 
-// The engine text probe preserves the engine's instructions/history, but explicitly
-// disables tools and sets output limits before this shared, budgeted HTTP entry.
+// Callers constrain tools and set output limits before this shared, budgeted HTTP entry.
 export async function sendBoundedDeepSeek(ledger: BudgetLedger, trial: string, apiKey: string,
   request: Record<string, unknown>, fetchImpl: typeof fetch = fetch) {
   if (!/^sk-[A-Za-z0-9_-]{16,200}$/.test(apiKey)) throw new Error("API_INVALID_KEY_FORMAT");
