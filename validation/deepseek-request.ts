@@ -25,7 +25,8 @@ export async function sendBoundedDeepSeek(ledger: BudgetLedger, trial: string, a
   request: Record<string, unknown>, fetchImpl: typeof fetch = fetch, externalSignal?: AbortSignal) {
   if (!/^sk-[A-Za-z0-9_-]{16,200}$/.test(apiKey)) throw new Error("API_INVALID_KEY_FORMAT");
   if (request.model !== "deepseek-flash" || request.stream !== true || request.store !== false ||
-    request.max_output_tokens !== MAX_OUTPUT_TOKENS || request.previous_response_id || request.background || request.conversation) throw new Error("API_REQUEST_BOUNDS_REQUIRED");
+    !Number.isSafeInteger(request.max_output_tokens) || Number(request.max_output_tokens) <= 0 || Number(request.max_output_tokens) > MAX_OUTPUT_TOKENS ||
+    request.previous_response_id || request.background || request.conversation) throw new Error("API_REQUEST_BOUNDS_REQUIRED");
   if (!Array.isArray(request.input) || !Array.isArray(request.tools)) throw new Error("API_INVALID_REQUEST");
   const input: unknown[] = request.input;
   const tools: unknown[] = request.tools;
@@ -81,7 +82,7 @@ export async function sendBoundedDeepSeek(ledger: BudgetLedger, trial: string, a
     const estimatedMicros = inputTokens * 2 + outputTokens * 8;
     if (!Number.isSafeInteger(estimatedMicros)) throw new Error("API_USAGE_INVALID");
     ledger.settle(id, estimatedMicros);
-    if (inputTokens > 100_000 || outputTokens > MAX_OUTPUT_TOKENS || estimatedMicros > REQUEST_RESERVATION_MICROS) throw new Error("API_BOUNDS_VIOLATED");
+    if (inputTokens > 100_000 || outputTokens > Number(request.max_output_tokens) || estimatedMicros > REQUEST_RESERVATION_MICROS) throw new Error("API_BOUNDS_VIOLATED");
     return { ...parsed, wire, usage: { inputTokens, outputTokens, estimatedMicros }, requestedModel: "deepseek-flash" };
   } catch (error) {
     // Network/HTTP failure or missing usage leaves its reservation pending. No automatic retry.

@@ -124,7 +124,7 @@ test("engine entry requires bounded stateless requests and preserves supplied in
     return new Response(frame("response.completed", 0, terminal), { headers: { "content-type": "text/event-stream" } });
   };
   try {
-    for (const changed of [{ max_output_tokens: undefined }, { previous_response_id: "previous" }, { background: true }, { model: "unknown" }]) {
+    for (const changed of [{ max_output_tokens: undefined }, { max_output_tokens: 0 }, { max_output_tokens: 1025 }, { max_output_tokens: 1.5 }, { previous_response_id: "previous" }, { background: true }, { model: "unknown" }]) {
       await assert.rejects(sendBoundedDeepSeek(ledger, "engine-test", fakeKey, { ...body, ...changed }, fakeFetch), /REQUEST_BOUNDS_REQUIRED/);
     }
     assert.equal(ledger.summary().requests, 0);

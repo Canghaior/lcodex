@@ -14,6 +14,7 @@ import { checkDiagnosis, checkResponseWire, READ_COMMAND } from "./readonly-cont
 import { snapshot } from "./fixtures.js";
 import { evaluateInvoiceSource, INVOICE_BASELINE, previewInvoicePatch } from "./patch-contract.js";
 import { checkRestart } from "./resume-check.js";
+import { mapDeepSeekRoles } from "./deepseek-roles.js";
 
 const expectedSha = "03e5cf467f4ef2c06360b00cdc9aef64bb79b2028e25e3e122dd0bd2152ace22";
 const candidateSha = "dce685d569526ef4712fa82d20ff20e1309baad5fcd34215e1126698f611242f";
@@ -206,13 +207,15 @@ async function main() {
         const tools = (readTask || editTask) && requests.length === 1 && Array.isArray(parsed.tools)
           ? parsed.tools.filter(isObject).filter((tool) => editTask ? tool.type === "custom" && tool.name === "apply_patch" : tool.type === "function" && tool.name === "exec_command") : [];
         check(!(readTask || editTask) || requests.length !== 1 || tools.length === 1, "PROBE_SHELL_TOOL_MISSING");
-        activeUpstream = sendBoundedDeepSeek(ledger, editTask ? "engine-edit-v1" : (readTask ? "engine-read-v1" : "engine-text-v1"), key, {
+        const adapted = mapDeepSeekRoles({
           ...parsed, max_output_tokens: MAX_OUTPUT_TOKENS, reasoning: { effort: "none" }, tools,
           tool_choice: tools.length ? "auto" : "none", parallel_tool_calls: false, store: false,
-        }, fetch, upstreamAbort.signal);
+        });
+        activeUpstream = sendBoundedDeepSeek(ledger, editTask ? "engine-edit-v1" : (readTask ? "engine-read-v1" : "engine-text-v1"), key, adapted, fetch, upstreamAbort.signal);
         const response = await activeUpstream;
         activeUpstream = undefined;
-        upstream.push({ terminalType: response.terminalType, events: response.events, usage: response.usage, returnedModel: response.response.model });
+        upstream.push({ terminalType: response.terminalType, events: response.events, usage: response.usage, returnedModel: response.response.model,
+          roles: (adapted.input as Record<string, unknown>[]).map((item) => item.role ?? item.type) });
         check(response.terminalType === "response.completed", "PROBE_TOOL_OUTPUT_REFUSED");
         const call = checkResponseWire(response.wire, response.response, readTask && requests.length === 1 ? { cwd, shell: shellPath! } : undefined,
           editTask && requests.length === 1 ? (input) => { expectedCandidate = previewInvoicePatch(input); } : undefined);
