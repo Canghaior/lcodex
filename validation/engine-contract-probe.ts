@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import path from "node:path";
 import { isolatedEnvironment } from "./isolated-env.js";
@@ -12,6 +12,7 @@ import { BudgetLedger } from "./budget.js";
 import { MAX_OUTPUT_TOKENS, PRICE_REVIEW_DATE, sendBoundedDeepSeek } from "./deepseek-request.js";
 
 const expectedSha = "03e5cf467f4ef2c06360b00cdc9aef64bb79b2028e25e3e122dd0bd2152ace22";
+const candidateSha = "dce685d569526ef4712fa82d20ff20e1309baad5fcd34215e1126698f611242f";
 function check(value: unknown, code: string): asserts value { if (!value) throw new Error(code); }
 
 export function syntheticTextStream(text: string): string {
@@ -35,8 +36,17 @@ export function syntheticTextStream(text: string): string {
 async function main() {
   const binary = process.argv[2];
   check(binary && path.isAbsolute(binary), "PROBE_BINARY_REQUIRED");
-  check(createHash("sha256").update(readFileSync(binary)).digest("hex") === expectedSha, "PROBE_BINARY_MISMATCH");
+  const binarySha = createHash("sha256").update(readFileSync(binary)).digest("hex");
+  check([expectedSha, candidateSha].includes(binarySha), "PROBE_BINARY_MISMATCH");
+  const engineVersion = binarySha === candidateSha ? "0.162.0" : "0.140.0";
   const live = process.argv.includes("--live");
+  const toolCase = process.argv.find((arg) => arg.startsWith("--tool-case="))?.slice("--tool-case=".length);
+  check(!toolCase || (["readonly", "write", "interrupt", "deny"].includes(toolCase) && !live && engineVersion === "0.162.0"), "PROBE_TOOL_CASE_REFUSED");
+  const shellPath = process.argv.find((arg) => arg.startsWith("--shell="))?.slice("--shell=".length);
+  if (toolCase) {
+    check(shellPath && path.isAbsolute(shellPath), "PROBE_SHELL_PATH_REQUIRED");
+    check(createHash("sha256").update(readFileSync(shellPath)).digest("hex") === "362a356ce7f0940ec74f73a8fc2c990a2cc24a38a11c90bbd8eca947110ad139", "PROBE_SHELL_HASH_MISMATCH");
+  }
   if (live) {
     const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
     check(today === PRICE_REVIEW_DATE && process.argv.includes(`--price-reviewed=${PRICE_REVIEW_DATE}`), "PROBE_PRICE_REVIEW_REQUIRED");
@@ -45,8 +55,25 @@ async function main() {
   const ledger = live ? new BudgetLedger(path.resolve(".local/state/p1-budget.jsonl")) : undefined;
   try {
   const run = createRunDirectory("engine 中文契约");
-  for (const dir of ["home", "profile/roaming", "profile/local", "temp", "workspace"]) mkdirSync(path.join(run.root, dir), { recursive: true });
+  for (const dir of ["home", "profile/roaming", "profile/local", "temp", "workspace", "outside"]) mkdirSync(path.join(run.root, dir), { recursive: true });
   const cwd = path.join(run.root, "workspace");
+  const marker = path.join(cwd, "write-marker.txt");
+  const pidMarker = path.join(cwd, "process-started.txt");
+  const outside = path.join(run.root, "outside/sentinel.txt");
+  writeFileSync(path.join(cwd, "inside.txt"), "INSIDE_SYNTHETIC");
+  writeFileSync(path.join(cwd, ".env"), "ENV_SYNTHETIC");
+  writeFileSync(outside, "OUTSIDE_SYNTHETIC");
+  const quote = (value: string) => `'${value.replaceAll("'", "''")}'`;
+  const fixedCommand = toolCase === "interrupt"
+    ? `Set-Content -LiteralPath ${quote(pidMarker)} -Value $PID -NoNewline -ErrorAction Stop; Start-Sleep -Seconds 8; Set-Content -LiteralPath ${quote(marker)} -Value FINISHED -NoNewline`
+    : [
+    "$r=@{}",
+    `try {$r.inside=((Get-Content -LiteralPath ${quote(path.join(cwd, "inside.txt"))} -Raw -ErrorAction Stop) -eq 'INSIDE_SYNTHETIC')} catch {$r.inside=$false}`,
+    `try {$r.outside=((Get-Content -LiteralPath ${quote(outside)} -Raw -ErrorAction Stop) -eq 'OUTSIDE_SYNTHETIC')} catch {$r.outside=$false}`,
+    `try {$r.sensitive=((Get-Content -LiteralPath ${quote(path.join(cwd, ".env"))} -Raw -ErrorAction Stop) -eq 'ENV_SYNTHETIC')} catch {$r.sensitive=$false}`,
+    `try {Set-Content -LiteralPath ${quote(marker)} -Value 'MARKER' -NoNewline -ErrorAction Stop; $r.write=$true} catch {$r.write=$false}`,
+    "$r | ConvertTo-Json -Compress",
+  ].join("; ");
   const localToken = randomUUID();
   const env = { ...isolatedEnvironment(run.root, process.env), GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "NUL", LCODEX_LOCAL_PROBE_TOKEN: localToken };
   check(spawnSync("git", ["init", "--quiet", cwd], { env, windowsHide: true, timeout: 10_000 }).status === 0, "PROBE_GIT_INIT_FAILED");
@@ -54,10 +81,14 @@ async function main() {
   const upstream: Record<string, unknown>[] = [];
   let gatewayFailure: string | null = null;
   let inFlight = false;
+  let stopping = false;
+  let blockedAfterStop = 0;
+  let toolResult: unknown = null;
   const server = createServer(async (req, res) => {
     let ownsRequest = false;
     try {
       check(req.headers.authorization === `Bearer ${localToken}`, "PROBE_LOCAL_AUTH_REQUIRED");
+      if (stopping) { blockedAfterStop++; throw new Error("PROBE_GATEWAY_STOPPED"); }
       check(!inFlight && gatewayFailure === null, "PROBE_GATEWAY_STOPPED");
       inFlight = true;
       ownsRequest = true;
@@ -75,8 +106,33 @@ async function main() {
         ancestorInstructionsDetected: body.includes("本项目开发接入 DeepSeek"),
         developerMarkerPresent: body.includes("SYNTHETIC_DEVELOPER_MARKER"),
       });
-      check(requests.length <= 1, "PROBE_UNEXPECTED_RETRY");
+      check(requests.length <= (toolCase ? 2 : 1), "PROBE_UNEXPECTED_RETRY");
       let wire = syntheticTextStream("42");
+      if (toolCase && requests.length === 1) {
+        check(Array.isArray(parsed.tools), "PROBE_SHELL_TOOL_MISSING");
+        const shellTool = parsed.tools.filter(isObject).find((tool) => ["shell_command", "exec_command"].includes(String(tool.name)));
+        check(shellTool, "PROBE_SHELL_TOOL_MISSING");
+        const args = shellTool.name === "exec_command"
+          ? { cmd: fixedCommand, workdir: cwd, yield_time_ms: 10_000, max_output_tokens: 2048, login: false, shell: shellPath,
+            ...(toolCase === "deny" ? { sandbox_permissions: "require_escalated", justification: "Synthetic validation request; the client will decline it." } : {}) }
+          : { command: fixedCommand, workdir: cwd, timeout_ms: 10_000, login: false };
+        const item = { id: "fc_synthetic", call_id: "call_synthetic", type: "function_call", name: shellTool.name,
+          arguments: JSON.stringify(args), status: "completed" };
+        const events = [
+          { type: "response.created", response: { id: "resp_tool", status: "in_progress", output: [] } },
+          { type: "response.output_item.added", output_index: 0, item },
+          { type: "response.output_item.done", output_index: 0, item },
+          { type: "response.completed", response: { id: "resp_tool", status: "completed", output: [item], usage: { input_tokens: 10, output_tokens: 10, total_tokens: 20 } } },
+        ];
+        wire = events.map((event, sequence_number) => `event: ${event.type}\ndata: ${JSON.stringify({ ...event, sequence_number })}\n\n`).join("");
+      } else if (toolCase) {
+        check(Array.isArray(parsed.input), "PROBE_NO_TOOL_HISTORY");
+        const outputs = parsed.input.filter(isObject).filter((item) => item.type === "function_call_output" && item.call_id === "call_synthetic");
+        check(outputs.length === 1 && typeof outputs[0]?.output === "string", "PROBE_TOOL_RESULT_MISSING");
+        const output = outputs[0].output as string;
+        const json = output.match(/\{[^{}]*"inside"[^{}]*\}/)?.[0];
+        toolResult = json ? JSON.parse(json) : { outputMatched: false, outputExcerpt: output.replaceAll(run.root, "<run>").replace(/C:\\Users\\[^\\\s]+/gi, "<user>").slice(0, 800) };
+      }
       if (live && ledger) {
         check(!body.includes("本项目开发接入 DeepSeek"), "PROBE_ANCESTOR_INSTRUCTIONS");
         const response = await sendBoundedDeepSeek(ledger, "engine-text-v1", key, {
@@ -99,11 +155,18 @@ async function main() {
   const address = server.address();
   check(address && typeof address !== "string", "PROBE_NO_PORT");
   const catalogPath = path.join(run.root, "home/models.json");
-  writeFileSync(catalogPath, JSON.stringify(validationCatalog()));
+  writeFileSync(catalogPath, JSON.stringify(validationCatalog(Boolean(toolCase))));
   writeFileSync(path.join(run.root, "home/config.toml"), [
     'model = "deepseek-flash"', 'model_provider = "local_contract"', 'model_reasoning_effort = "none"',
     `model_catalog_json = '${catalogPath}'`,
-    'approval_policy = "never"', 'sandbox_mode = "read-only"', 'web_search = "disabled"',
+    `approval_policy = "${toolCase === "deny" ? "on-request" : "never"}"`, ...(toolCase ? ['default_permissions = "scoped"'] : ['sandbox_mode = "read-only"']),
+    'web_search = "disabled"', 'allow_login_shell = false',
+    ...(toolCase ? ['[windows]', 'sandbox = "mxc"', '[permissions.scoped.filesystem]', '":minimal" = "read"',
+      `${quote(cwd)} = "${toolCase !== "readonly" ? "write" : "read"}"`, `${quote(path.join(cwd, ".env"))} = "deny"`,
+      `${quote(path.join(cwd, ".git"))} = "read"`,
+      `${quote(path.dirname(process.env.COMSPEC ?? "C:/Windows/System32/cmd.exe"))} = "read"`,
+      `${quote(path.dirname(shellPath!))} = "read"`,
+      '[permissions.scoped.network]', 'enabled = false'] : []),
     '[features]', 'multi_agent = false', 'apps = false', 'plugins = false', 'hooks = false', 'goals = false',
     'shell_snapshot = false', 'browser_use = false', 'computer_use = false', 'image_generation = false',
     '[analytics]', 'enabled = false', '[model_providers.local_contract]',
@@ -126,28 +189,67 @@ async function main() {
         message: typeof error.message === "string" ? error.message.replaceAll(run.root, "<run>").replaceAll(localToken, "<local-token>").replace(/sk-[A-Za-z0-9_-]+/g, "<redacted>").slice(0, 1500) : null });
     }
     if (method === "turn/completed") complete(params);
-  });
+  }, toolCase === "deny");
   child.on("error", () => rpc.abort(new Error("PROBE_SPAWN_FAILED")));
   let exitCode: number | null | undefined;
   let timer: NodeJS.Timeout | undefined;
   let result: Record<string, unknown> = { status: "failed" };
+  let interruptedProcessEnded: unknown = "not-tested";
+  let terminalCounts: unknown = null;
   try {
-    await rpc.request("initialize", { clientInfo: { name: "lcodex_contract", version: "0.0.1" }, capabilities: { experimentalApi: false } });
+    await rpc.request("initialize", { clientInfo: { name: "lcodex_contract", version: "0.0.1" }, capabilities: { experimentalApi: toolCase === "interrupt" } });
     rpc.notify("initialized", {});
-    const thread = await rpc.request("thread/start", { cwd, ephemeral: false, sandbox: "read-only", approvalPolicy: "never",
+    const thread = await rpc.request("thread/start", { cwd, ephemeral: false, ...(!toolCase ? { sandbox: "read-only" } : {}), approvalPolicy: toolCase === "deny" ? "on-request" : "never", approvalsReviewer: "user",
       developerInstructions: "SYNTHETIC_DEVELOPER_MARKER. This probe requires only a plain text answer; do not use tools." });
     check(isObject(thread) && isObject(thread.thread) && typeof thread.thread.id === "string", "PROBE_INVALID_THREAD");
-    await rpc.request("turn/start", { threadId: thread.thread.id, input: [{ type: "text", text: "Reply with only 42. Do not use any tools.", text_elements: [] }] });
+    const started = await rpc.request("turn/start", { threadId: thread.thread.id, input: [{ type: "text", text: "Reply with only 42. Do not use any tools.", text_elements: [] }] });
+    let commandPid: number | undefined;
+    if (toolCase === "interrupt") {
+      check(isObject(started) && isObject(started.turn) && typeof started.turn.id === "string", "PROBE_INVALID_TURN");
+      const deadline = Date.now() + 5_000;
+      while (!existsSync(pidMarker) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+      check(existsSync(pidMarker), "PROBE_COMMAND_START_UNCONFIRMED");
+      commandPid = Number(readFileSync(pidMarker, "utf8").replace(/^\uFEFF/, "").trim());
+      check(Number.isSafeInteger(commandPid) && commandPid > 0, "PROBE_INVALID_COMMAND_PID");
+      const beforeStop = await rpc.request("thread/backgroundTerminals/list", { threadId: thread.thread.id });
+      check(isObject(beforeStop) && Array.isArray(beforeStop.data), "PROBE_INVALID_TERMINAL_LIST");
+      stopping = true;
+      await rpc.request("turn/interrupt", { threadId: thread.thread.id, turnId: started.turn.id });
+      await rpc.request("thread/backgroundTerminals/clean", { threadId: thread.thread.id });
+      let afterStop = await rpc.request("thread/backgroundTerminals/list", { threadId: thread.thread.id });
+      const cleanupDeadline = Date.now() + 2_000;
+      while (isObject(afterStop) && Array.isArray(afterStop.data) && afterStop.data.length > 0 && Date.now() < cleanupDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        afterStop = await rpc.request("thread/backgroundTerminals/list", { threadId: thread.thread.id });
+      }
+      terminalCounts = { before: beforeStop.data.length, after: isObject(afterStop) && Array.isArray(afterStop.data) ? afterStop.data.length : "invalid" };
+      check(isObject(afterStop) && Array.isArray(afterStop.data) && afterStop.data.length === 0, "PROBE_TERMINALS_STILL_RUNNING");
+    }
     const terminal = await Promise.race([completed, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("PROBE_TURN_TIMEOUT")), live ? 70_000 : 30_000); })]);
     check(isObject(terminal) && isObject(terminal.turn), "PROBE_INVALID_TERMINAL");
-    check(terminal.turn.status === "completed", "PROBE_TURN_FAILED");
-    check(requests.length === 1 && rpc.deniedServerRequests === 0, "PROBE_UNEXPECTED_OPERATIONS");
+    const expectedStatus = toolCase === "interrupt" ? "interrupted" : "completed";
+    check(terminal.turn.status === expectedStatus, "PROBE_TURN_FAILED");
+    check(requests.length === (toolCase && toolCase !== "interrupt" ? 2 : 1) && rpc.deniedServerRequests === (toolCase === "deny" ? 1 : 0), "PROBE_UNEXPECTED_OPERATIONS");
+    if (toolCase === "deny") check(!existsSync(marker), "PROBE_DECLINED_COMMAND_EXECUTED");
+    if (commandPid) {
+      let alive = true;
+      const stoppedDeadline = Date.now() + 2_000;
+      do {
+        try { process.kill(commandPid, 0); } catch (error) { alive = (error as NodeJS.ErrnoException).code !== "ESRCH"; }
+        if (alive) await new Promise((resolve) => setTimeout(resolve, 50));
+      } while (alive && Date.now() < stoppedDeadline);
+      await new Promise((resolve) => setTimeout(resolve, 8_500));
+      interruptedProcessEnded = !alive && !existsSync(marker) && requests.length === 1;
+      check(interruptedProcessEnded, "PROBE_INTERRUPT_PROCESS_NOT_STOPPED");
+    }
+    if (toolCase && !["interrupt", "deny"].includes(toolCase)) check(isObject(toolResult) && toolResult.inside === true && toolResult.outside === false && toolResult.sensitive === false &&
+      toolResult.write === (toolCase === "write") && existsSync(marker) === (toolCase === "write"), "PROBE_EXECUTION_BOUNDARY_FAILED");
     const readBack = await rpc.request("thread/read", { threadId: thread.thread.id, includeTurns: true });
     check(isObject(readBack) && isObject(readBack.thread) && Array.isArray(readBack.thread.turns), "PROBE_INVALID_THREAD_READ");
     const lastTurn = readBack.thread.turns.at(-1);
-    check(isObject(lastTurn) && lastTurn.status === "completed", "PROBE_READ_STATUS_MISMATCH");
-    check(Array.isArray(lastTurn.items) && lastTurn.items.some((item) => isObject(item) && item.type === "agentMessage" && item.text === "42"), "PROBE_READ_TEXT_MISMATCH");
-    result = { status: "passed", turnStatus: terminal.turn.status, readBack: "completed-and-text-matched" };
+    check(isObject(lastTurn) && lastTurn.status === expectedStatus, "PROBE_READ_STATUS_MISMATCH");
+    if (toolCase !== "interrupt") check(Array.isArray(lastTurn.items) && lastTurn.items.some((item) => isObject(item) && item.type === "agentMessage" && item.text === "42"), "PROBE_READ_TEXT_MISMATCH");
+    result = { status: "passed", turnStatus: terminal.turn.status, readBack: toolCase === "interrupt" ? "interrupted-matched" : "completed-and-text-matched" };
   } catch (error) {
     result = { status: "failed", errorCode: error instanceof Error && /^(PROBE_|RPC_)[A-Z0-9_-]+$/.test(error.message) ? error.message : "PROBE_FAILED" };
     process.exitCode = 1;
@@ -167,13 +269,16 @@ async function main() {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
   key = "";
+  if (toolCase === "interrupt" && interruptedProcessEnded !== true) await new Promise((resolve) => setTimeout(resolve, 8_500));
   const budget = ledger?.summary();
   ledger?.close();
   if (exitCode !== 0) result = { status: "failed", errorCode: "PROBE_UNCLEAN_EXIT" };
-  const report = { kind: live ? "engine-deepseek-text-only" : "engine-local-synthetic-response-only", ...result, engineVersion: "0.140.0", engineSha256: expectedSha,
+  const report = { kind: live ? "engine-deepseek-text-only" : (toolCase ? "engine-fixed-command-boundary" : "engine-local-synthetic-response-only"), ...result, engineVersion, engineSha256: binarySha,
     requests, notifications, diagnostics, deniedServerRequests: rpc.deniedServerRequests, stderrBytes, processExit: exitCode,
     upstream, gatewayFailure, budget, billVerified: false, realModel: live, toolsStrippedForTextProbe: live,
-    upstreamOutputLimit: live ? MAX_OUTPUT_TOKENS : null, toolExecutionTested: false, sandboxEnforcement: "not-tested" };
+    upstreamOutputLimit: live ? MAX_OUTPUT_TOKENS : null, toolCase, toolResult, markerExists: existsSync(marker),
+    interruptedProcessEnded, terminalCounts, blockedAfterStop,
+    toolExecutionTested: Boolean(toolCase), sandboxEnforcement: toolCase ? "see-fixed-command-result" : "not-tested" };
   mkdirSync(path.resolve(".local/reports"), { recursive: true });
   writeFileSync(path.resolve(`.local/reports/engine-contract-${Date.now()}.json`), `${JSON.stringify(report, null, 2)}\n`, { flag: "wx" });
   if (exitCode === 0) run.cleanup();

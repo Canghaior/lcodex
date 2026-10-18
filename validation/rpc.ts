@@ -25,6 +25,7 @@ export class JsonLineRpc {
     private timeoutMs = 5_000,
     private maxFrameBytes = 1_048_576,
     private onNotification?: (method: string, params: unknown) => void,
+    private declineKnownApprovals = false,
   ) {
     input.setEncoding("utf8");
     input.on("data", (chunk: string) => this.consume(chunk));
@@ -98,7 +99,9 @@ export class JsonLineRpc {
         if (typeof message.id !== "number" && typeof message.id !== "string") throw new Error();
         // The offline probe never grants approvals or performs server-requested actions.
         this.deniedServerRequests++;
-        this.send({ id: message.id, error: { code: -32601, message: "Offline probe denies server requests" } });
+        if (this.declineKnownApprovals && message.method === "item/commandExecution/requestApproval") {
+          this.send({ id: message.id, result: { decision: "decline" } });
+        } else this.send({ id: message.id, error: { code: -32601, message: "Offline probe denies server requests" } });
       } else {
         this.notifications++;
         this.onNotification?.(message.method, message.params);

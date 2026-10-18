@@ -58,6 +58,20 @@ test("notifications reach the observer without being confused with approval requ
   input.end();
 });
 
+test("explicit approval-denial mode returns decline and never grants unknown requests", () => {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const sent: unknown[] = [];
+  output.on("data", (chunk: Buffer) => sent.push(JSON.parse(chunk.toString())));
+  const rpc = new JsonLineRpc(input, output, 1_000, 1_048_576, undefined, true);
+  input.write('{"id":"approval","method":"item/commandExecution/requestApproval","params":{}}\n');
+  input.write('{"id":"other","method":"unknown/permission","params":{}}\n');
+  assert.deepEqual(sent[0], { id: "approval", result: { decision: "decline" } });
+  assert.deepEqual(sent[1], { id: "other", error: { code: -32601, message: "Offline probe denies server requests" } });
+  assert.equal(rpc.deniedServerRequests, 2);
+  input.end();
+});
+
 for (const [label, payload] of [
   ["invalid JSON", "invalid\n"],
   ["unknown ID", '{"id":99,"result":true}\n'],
