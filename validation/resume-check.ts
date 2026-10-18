@@ -3,7 +3,7 @@ import { JsonLineRpc, isObject } from "./rpc.js";
 
 // Restart the same private engine home, load history and resume without a new
 // turn. The caller keeps its model endpoint closed to new calls and checks files.
-export async function checkRestart(binary: string, cwd: string, env: NodeJS.ProcessEnv, threadId: string, turnId: string) {
+export async function checkRestart(binary: string, cwd: string, env: NodeJS.ProcessEnv, threadId: string, turnId: string, expectedStatus: "completed" | "interrupted" = "completed") {
   const child = spawn(binary, ["app-server", "--listen", "stdio://", "--strict-config"], {
     cwd, env: { ...env, RUST_LOG: "codex_app_server=info" }, windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
   });
@@ -26,8 +26,8 @@ export async function checkRestart(binary: string, cwd: string, env: NodeJS.Proc
     if (!isObject(read) || !isObject(read.thread) || !Array.isArray(read.thread.turns)) throw new Error("PROBE_RESTART_HISTORY_MISSING");
     const last = read.thread.turns.at(-1);
     history = { turns: read.thread.turns.length, lastStatus: isObject(last) ? last.status : "missing", sameTurnId: isObject(last) && last.id === turnId };
-    passed = isObject(last) && last.id === turnId && last.status === "completed" && Array.isArray(last.items) &&
-      last.items.some((item) => isObject(item) && item.type === "agentMessage");
+    passed = isObject(last) && last.id === turnId && last.status === expectedStatus && Array.isArray(last.items) &&
+      (expectedStatus === "interrupted" || last.items.some((item) => isObject(item) && item.type === "agentMessage"));
   } catch (error) { passed = false; errorCode = error instanceof Error && /^(RPC_|PROBE_)[A-Z0-9_-]+$/.test(error.message) ? error.message : "PROBE_RESTART_FAILED"; }
   rpc.abort(new Error("PROBE_RESTART_CLOSED"));
   child.stdin.end();
@@ -49,5 +49,5 @@ export async function checkRestart(binary: string, cwd: string, env: NodeJS.Proc
     return [];
   }))];
   return { passed: passed && exitCode === 0 && replayEvents.length === 0 && rpc.deniedServerRequests === 0,
-    historyMatched: passed, history, errorCode, exitCode, forcedExit, stderrBytes, shutdownMessages, replayEvents, notifications };
+    historyMatched: passed, history, expectedStatus, errorCode, exitCode, forcedExit, stderrBytes, shutdownMessages, replayEvents, notifications };
 }

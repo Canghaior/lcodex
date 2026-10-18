@@ -66,7 +66,6 @@ async function main() {
   const faultCase = process.argv.find((arg) => arg.startsWith("--fault-case="))?.slice("--fault-case=".length);
   check(!compactCheck || !restartCheck && !toolCase && !readTask && !editTask && !faultCase && engineVersion === "0.162.0", "PROBE_COMPACT_MODE_REFUSED");
   check(!faultCase || ["failed", "incomplete", "missing-terminal", "oversized"].includes(faultCase) && !live && !restartCheck && !toolCase && !readTask && !editTask && engineVersion === "0.162.0", "PROBE_FAULT_MODE_REFUSED");
-  check(!restartCheck || toolCase !== "interrupt", "PROBE_RESTART_MODE_REFUSED");
   check(Number(readTask) + Number(editTask) + Number(Boolean(toolCase)) <= 1, "PROBE_CONFLICTING_MODES");
   check(!toolCase || (["readonly", "write", "interrupt", "deny", "network-control", "network-denied", "concurrent-edit", "temp-scope", "patch-readonly", "patch-write", "patch-sensitive", "patch-outside", "guard-parallel", "guard-delta", "sensitive-search"].includes(toolCase) && !live && engineVersion === "0.162.0"), "PROBE_TOOL_CASE_REFUSED");
   const sensitiveCase = toolCase === "sensitive-search";
@@ -393,7 +392,7 @@ async function main() {
   }, toolCase === "deny");
   child.on("error", () => rpc.abort(new Error("PROBE_SPAWN_FAILED")));
   let exitCode: number | null | undefined;
-  let completedIdentity: { threadId: string; turnId: string } | undefined;
+  let completedIdentity: { threadId: string; turnId: string; status: "completed" | "interrupted" } | undefined;
   let restarted: Awaited<ReturnType<typeof checkRestart>> | undefined;
   let shutdownMilliseconds = 0;
   let forcedExit = false;
@@ -488,7 +487,7 @@ async function main() {
     check(isObject(readBack) && isObject(readBack.thread) && Array.isArray(readBack.thread.turns), "PROBE_INVALID_THREAD_READ");
     const lastTurn = readBack.thread.turns.at(-1);
     check(isObject(lastTurn) && lastTurn.status === expectedStatus, "PROBE_READ_STATUS_MISMATCH");
-    if (typeof lastTurn.id === "string" && expectedStatus === "completed") completedIdentity = { threadId: thread.thread.id, turnId: lastTurn.id };
+    if (typeof lastTurn.id === "string" && (expectedStatus === "completed" || expectedStatus === "interrupted")) completedIdentity = { threadId: thread.thread.id, turnId: lastTurn.id, status: expectedStatus };
     check(!restartCheck || completedIdentity, "PROBE_RESTART_ID_MISSING");
     if (toolCase !== "interrupt" && !faultCase && !guardCase) check(Array.isArray(lastTurn.items) && lastTurn.items.some((item) => isObject(item) && item.type === "agentMessage" && typeof item.text === "string" &&
       (editTask ? item.text.length > 0 : (readTask ? checkDiagnosis(item.text, readMarker) : item.text === "42"))), "PROBE_READ_TEXT_MISMATCH");
@@ -550,7 +549,7 @@ async function main() {
     shutdownMilliseconds = Date.now() - shutdownStarted;
     if (restartCheck && exitCode === 0 && result.status === "passed" && completedIdentity) {
       const beforeRestart = JSON.stringify(snapshot(cwd));
-      restarted = await checkRestart(binary, cwd, env, completedIdentity.threadId, completedIdentity.turnId);
+      restarted = await checkRestart(binary, cwd, env, completedIdentity.threadId, completedIdentity.turnId, completedIdentity.status);
       if (!restarted.passed || blockedAfterStop !== 0 || JSON.stringify(snapshot(cwd)) !== beforeRestart) {
         result = { status: "failed", errorCode: "PROBE_RESTART_CHECK_FAILED" }; process.exitCode = 1;
       }
