@@ -64,7 +64,7 @@ async function main() {
   const toolCase = process.argv.find((arg) => arg.startsWith("--tool-case="))?.slice("--tool-case=".length);
   const faultCase = process.argv.find((arg) => arg.startsWith("--fault-case="))?.slice("--fault-case=".length);
   check(!compactCheck || !restartCheck && !toolCase && !readTask && !editTask && !faultCase && engineVersion === "0.162.0", "PROBE_COMPACT_MODE_REFUSED");
-  check(!faultCase || ["failed", "incomplete", "missing-terminal"].includes(faultCase) && !live && !restartCheck && !toolCase && !readTask && !editTask && engineVersion === "0.162.0", "PROBE_FAULT_MODE_REFUSED");
+  check(!faultCase || ["failed", "incomplete", "missing-terminal", "oversized"].includes(faultCase) && !live && !restartCheck && !toolCase && !readTask && !editTask && engineVersion === "0.162.0", "PROBE_FAULT_MODE_REFUSED");
   check(!restartCheck || toolCase !== "interrupt", "PROBE_RESTART_MODE_REFUSED");
   check(Number(readTask) + Number(editTask) + Number(Boolean(toolCase)) <= 1, "PROBE_CONFLICTING_MODES");
   check(!toolCase || (["readonly", "write", "interrupt", "deny", "network-control", "network-denied", "concurrent-edit", "temp-scope", "patch-readonly", "patch-write", "patch-sensitive", "patch-outside", "guard-parallel", "guard-delta"].includes(toolCase) && !live && engineVersion === "0.162.0"), "PROBE_TOOL_CASE_REFUSED");
@@ -128,6 +128,8 @@ async function main() {
   const requests: Record<string, unknown>[] = [];
   const upstream: Record<string, unknown>[] = [];
   let gatewayFailure: string | null = null;
+  let oversizedHttpCalls = 0;
+  let oversizedLedgerRequests: number | undefined;
   let inFlight = false;
   let stopping = false;
   let blockedAfterStop = 0;
@@ -173,6 +175,16 @@ async function main() {
         contextMarkerPresent: compactCheck ? body.includes(contextMarker) : "not-tested",
       });
       check(requests.length <= (compactCheck || verifyEdit ? 3 : toolCase || readTask || editTask ? 2 : 1), "PROBE_UNEXPECTED_RETRY");
+      if (faultCase === "oversized") {
+        const syntheticLedgerPath = path.join(run.root, "synthetic-budget.jsonl");
+        BudgetLedger.initialize(syntheticLedgerPath);
+        const syntheticLedger = new BudgetLedger(syntheticLedgerPath);
+        try {
+          await sendBoundedDeepSeek(syntheticLedger, "oversized", "sk-synthetic-not-a-real-credential", { ...parsed, tools: [], max_output_tokens: 1024, store: false, stream: true },
+            async () => { oversizedHttpCalls++; throw new Error("PROBE_UNEXPECTED_HTTP"); });
+          throw new Error("PROBE_OVERSIZED_ADMITTED");
+        } finally { oversizedLedgerRequests = syntheticLedger.summary().requests; syntheticLedger.close(); }
+      }
       let wire = syntheticTextStream(faultCase ? "PARTIAL_SYNTHETIC" : "42", faultCase);
       if (compactCheck && requests.length > 1) {
         check(body.includes(contextMarker), "PROBE_CONTEXT_MARKER_LOST");
@@ -381,7 +393,7 @@ async function main() {
     const thread = await rpc.request("thread/start", { cwd, ephemeral: false, ...(!scopedTools ? { sandbox: "read-only" } : {}), approvalPolicy: toolCase === "deny" ? "on-request" : "never", approvalsReviewer: "user",
       developerInstructions: verifyEdit ? "SYNTHETIC_DEVELOPER_MARKER. Update invoice.mjs with one apply_patch, then run exactly the user's verification command once using exec_command. Summarize observed results. No other commands or files." : editTask ? "SYNTHETIC_DEVELOPER_MARKER. Only update invoice.mjs with one apply_patch call. No other tools or files. After the tool result, give a concise summary." : (readTask ? "SYNTHETIC_DEVELOPER_MARKER. Read-only code analysis. Execute only the exact read command given by the user, once, then answer from that result." : "SYNTHETIC_DEVELOPER_MARKER. This probe requires only a plain text answer; do not use tools.") });
     check(isObject(thread) && isObject(thread.thread) && typeof thread.thread.id === "string", "PROBE_INVALID_THREAD");
-    const prompt = editTask
+    const prompt = faultCase === "oversized" ? "Synthetic oversized input: " + "x".repeat(20_000) : editTask
       ? `Fix invoiceTotal to account for each line's quantity, and add applyDiscount(cents, percent) that returns integer cents rounded with Math.round after a percentage discount. Use only arithmetic expressions. Keep the existing exported function signatures and the items.reduce((sum, item) => expression, 0) form. Apply exactly one apply_patch call, a single Update File: invoice.mjs hunk (one @@), with no other file edits. The complete current file is:\n${INVOICE_BASELINE}\n` + (verifyEdit
         ? `After patch success, run exec_command exactly once with cmd=${JSON.stringify(verificationCommand)}, shell=${JSON.stringify(shellPath)}, workdir=${JSON.stringify(cwd)}, login=false, yield_time_ms=10000, max_output_tokens=2048. Then summarize the observed verification result. Do not run any other commands.`
         : "Do not run commands. After patch success, briefly report the change and say tests have not been run by you.")
@@ -471,6 +483,7 @@ async function main() {
       if (verifyEdit) check(verificationResultMatched && commandExitCodes.length === 1 && commandExitCodes[0] === 0 && readFileSync(evaluatorPath, "utf8") === evaluatorSource, "PROBE_VERIFY_COMMAND_FAILED");
     }
     if (faultCase) check(JSON.stringify(snapshot(cwd)) === JSON.stringify(beforeFiles) && !notifications.some((method) => method.startsWith("item/commandExecution/") || method === "turn/diff/updated"), "PROBE_FAULT_SIDE_EFFECT");
+    if (faultCase === "oversized") check(gatewayFailure === "API_INPUT_SIZE_LIMIT" && oversizedHttpCalls === 0 && oversizedLedgerRequests === 0, "PROBE_OVERSIZED_HTTP_OCCURRED");
     if (guardCase) check(gatewayFailure === "PROBE_RESPONSE_CONTRACT_REFUSED" && commandExitCodes.length === 0 && !itemTypes.includes("commandExecution") && !existsSync(marker) && JSON.stringify(snapshot(cwd)) === JSON.stringify(beforeFiles), "PROBE_GUARD_EXECUTION_OCCURRED");
     if (compactCheck) {
       const nextTerminal = async (method: string, params: Record<string, unknown>) => {
@@ -539,7 +552,7 @@ async function main() {
   const report = { kind: live ? (editTask ? "engine-deepseek-bounded-edit-task" : (readTask ? "engine-deepseek-bounded-read-task" : "engine-deepseek-text-only")) : (scopedTools ? "engine-fixed-command-boundary" : "engine-local-synthetic-response-only"), ...result, engineVersion, engineSha256: binarySha,
     requests, notifications, diagnostics, compactCheck, compactionResult, deniedServerRequests: rpc.deniedServerRequests, stderrBytes, processExit: exitCode, shutdownMilliseconds, forcedExit, shutdownDiagnostics, restarted,
     upstream, gatewayFailure, budget, billVerified: false, realModel: live, toolsStrippedForTextProbe: live && !readTask && !editTask,
-    upstreamOutputLimit: live ? MAX_OUTPUT_TOKENS : null, toolCase, faultCase, observedTurnStatus, toolResult, markerExists: existsSync(marker),
+    upstreamOutputLimit: live ? MAX_OUTPUT_TOKENS : null, toolCase, faultCase, oversizedHttpCalls, oversizedLedgerRequests, observedTurnStatus, toolResult, markerExists: existsSync(marker),
     interruptedProcessEnded, terminalCounts, blockedAfterStop, networkHits, externalEditWritten, externalEditPreserved,
     readTask, readToolResultMatched, filesUnchanged: readTask || faultCase || guardCase ? JSON.stringify(snapshot(cwd)) === JSON.stringify(beforeFiles) : "not-tested",
     editTask, verifyEdit, patchResultMatched, baselineChecks, independentChecks, commandExitCodes, verificationResultMatched,
