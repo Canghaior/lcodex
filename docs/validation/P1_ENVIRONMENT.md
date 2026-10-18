@@ -32,7 +32,7 @@ npm test
 npm run validate:offline -- "<本机固定版本 codex.exe 的绝对路径>"
 ```
 
-最后一条须替换占位路径，或在本机设置 CODEX_BINARY 后运行 `npm run validate:offline`。程序只接受已登记版本和哈希；不通过 shell 调用 .cmd/.ps1 包装器。
+最后一条须替换占位路径，或在本机设置 CODEX_BINARY 后运行 `npm run validate:offline`。程序只接受已登记版本和哈希；不通过 shell 调用 .cmd/.ps1 包装器。后续清理改动使成功运行将报告保存到 .local/reports/offline-latest.json 后删除运行副本；失败目录按 WORKSPACE_HYGIENE.md 核对处理。
 
 | 检查 | 结果 | 证据或范围 |
 | --- | --- | --- |

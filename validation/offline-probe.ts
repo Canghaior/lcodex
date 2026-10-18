@@ -1,9 +1,10 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { isolatedEnvironment } from "./isolated-env.js";
 import { isObject, JsonLineRpc } from "./rpc.js";
+import { createRunDirectory } from "./run-directory.js";
 
 const expectedVersion = "codex-cli 0.140.0";
 const expectedSha256 = "03e5cf467f4ef2c06360b00cdc9aef64bb79b2028e25e3e122dd0bd2152ace22";
@@ -20,7 +21,8 @@ async function main(): Promise<void> {
   requireCondition(binarySha === expectedSha256, "PROBE_BINARY_HASH_MISMATCH");
   const localRoot = path.resolve(".local");
   await mkdir(localRoot, { recursive: true });
-  const root = await mkdtemp(path.join(localRoot, "p1 中文路径 "));
+  const run = createRunDirectory("p1 中文路径");
+  const root = run.root;
   for (const directory of ["home", "profile/roaming", "profile/local", "temp", "workspace"]) {
     await mkdir(path.join(root, directory), { recursive: true });
   }
@@ -118,7 +120,9 @@ async function main(): Promise<void> {
     sandboxEnforcement: "not-tested",
     deepSeekCompatibility: "not-tested",
   };
-  await writeFile(path.join(root, "report.json"), `${JSON.stringify(report, null, 2)}\n`);
+  await mkdir(path.join(localRoot, "reports"), { recursive: true });
+  await writeFile(path.join(localRoot, "reports/offline-latest.json"), `${JSON.stringify(report, null, 2)}\n`);
+  run.cleanup();
   console.log(JSON.stringify(report, null, 2));
 }
 

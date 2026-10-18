@@ -12,6 +12,7 @@
 - [执行记录](docs/PROGRESS.md)：当前阶段、下一步、验证证据和决策记录。
 - [P1 环境与本地通信结果](docs/validation/P1_ENVIRONMENT.md)：固定版本、运行命令、已通过检查与未验证范围。
 - [开发约定](AGENTS.md)：后续开发必须遵守的范围和工作流程。
+- [文件清理规则](docs/WORKSPACE_HYGIENE.md)：测试与临时数据的保留边界、磁盘检查和安全清理方式。
 
 当前方案为 0.5，优先服务已有本地项目的个人开发者，围绕代码理解、bug 修复和小功能开发。用户已明确 Codex 风格的界面方向，以及 TypeScript、React、CSS、Electron 技术栈和应用分层，模型只接 DeepSeek。首发 Windows 与官方 API 接入方式仍沿用方案安排；具体依赖版本、引擎兼容性和支持项目类型由 P1 确定。
 
