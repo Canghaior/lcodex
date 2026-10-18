@@ -1,0 +1,18 @@
+{
+  "name": "lcodex",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "P1 validation for a local DeepSeek coding assistant",
+  "engines": { "node": ">=24.8.0 <25" },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "build:validation": "tsc",
+    "test": "npm run build:validation && node --test dist/validation/*.test.js",
+    "validate:offline": "npm run build:validation && node dist/validation/offline-probe.js"
+  },
+  "devDependencies": {
+    "@types/node": "24.8.1",
+    "typescript": "5.9.3"
+  }
+}

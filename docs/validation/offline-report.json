@@ -1,0 +1,29 @@
+{
+  "kind": "local-app-server-handshake-only",
+  "node": "v24.8.0",
+  "platform": "win32",
+  "arch": "x64",
+  "engineVersion": "codex-cli 0.140.0",
+  "engineSha256": "03e5cf467f4ef2c06360b00cdc9aef64bb79b2028e25e3e122dd0bd2152ace22",
+  "schemaHashes": {
+    "v1/InitializeParams.json": "f6540330c6492971750ad0caa532904eb08547bd8d849a053aecf36c803c49f7",
+    "v1/InitializeResponse.json": "86dcd236d0576a82c85b933586dc45731260eab1b6edb3447b03f790277322b1",
+    "v2/ConfigReadParams.json": "9a51989dc089ac297037c6f1fdc65a73f9c8105837e93a998f173a80c7880172",
+    "v2/ConfigReadResponse.json": "c8955e1e07e97749b9e3f69a53b7aed03a6a2ddb16df449cef1d66765b01f08a"
+  },
+  "isolatedHome": true,
+  "chineseAndSpacePath": true,
+  "initialize": "passed",
+  "configRead": "passed",
+  "modelRequestsSent": 0,
+  "toolTasksStarted": 0,
+  "notifications": 1,
+  "deniedServerRequests": 0,
+  "stderrBytes": 0,
+  "processExit": {
+    "code": 0,
+    "signal": null
+  },
+  "sandboxEnforcement": "not-tested",
+  "deepSeekCompatibility": "not-tested"
+}
