@@ -9,7 +9,8 @@
     "check": "tsc --noEmit",
     "build:validation": "tsc",
     "test": "npm run build:validation && node --test dist/validation/*.test.js",
-    "validate:offline": "npm run build:validation && node dist/validation/offline-probe.js"
+    "validate:offline": "npm run build:validation && node dist/validation/offline-probe.js",
+    "validate:deepseek": "npm run build:validation && node dist/validation/deepseek-probe.js"
   },
   "devDependencies": {
     "@types/node": "24.8.1",

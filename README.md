@@ -11,6 +11,7 @@
 - [补充建议评审](docs/PLAN_REVIEW.md)：逐项处理结果、官方资料核对、工作量和待决定事项。
 - [执行记录](docs/PROGRESS.md)：当前阶段、下一步、验证证据和决策记录。
 - [P1 环境与本地通信结果](docs/validation/P1_ENVIRONMENT.md)：固定版本、运行命令、已通过检查与未验证范围。
+- [P1 直接 API 结果](docs/validation/P1_RESPONSES.md)：首个失败、两轮合成工具调用复测、用量与预算；不代表引擎兼容通过。
 - [开发约定](AGENTS.md)：后续开发必须遵守的范围和工作流程。
 - [文件清理规则](docs/WORKSPACE_HYGIENE.md)：测试与临时数据的保留边界、磁盘检查和安全清理方式。
 

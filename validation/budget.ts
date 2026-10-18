@@ -6,8 +6,9 @@ export const P1_LIMITS = { totalMicros: 10_000_000, trialMicros: 1_000_000, requ
 type Entry =
   | { type: "init"; version: 1; limits: typeof P1_LIMITS }
   | { type: "reserve"; id: string; trial: string; maxMicros: number }
-  | { type: "settle"; id: string; actualMicros: number };
-type Request = { trial: string; maxMicros: number; actualMicros?: number };
+  | { type: "settle"; id: string; actualMicros: number }
+  | { type: "account-unknown"; id: string };
+type Request = { trial: string; maxMicros: number; actualMicros?: number; unknownAccounted?: boolean };
 
 function natural(value: unknown): value is number {
   return Number.isSafeInteger(value) && Number(value) >= 0;
@@ -58,8 +59,12 @@ export class BudgetLedger {
       this.requests.set(entry.id, { trial: entry.trial, maxMicros: entry.maxMicros });
     } else if (entry.type === "settle") {
       const request = this.requests.get(entry.id);
-      check(request && request.actualMicros === undefined && natural(entry.actualMicros), "BUDGET_CORRUPT");
+      check(request && request.actualMicros === undefined && !request.unknownAccounted && natural(entry.actualMicros), "BUDGET_CORRUPT");
       request.actualMicros = entry.actualMicros;
+    } else if (entry.type === "account-unknown") {
+      const request = this.requests.get(entry.id);
+      check(request && request.actualMicros === undefined && !request.unknownAccounted, "BUDGET_CORRUPT");
+      request.unknownAccounted = true;
     } else throw new Error("BUDGET_CORRUPT");
   }
 
@@ -68,13 +73,15 @@ export class BudgetLedger {
     let estimatedMicros = 0;
     let pending = 0;
     let overrun = false;
+    let unknownMicros = 0;
     for (const request of this.requests.values()) {
       committedMicros += request.actualMicros ?? request.maxMicros;
       estimatedMicros += request.actualMicros ?? 0;
-      if (request.actualMicros === undefined) pending++;
+      if (request.actualMicros === undefined && !request.unknownAccounted) pending++;
+      if (request.unknownAccounted) unknownMicros += request.maxMicros;
       if (request.actualMicros !== undefined && request.actualMicros > request.maxMicros) overrun = true;
     }
-    return { committedMicros, estimatedMicros, pending, overrun, requests: this.requests.size };
+    return { committedMicros, estimatedMicros, unknownMicros, pending, overrun, requests: this.requests.size };
   }
 
   private checkReservation(trial: string, maxMicros: number): void {
@@ -101,10 +108,20 @@ export class BudgetLedger {
   settle(id: string, actualMicros: number): void {
     check(!this.closed && !this.poisoned, "BUDGET_CLOSED");
     const request = this.requests.get(id);
-    check(request && request.actualMicros === undefined && natural(actualMicros), "BUDGET_INVALID_SETTLEMENT");
+    check(request && request.actualMicros === undefined && !request.unknownAccounted && natural(actualMicros), "BUDGET_INVALID_SETTLEMENT");
     // An estimate overrun is recorded truthfully, and blocks all further requests.
     this.append({ type: "settle", id, actualMicros });
     request.actualMicros = actualMicros;
+  }
+
+  // Explicit supervisor reconciliation only: permanently charge the full validated upper
+  // reservation to both budgets. Usage stays unknown; this is not a claim of zero cost or a bill.
+  accountUnknown(id: string): void {
+    check(!this.closed && !this.poisoned, "BUDGET_CLOSED");
+    const request = this.requests.get(id);
+    check(request && request.actualMicros === undefined && !request.unknownAccounted, "BUDGET_INVALID_RECONCILIATION");
+    this.append({ type: "account-unknown", id });
+    request.unknownAccounted = true;
   }
 
   private append(entry: Entry): void {

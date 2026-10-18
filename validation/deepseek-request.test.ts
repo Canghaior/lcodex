@@ -1,0 +1,81 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import path from "node:path";
+import { BudgetLedger } from "./budget.js";
+import { createRunDirectory } from "./run-directory.js";
+import { requestDeepSeek } from "./deepseek-request.js";
+import { ResponsesStream } from "./responses-stream.js";
+
+const fakeKey = `sk-${"synthetic".repeat(2)}`;
+const frame = (type: string, sequence_number: number, response?: unknown) =>
+  `event: ${type}\r\ndata: ${JSON.stringify({ type, sequence_number, response })}\r\n\r\n`;
+const terminal = { status: "completed", usage: { input_tokens: 100, output_tokens: 20 }, output: [] };
+
+test("SSE handles fragments and keeps failed/incomplete terminal distinct", () => {
+  for (const status of ["completed", "failed", "incomplete"]) {
+    const parser = new ResponsesStream();
+    const data = frame("response.created", 0) + frame(`response.${status}`, 1, { ...terminal, status });
+    for (const char of data) parser.push(char);
+    assert.equal(parser.finish().response.status, status);
+  }
+});
+
+test("missing terminal, duplicate sequence and mismatched status fail closed", () => {
+  const missing = new ResponsesStream();
+  missing.push(frame("response.created", 0));
+  assert.throws(() => missing.finish(), /MISSING_TERMINAL/);
+  assert.throws(() => missing.push(frame("response.created", 0)), /INVALID_SEQUENCE/);
+  const mismatch = new ResponsesStream();
+  assert.throws(() => mismatch.push(frame("response.completed", 0, { status: "failed" })), /STATUS_MISMATCH/);
+});
+
+test("actual request wrapper reserves before HTTP and settles returned usage", async () => {
+  const run = createRunDirectory("request-test");
+  const file = path.join(run.root, "synthetic-ledger.jsonl");
+  BudgetLedger.initialize(file);
+  const ledger = new BudgetLedger(file);
+  let calls = 0;
+  const fakeFetch: typeof fetch = async (url, options) => {
+    calls++;
+    assert.equal(ledger.summary().pending, 1);
+    assert.equal(url, "https://api.deepseek.com/responses");
+    assert.equal(options?.redirect, "error");
+    assert.equal(JSON.parse(String(options?.body)).max_output_tokens, 1024);
+    assert.deepEqual(JSON.parse(String(options?.body)).reasoning, { effort: "none" });
+    return new Response(frame("response.created", 0) + frame("response.completed", 1, terminal), { headers: { "content-type": "text/event-stream" } });
+  };
+  try {
+    const result = await requestDeepSeek(ledger, "test", fakeKey, [{ role: "user", content: "synthetic" }], [], "none", fakeFetch);
+    assert.equal(calls, 1);
+    assert.equal(result.usage.estimatedMicros, 360);
+    assert.equal(ledger.summary().pending, 0);
+  } finally { ledger.close(); run.cleanup(); }
+});
+
+test("HTTP errors leave unknown usage reserved, block retries and do not expose body", async () => {
+  const run = createRunDirectory("request-fail-test");
+  const file = path.join(run.root, "synthetic-ledger.jsonl");
+  BudgetLedger.initialize(file);
+  const ledger = new BudgetLedger(file);
+  let calls = 0;
+  const fakeFetch: typeof fetch = async () => { calls++; return new Response("private response", { status: 401 }); };
+  try {
+    await assert.rejects(requestDeepSeek(ledger, "test", fakeKey, [], [], "none", fakeFetch), /API_HTTP_401/);
+    assert.equal(ledger.summary().committedMicros, 250_000);
+    await assert.rejects(requestDeepSeek(ledger, "test", fakeKey, [], [], "none", fakeFetch), /PENDING_RECONCILIATION/);
+    assert.equal(calls, 1);
+  } finally { ledger.close(); run.cleanup(); }
+});
+
+test("oversized input and server-side tools are refused before HTTP", async () => {
+  const run = createRunDirectory("request-bounds-test");
+  const file = path.join(run.root, "synthetic-ledger.jsonl");
+  BudgetLedger.initialize(file);
+  const ledger = new BudgetLedger(file);
+  const fakeFetch: typeof fetch = async () => { throw new Error("should not be called"); };
+  try {
+    await assert.rejects(requestDeepSeek(ledger, "test", fakeKey, [{ content: "x".repeat(20_000) }], [], "none", fakeFetch), /INPUT_SIZE_LIMIT/);
+    await assert.rejects(requestDeepSeek(ledger, "test", fakeKey, [], [{ type: "web_search" }], "auto", fakeFetch), /SERVER_TOOLS_REFUSED/);
+    assert.equal(ledger.summary().requests, 0);
+  } finally { ledger.close(); run.cleanup(); }
+});

@@ -104,3 +104,21 @@ test("request count remains bounded even for zero billed usage", () => {
     assert.throws(() => ledger.reserve("trial", 1), /REQUEST_LIMIT/);
   } finally { ledger.close(); }
 });
+
+test("explicit unknown reconciliation consumes the full reservation and survives restart", () => {
+  const { file, ledger } = sample();
+  const id = ledger.reserve("trial", 250_000);
+  ledger.accountUnknown(id);
+  assert.equal(ledger.summary().estimatedMicros, 0);
+  assert.equal(ledger.summary().unknownMicros, 250_000);
+  assert.equal(ledger.summary().committedMicros, 250_000);
+  assert.throws(() => ledger.settle(id, 0), /INVALID_SETTLEMENT/);
+  assert.throws(() => ledger.accountUnknown(id), /INVALID_RECONCILIATION/);
+  ledger.close();
+  const recovered = new BudgetLedger(file);
+  try {
+    assert.equal(recovered.summary().unknownMicros, 250_000);
+    assert.throws(() => recovered.reserve("trial", 750_001), /TRIAL_LIMIT/);
+    recovered.settle(recovered.reserve("trial", 750_000), 750_000);
+  } finally { recovered.close(); }
+});
