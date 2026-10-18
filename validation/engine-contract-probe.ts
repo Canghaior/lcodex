@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import path from "node:path";
 import { isolatedEnvironment } from "./isolated-env.js";
@@ -11,7 +11,7 @@ import { readKey } from "./read-key.js";
 import { BudgetLedger } from "./budget.js";
 import { MAX_OUTPUT_TOKENS, PRICE_REVIEW_DATE, sendBoundedDeepSeek } from "./deepseek-request.js";
 import { checkDiagnosis, checkResponseWire, READ_COMMAND } from "./readonly-contract.js";
-import { snapshot } from "./fixtures.js";
+import { evaluatorSource, snapshot } from "./fixtures.js";
 import { evaluateInvoiceSource, INVOICE_BASELINE, previewInvoicePatch } from "./patch-contract.js";
 import { checkRestart } from "./resume-check.js";
 import { mapDeepSeekRoles } from "./deepseek-roles.js";
@@ -54,6 +54,8 @@ async function main() {
   check(!restartCheck || (!live && engineVersion === "0.162.0"), "PROBE_RESTART_MODE_REFUSED");
   const readTask = process.argv.includes("--read-task");
   const editTask = process.argv.includes("--edit-task");
+  const verifyEdit = process.argv.includes("--verify-edit");
+  check(!verifyEdit || editTask, "PROBE_VERIFY_REQUIRES_EDIT");
   check(!editTask || (!readTask && engineVersion === "0.162.0"), "PROBE_EDIT_TASK_REFUSED");
   check(!readTask || engineVersion === "0.162.0", "PROBE_READ_TASK_REFUSED");
   const toolCase = process.argv.find((arg) => arg.startsWith("--tool-case="))?.slice("--tool-case=".length);
@@ -96,6 +98,13 @@ async function main() {
   if (editTask) writeFileSync(path.join(cwd, "invoice.mjs"), INVOICE_BASELINE);
   const baselineChecks = editTask ? evaluateInvoiceSource(INVOICE_BASELINE) : null;
   const quote = (value: string) => `'${value.replaceAll("'", "''")}'`;
+  const evaluatorPath = path.join(run.root, "outside/independent-evaluator.mjs");
+  const nodePath = realpathSync(process.execPath);
+  if (verifyEdit) {
+    check(createHash("sha256").update(readFileSync(nodePath)).digest("hex") === "3a9ac860c566b7aebf144be914f95e3ec36dc88040aa7acb5d9d1e6e0c7afd5e", "PROBE_NODE_HASH_MISMATCH");
+    writeFileSync(evaluatorPath, evaluatorSource);
+  }
+  const verificationCommand = `& ${quote(nodePath)} --preserve-symlinks --preserve-symlinks-main ${quote(evaluatorPath)} ${quote(path.join(cwd, "invoice.mjs"))}; exit $LASTEXITCODE`;
   let fixedCommand = toolCase === "interrupt"
     ? `Set-Content -LiteralPath ${quote(pidMarker)} -Value $PID -NoNewline -ErrorAction Stop; Start-Sleep -Seconds 8; Set-Content -LiteralPath ${quote(marker)} -Value FINISHED -NoNewline`
     : toolCase === "concurrent-edit"
@@ -125,6 +134,8 @@ async function main() {
   let expectedCandidate: string | undefined;
   let independentChecks: unknown = null;
   let patchResultMatched = false;
+  let verificationCallId: string | undefined;
+  let verificationResultMatched = false;
   const upstreamAbort = new AbortController();
   let activeUpstream: ReturnType<typeof sendBoundedDeepSeek> | undefined;
   let networkHits = 0;
@@ -157,7 +168,7 @@ async function main() {
         developerMarkerPresent: body.includes("SYNTHETIC_DEVELOPER_MARKER"),
         contextMarkerPresent: compactCheck ? body.includes(contextMarker) : "not-tested",
       });
-      check(requests.length <= (compactCheck ? 3 : toolCase || readTask || editTask ? 2 : 1), "PROBE_UNEXPECTED_RETRY");
+      check(requests.length <= (compactCheck || verifyEdit ? 3 : toolCase || readTask || editTask ? 2 : 1), "PROBE_UNEXPECTED_RETRY");
       let wire = syntheticTextStream(faultCase ? "PARTIAL_SYNTHETIC" : "42", faultCase);
       if (compactCheck && requests.length > 1) {
         check(body.includes(contextMarker), "PROBE_CONTEXT_MARKER_LOST");
@@ -195,6 +206,13 @@ async function main() {
         ];
         wire = events.map((event, sequence_number) => `event: ${event.type}\ndata: ${JSON.stringify({ ...event, sequence_number })}\n\n`).join("");
         if (readTask) readCallId = "call_synthetic";
+      } else if (verifyEdit && !live && requests.length === 2) {
+        const item = { id: "fc_verify", call_id: "call_verify", type: "function_call", name: "exec_command", status: "completed",
+          arguments: JSON.stringify({ cmd: verificationCommand, workdir: cwd, shell: shellPath, login: false, yield_time_ms: 10000, max_output_tokens: 2048 }) };
+        verificationCallId = item.call_id;
+        const events = [{ type: "response.output_item.added", output_index: 0, item }, { type: "response.output_item.done", output_index: 0, item },
+          { type: "response.completed", response: { id: "resp_verify", status: "completed", output: [item], usage: { input_tokens: 10, output_tokens: 10, total_tokens: 20 } } }];
+        wire = events.map((event, sequence_number) => `event: ${event.type}\ndata: ${JSON.stringify({ ...event, sequence_number })}\n\n`).join("");
       } else if (toolCase) {
         check(Array.isArray(parsed.input), "PROBE_NO_TOOL_HISTORY");
         const outputs = parsed.input.filter(isObject).filter((item) => item.type === (patchCase ? "custom_tool_call_output" : "function_call_output") && item.call_id === "call_synthetic");
@@ -216,29 +234,43 @@ async function main() {
         patchResultMatched = outputs.length === 1 && typeof outputs[0]?.output === "string" && outputs[0].output.includes("Success.");
         check(patchResultMatched, "PROBE_PATCH_RESULT_MISSING");
       }
+      if (verifyEdit && requests.length === 3) {
+        check(Array.isArray(parsed.input) && verificationCallId, "PROBE_NO_TOOL_HISTORY");
+        const outputs = parsed.input.filter(isObject).filter((item) => item.type === "function_call_output" && item.call_id === verificationCallId);
+        check(outputs.length === 1 && typeof outputs[0]?.output === "string", "PROBE_VERIFY_RESULT_MISSING");
+        const output = outputs[0].output;
+        const line = output.split(/\r?\n/).map((line) => line.trim()).find((line) => line.startsWith('{"kind":"independent-invoice-checks"'));
+        const parsedChecks: unknown = line ? JSON.parse(line) : null;
+        const names = ["empty", "single", "quantity", "mixed", "discount", "rounding"];
+        verificationResultMatched = isObject(parsedChecks) && Array.isArray(parsedChecks.checks) && parsedChecks.checks.length === 6 && parsedChecks.checks.every((item, index) => isObject(item) && item.name === names[index] && item.passed === true);
+        check(verificationResultMatched, "PROBE_VERIFY_CHECKS_FAILED");
+      }
       if (live && ledger) {
         check(!body.includes("本项目开发接入 DeepSeek"), "PROBE_ANCESTOR_INSTRUCTIONS");
         assertNoKnownSecrets(body, [localToken, key]);
-        const tools = (readTask || editTask) && requests.length === 1 && Array.isArray(parsed.tools)
+        const tools = verifyEdit && requests.length === 2 && Array.isArray(parsed.tools)
+          ? parsed.tools.filter(isObject).filter((tool) => tool.type === "function" && tool.name === "exec_command")
+          : (readTask || editTask) && requests.length === 1 && Array.isArray(parsed.tools)
           ? parsed.tools.filter(isObject).filter((tool) => editTask ? tool.type === "custom" && tool.name === "apply_patch" : tool.type === "function" && tool.name === "exec_command") : [];
         check(!(readTask || editTask) || requests.length !== 1 || tools.length === 1, "PROBE_SHELL_TOOL_MISSING");
         const adapted = mapDeepSeekRoles({
           ...parsed, max_output_tokens: MAX_OUTPUT_TOKENS, reasoning: { effort: "none" }, tools,
           tool_choice: tools.length ? "auto" : "none", parallel_tool_calls: false, store: false,
         });
-        activeUpstream = sendBoundedDeepSeek(ledger, compactCheck ? "engine-compact-v1" : editTask ? "engine-edit-v1" : (readTask ? "engine-read-v1" : "engine-text-v1"), key, adapted, fetch, upstreamAbort.signal);
+        activeUpstream = sendBoundedDeepSeek(ledger, verifyEdit ? "engine-edit-verify-v1" : compactCheck ? "engine-compact-v1" : editTask ? "engine-edit-v1" : (readTask ? "engine-read-v1" : "engine-text-v1"), key, adapted, fetch, upstreamAbort.signal);
         const response = await activeUpstream;
         activeUpstream = undefined;
         upstream.push({ terminalType: response.terminalType, events: response.events, usage: response.usage, returnedModel: response.response.model,
           roles: (adapted.input as Record<string, unknown>[]).map((item) => item.role ?? item.type) });
         check(response.terminalType === "response.completed", "PROBE_TOOL_OUTPUT_REFUSED");
-        const call = checkResponseWire(response.wire, response.response, readTask && requests.length === 1 ? { cwd, shell: shellPath! } : undefined,
+        const call = checkResponseWire(response.wire, response.response, verifyEdit && requests.length === 2 ? { cwd, shell: shellPath!, command: verificationCommand } : readTask && requests.length === 1 ? { cwd, shell: shellPath! } : undefined,
           editTask && requests.length === 1 ? (input) => { expectedCandidate = previewInvoicePatch(input); } : undefined);
         if (readTask && requests.length === 1) {
           check(call && typeof call.call_id === "string", "PROBE_READ_NOT_REQUESTED");
           readCallId = call.call_id;
         }
         if (editTask && requests.length === 1) { check(call && typeof call.call_id === "string", "PROBE_PATCH_NOT_REQUESTED"); editCallId = call.call_id; }
+        if (verifyEdit && requests.length === 2) { check(call && typeof call.call_id === "string", "PROBE_VERIFY_NOT_REQUESTED"); verificationCallId = call.call_id; }
         // Hold all real SSE bytes until every execution-bearing event passes the contract.
         wire = response.wire;
       }
@@ -265,7 +297,7 @@ async function main() {
     "$r | ConvertTo-Json -Compress",
   ].join("; ");
   const catalogPath = path.join(run.root, "home/models.json");
-  writeFileSync(catalogPath, JSON.stringify(validationCatalog(scopedTools, readTask, patchCase)));
+  writeFileSync(catalogPath, JSON.stringify(validationCatalog(scopedTools, readTask, patchCase, verifyEdit)));
   writeFileSync(path.join(run.root, "home/config.toml"), [
     'model = "deepseek-flash"', 'model_provider = "local_contract"', 'model_reasoning_effort = "none"',
     `model_catalog_json = '${catalogPath}'`,
@@ -276,6 +308,7 @@ async function main() {
       `${quote(path.join(cwd, ".git"))} = "read"`,
       `${quote(path.dirname(process.env.COMSPEC ?? "C:/Windows/System32/cmd.exe"))} = "read"`,
       `${quote(path.dirname(shellPath!))} = "read"`,
+      ...(verifyEdit ? [`${quote(path.dirname(nodePath))} = "read"`, `${quote(evaluatorPath)} = "read"`] : []),
       `${quote(path.join(run.root, "profile/local/Packages"))} = "write"`,
       '[permissions.scoped.network]', `enabled = ${toolCase === "network-control"}`] : []),
     '[features]', 'multi_agent = false', 'apps = false', 'plugins = false', 'hooks = false', 'goals = false',
@@ -295,12 +328,14 @@ async function main() {
   const closed = new Promise<number | null>((resolve) => child.once("close", resolve));
   const notifications: string[] = [];
   const itemTypes: string[] = [];
+  const commandExitCodes: unknown[] = [];
   const diagnostics: unknown[] = [];
   let complete!: (value: unknown) => void;
   let completed = new Promise<unknown>((resolve) => { complete = resolve; });
   const rpc = new JsonLineRpc(child.stdout, child.stdin, 15_000, 1_048_576, (method, params) => {
     notifications.push(method);
     if (method === "item/completed" && isObject(params) && isObject(params.item) && typeof params.item.type === "string") itemTypes.push(params.item.type);
+    if (method === "item/completed" && isObject(params) && isObject(params.item) && params.item.type === "commandExecution") commandExitCodes.push(params.item.exitCode);
     if (["error", "warning"].includes(method) && isObject(params)) {
       const error = isObject(params.error) ? params.error : params;
       diagnostics.push({ method, info: error.codexErrorInfo,
@@ -324,10 +359,12 @@ async function main() {
     await rpc.request("initialize", { clientInfo: { name: "lcodex_contract", version: "0.0.1" }, capabilities: { experimentalApi: toolCase === "interrupt" } });
     rpc.notify("initialized", {});
     const thread = await rpc.request("thread/start", { cwd, ephemeral: false, ...(!scopedTools ? { sandbox: "read-only" } : {}), approvalPolicy: toolCase === "deny" ? "on-request" : "never", approvalsReviewer: "user",
-      developerInstructions: editTask ? "SYNTHETIC_DEVELOPER_MARKER. Only update invoice.mjs with one apply_patch call. No other tools or files. After the tool result, give a concise summary." : (readTask ? "SYNTHETIC_DEVELOPER_MARKER. Read-only code analysis. Execute only the exact read command given by the user, once, then answer from that result." : "SYNTHETIC_DEVELOPER_MARKER. This probe requires only a plain text answer; do not use tools.") });
+      developerInstructions: verifyEdit ? "SYNTHETIC_DEVELOPER_MARKER. Update invoice.mjs with one apply_patch, then run exactly the user's verification command once using exec_command. Summarize observed results. No other commands or files." : editTask ? "SYNTHETIC_DEVELOPER_MARKER. Only update invoice.mjs with one apply_patch call. No other tools or files. After the tool result, give a concise summary." : (readTask ? "SYNTHETIC_DEVELOPER_MARKER. Read-only code analysis. Execute only the exact read command given by the user, once, then answer from that result." : "SYNTHETIC_DEVELOPER_MARKER. This probe requires only a plain text answer; do not use tools.") });
     check(isObject(thread) && isObject(thread.thread) && typeof thread.thread.id === "string", "PROBE_INVALID_THREAD");
     const prompt = editTask
-      ? `Fix invoiceTotal to account for each line's quantity, and add applyDiscount(cents, percent) that returns integer cents rounded with Math.round after a percentage discount. Use only arithmetic expressions. Keep the existing exported function signatures and the items.reduce((sum, item) => expression, 0) form. Apply exactly one apply_patch call, a single Update File: invoice.mjs hunk (one @@), with no other file edits. The complete current file is:\n${INVOICE_BASELINE}\nDo not run commands. After patch success, briefly report the change and say tests have not been run by you.`
+      ? `Fix invoiceTotal to account for each line's quantity, and add applyDiscount(cents, percent) that returns integer cents rounded with Math.round after a percentage discount. Use only arithmetic expressions. Keep the existing exported function signatures and the items.reduce((sum, item) => expression, 0) form. Apply exactly one apply_patch call, a single Update File: invoice.mjs hunk (one @@), with no other file edits. The complete current file is:\n${INVOICE_BASELINE}\n` + (verifyEdit
+        ? `After patch success, run exec_command exactly once with cmd=${JSON.stringify(verificationCommand)}, shell=${JSON.stringify(shellPath)}, workdir=${JSON.stringify(cwd)}, login=false, yield_time_ms=10000, max_output_tokens=2048. Then summarize the observed verification result. Do not run any other commands.`
+        : "Do not run commands. After patch success, briefly report the change and say tests have not been run by you.")
       : readTask
       ? `Read invoice.mjs and diagnose invoiceTotal for one line with priceCents=125, quantity=4. Use exec_command exactly once with cmd=${JSON.stringify(READ_COMMAND)}, shell=${JSON.stringify(shellPath)}, login=false, workdir=${JSON.stringify(cwd)}, yield_time_ms=10000, max_output_tokens=2048. No other commands. Return only a JSON object with file, ignoresQuantity (boolean), observedTotal, expectedTotal, and marker (the source comment without // or spaces). Do not modify files.`
       : compactCheck ? `Remember this exact reference marker for later: ${contextMarker}. Reply with only 42. Do not use tools.` : "Reply with only 42. Do not use any tools.";
@@ -366,7 +403,7 @@ async function main() {
     observedTurnStatus = terminal.turn.status;
     const expectedStatus = faultCase ? "failed" : toolCase === "interrupt" ? "interrupted" : "completed";
     check(terminal.turn.status === expectedStatus, "PROBE_TURN_FAILED");
-    check(requests.length === (readTask || editTask || toolCase && toolCase !== "interrupt" ? 2 : 1) && rpc.deniedServerRequests === (toolCase === "deny" ? 1 : 0), "PROBE_UNEXPECTED_OPERATIONS");
+    check(requests.length === (verifyEdit ? 3 : readTask || editTask || toolCase && toolCase !== "interrupt" ? 2 : 1) && rpc.deniedServerRequests === (toolCase === "deny" ? 1 : 0), "PROBE_UNEXPECTED_OPERATIONS");
     if (toolCase === "deny") check(!existsSync(marker), "PROBE_DECLINED_COMMAND_EXECUTED");
     if (commandPid) {
       let alive = true;
@@ -411,6 +448,7 @@ async function main() {
       check(checks.every((test) => test.passed), "PROBE_INDEPENDENT_CHECK_FAILED");
       const afterFiles = snapshot(cwd);
       check(Object.keys(afterFiles).length === Object.keys(beforeFiles).length && Object.entries(beforeFiles).every(([file, hash]) => file === "invoice.mjs" || afterFiles[file] === hash), "PROBE_UNRELATED_FILES_CHANGED");
+      if (verifyEdit) check(verificationResultMatched && commandExitCodes.length === 1 && commandExitCodes[0] === 0 && readFileSync(evaluatorPath, "utf8") === evaluatorSource, "PROBE_VERIFY_COMMAND_FAILED");
     }
     if (faultCase) check(JSON.stringify(snapshot(cwd)) === JSON.stringify(beforeFiles) && !notifications.some((method) => method.startsWith("item/commandExecution/") || method === "turn/diff/updated"), "PROBE_FAULT_SIDE_EFFECT");
     if (compactCheck) {
@@ -477,7 +515,7 @@ async function main() {
     upstreamOutputLimit: live ? MAX_OUTPUT_TOKENS : null, toolCase, faultCase, observedTurnStatus, toolResult, markerExists: existsSync(marker),
     interruptedProcessEnded, terminalCounts, blockedAfterStop, networkHits, externalEditWritten, externalEditPreserved,
     readTask, readToolResultMatched, filesUnchanged: readTask || faultCase ? JSON.stringify(snapshot(cwd)) === JSON.stringify(beforeFiles) : "not-tested",
-    editTask, patchResultMatched, baselineChecks, independentChecks,
+    editTask, verifyEdit, patchResultMatched, baselineChecks, independentChecks, commandExitCodes, verificationResultMatched,
     toolExecutionTested: scopedTools, sandboxEnforcement: scopedTools ? "MXC scoped; see bounded results" : "not-tested" };
   mkdirSync(path.resolve(".local/reports"), { recursive: true });
   writeFileSync(path.resolve(`.local/reports/engine-contract-${Date.now()}.json`), `${JSON.stringify(report, null, 2)}\n`, { flag: "wx" });

@@ -6,7 +6,7 @@ function requireValue(value: unknown): asserts value { if (!value) throw new Err
 
 // Buffer and check every execution-bearing event before giving any bytes to the
 // engine. Checking only response.completed would miss a conflicting earlier call.
-export function checkResponseWire(wire: string, response: Record<string, unknown>, readScope?: { cwd: string; shell: string }, patchCheck?: (input: string) => void) {
+export function checkResponseWire(wire: string, response: Record<string, unknown>, readScope?: { cwd: string; shell: string; command?: string }, patchCheck?: (input: string) => void) {
   requireValue(Array.isArray(response.output));
   const output = response.output;
   requireValue(output.every((item) => isObject(item) && ["message", "reasoning", "function_call", ...(patchCheck ? ["custom_tool_call"] : [])].includes(String(item.type))));
@@ -23,7 +23,7 @@ export function checkResponseWire(wire: string, response: Record<string, unknown
     let args: unknown;
     try { args = JSON.parse(call.arguments); } catch { throw new Error("PROBE_RESPONSE_CONTRACT_REFUSED"); }
     requireValue(isObject(args) && Object.keys(args).every((key) => ["cmd", "workdir", "shell", "login", "yield_time_ms", "max_output_tokens"].includes(key)));
-    requireValue(args.cmd === READ_COMMAND && args.shell === readScope.shell && args.login === false &&
+    requireValue(args.cmd === (readScope.command ?? READ_COMMAND) && args.shell === readScope.shell && args.login === false &&
       (args.workdir === undefined || args.workdir === readScope.cwd));
     requireValue(args.yield_time_ms === undefined || (Number.isSafeInteger(args.yield_time_ms) && Number(args.yield_time_ms) > 0 && Number(args.yield_time_ms) <= 10_000));
     requireValue(args.max_output_tokens === undefined || (Number.isSafeInteger(args.max_output_tokens) && Number(args.max_output_tokens) > 0 && Number(args.max_output_tokens) <= 2048));

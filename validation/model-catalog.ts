@@ -1,12 +1,14 @@
 // P1-only metadata, matched to the 0.140.0 ModelInfo schema. This is our small
 // validation instruction, not a claim that an OpenAI prompt/model is reproduced.
-export function validationCatalog(shellEnabled = false, readonlyTask = false, patchEnabled = false) {
+export function validationCatalog(shellEnabled = false, readonlyTask = false, patchEnabled = false, verifyEdit = false) {
   return { models: [{
     slug: "deepseek-flash", display_name: "DeepSeek Flash (P1 validation)",
     description: "Bounded text-only compatibility probe; not a released model configuration.",
     default_reasoning_level: "none", supported_reasoning_levels: [{ effort: "none", description: "No thinking for the initial protocol probe" }],
     shell_type: shellEnabled ? "shell_command" : "disabled", visibility: "list", supported_in_api: true, priority: 1,
-    base_instructions: patchEnabled
+    base_instructions: verifyEdit
+      ? "You are a coding assistant in a synthetic project. Apply the one requested patch, run exactly the supplied verification command, then summarize actual results. Preserve unrelated files. Do not run other commands."
+      : patchEnabled
       ? "You are a coding assistant working in a synthetic project. Apply only the bounded patch requested by the user. Use apply_patch, never shell commands. Preserve unrelated files. Report uncertainty honestly."
       : readonlyTask
       ? "You are a coding assistant analysing a synthetic project. Follow the user's read-only task. Read the requested file using the one permitted command, then answer from the observed content. Do not modify files or call other tools."

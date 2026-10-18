@@ -23,7 +23,7 @@ export function snapshot(directory: string): Record<string, string> {
   return files;
 }
 
-const evaluatorSource = `import { pathToFileURL } from 'node:url';
+export const evaluatorSource = `import { pathToFileURL } from 'node:url';
 const target = await import(pathToFileURL(process.argv[2]).href);
 const cases = [
   ['empty', () => target.invoiceTotal([]) === 0],

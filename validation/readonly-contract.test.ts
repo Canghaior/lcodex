@@ -44,6 +44,17 @@ test("read gate rejects parallel calls and concealed early SSE tool execution", 
   assert.throws(() => checkResponseWire(forgedCreated, hidden.response), /CONTRACT_REFUSED/);
 });
 
+test("verification gate admits only the coordinator's exact command", () => {
+  const command = "& 'D:/runtime/node.exe' 'D:/outside/independent-evaluator.mjs'";
+  const verificationScope = { ...scope, command };
+  const allowed = stream([{ ...call, arguments: JSON.stringify({ ...args, cmd: command }) }]);
+  assert.equal(checkResponseWire(allowed.wire, allowed.response, verificationScope)?.call_id, "c1");
+  for (const cmd of [READ_COMMAND, command + "; Write-Output forged", command.replace("independent-evaluator", "agent-evaluator")]) {
+    const denied = stream([{ ...call, arguments: JSON.stringify({ ...args, cmd }) }]);
+    assert.throws(() => checkResponseWire(denied.wire, denied.response, verificationScope), /CONTRACT_REFUSED/);
+  }
+});
+
 function validDeltaStream(delta: string) {
   const response = { status: "completed", output: [call] };
   const events = [
