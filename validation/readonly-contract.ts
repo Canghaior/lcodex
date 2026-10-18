@@ -6,14 +6,18 @@ function requireValue(value: unknown): asserts value { if (!value) throw new Err
 
 // Buffer and check every execution-bearing event before giving any bytes to the
 // engine. Checking only response.completed would miss a conflicting earlier call.
-export function checkResponseWire(wire: string, response: Record<string, unknown>, readScope?: { cwd: string; shell: string }) {
+export function checkResponseWire(wire: string, response: Record<string, unknown>, readScope?: { cwd: string; shell: string }, patchCheck?: (input: string) => void) {
   requireValue(Array.isArray(response.output));
   const output = response.output;
-  requireValue(output.every((item) => isObject(item) && ["message", "reasoning", "function_call"].includes(String(item.type))));
-  const calls = output.filter(isObject).filter((item) => item.type === "function_call");
-  requireValue(calls.length <= (readScope ? 1 : 0));
+  requireValue(output.every((item) => isObject(item) && ["message", "reasoning", "function_call", ...(patchCheck ? ["custom_tool_call"] : [])].includes(String(item.type))));
+  const calls = output.filter(isObject).filter((item) => ["function_call", "custom_tool_call"].includes(String(item.type)));
+  requireValue(calls.length <= (readScope || patchCheck ? 1 : 0));
   const call = calls[0];
-  if (call) {
+  const payloadKey = call?.type === "custom_tool_call" ? "input" : "arguments";
+  if (call?.type === "custom_tool_call") {
+    requireValue(patchCheck && call.name === "apply_patch" && typeof call.input === "string" && typeof call.call_id === "string" && typeof call.id === "string");
+    patchCheck(call.input);
+  } else if (call) {
     requireValue(readScope && call.name === "exec_command" && typeof call.arguments === "string" &&
       typeof call.call_id === "string" && typeof call.id === "string");
     let args: unknown;
@@ -28,18 +32,22 @@ export function checkResponseWire(wire: string, response: Record<string, unknown
   let deltas = "";
   const parser = new ResponsesStream((event) => {
     const type = String(event.type);
+    if (["response.created", "response.in_progress"].includes(type) && isObject(event.response) && event.response.output !== undefined) {
+      requireValue(Array.isArray(event.response.output) && event.response.output.length === 0);
+    }
+    if (type === "response.completed") requireValue(isObject(event.response) && JSON.stringify(event.response.output) === JSON.stringify(output));
     if (["response.output_item.added", "response.output_item.done"].includes(type)) {
       const item = event.item;
-      requireValue(isObject(item) && ["message", "reasoning", "function_call"].includes(String(item.type)));
-      if (item.type === "function_call") {
-        requireValue(call && item.id === call.id && item.call_id === call.call_id && item.name === call.name);
-        if (type.endsWith("added")) { added++; requireValue(item.arguments === "" || item.arguments === call.arguments); }
-        else { done++; requireValue(item.arguments === call.arguments); }
+      requireValue(isObject(item) && ["message", "reasoning", "function_call", ...(patchCheck ? ["custom_tool_call"] : [])].includes(String(item.type)));
+      if (["function_call", "custom_tool_call"].includes(String(item.type))) {
+        requireValue(call && item.type === call.type && item.id === call.id && item.call_id === call.call_id && item.name === call.name);
+        if (type.endsWith("added")) { added++; requireValue(item[payloadKey] === "" || item[payloadKey] === call[payloadKey]); }
+        else { done++; requireValue(item[payloadKey] === call[payloadKey]); }
       }
-    } else if (type.startsWith("response.function_call_arguments.")) {
-      requireValue(call && event.item_id === call.id);
+    } else if (type.startsWith("response.function_call_arguments.") || type.startsWith("response.custom_tool_call_input.")) {
+      requireValue(call && event.item_id === call.id && type.startsWith(call.type === "custom_tool_call" ? "response.custom_tool_call_input." : "response.function_call_arguments."));
       if (type.endsWith(".delta")) { requireValue(typeof event.delta === "string"); deltas += event.delta; }
-      else if (type.endsWith(".done")) { argumentDone++; requireValue(event.arguments === call.arguments); }
+      else if (type.endsWith(".done")) { argumentDone++; requireValue(event[payloadKey] === call[payloadKey]); }
       else requireValue(false);
     } else requireValue([
       "response.created", "response.in_progress", "response.completed",
@@ -49,7 +57,7 @@ export function checkResponseWire(wire: string, response: Record<string, unknown
   });
   parser.push(wire);
   parser.finish();
-  requireValue(call ? added === 1 && done === 1 && argumentDone <= 1 && (!deltas || deltas === call.arguments) : added === 0 && done === 0 && argumentDone === 0 && !deltas);
+  requireValue(call ? added === 1 && done === 1 && argumentDone <= 1 && (!deltas || deltas === call[payloadKey]) : added === 0 && done === 0 && argumentDone === 0 && !deltas);
   return call;
 }
 

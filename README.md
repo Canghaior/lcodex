@@ -17,6 +17,7 @@
 - [P1 引擎工具与停止](docs/validation/P1_ENGINE_TOOLS.md)：实际工具权限、审批拒绝、首次停止失败与针对性修复。
 - [P1 真实只读代码任务](docs/validation/P1_READ_TASK.md)：新候选版本的真实工具调用、代码诊断、独立检查及受限范围。
 - [P1 数据与文件保护](docs/validation/P1_DATA_AND_PROTECTION.md)：凭据过滤、网络对照、并发覆盖失败与隔离/恢复可行性，含 D01 选项。
+- [P1 真实补丁任务](docs/validation/P1_EDIT_TASK.md)：真实模型修复合成 bug、添加小功能及独立验收；明确受限范围。
 - [开发约定](AGENTS.md)：后续开发必须遵守的范围和工作流程。
 - [文件清理规则](docs/WORKSPACE_HYGIENE.md)：测试与临时数据的保留边界、磁盘检查和安全清理方式。
 

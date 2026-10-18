@@ -40,6 +40,8 @@ test("read gate rejects parallel calls and concealed early SSE tool execution", 
   assert.throws(() => checkResponseWire(alteredDelta.wire, alteredDelta.response, scope), /CONTRACT_REFUSED/);
   const validDelta = validDeltaStream(call.arguments);
   assert.equal(checkResponseWire(validDelta.wire, validDelta.response, scope)?.call_id, "c1");
+  const forgedCreated = "data: " + JSON.stringify({ type: "response.created", sequence_number: 0, response: { output: [call] } }) + "\n\n";
+  assert.throws(() => checkResponseWire(forgedCreated, hidden.response), /CONTRACT_REFUSED/);
 });
 
 function validDeltaStream(delta: string) {

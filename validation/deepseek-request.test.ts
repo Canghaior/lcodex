@@ -76,7 +76,37 @@ test("oversized input and server-side tools are refused before HTTP", async () =
   try {
     await assert.rejects(requestDeepSeek(ledger, "test", fakeKey, [{ content: "x".repeat(20_000) }], [], "none", fakeFetch), /INPUT_SIZE_LIMIT/);
     await assert.rejects(requestDeepSeek(ledger, "test", fakeKey, [], [{ type: "web_search" }], "auto", fakeFetch), /SERVER_TOOLS_REFUSED/);
+    await assert.rejects(requestDeepSeek(ledger, "test", fakeKey, [], [{ type: "custom", name: "arbitrary" }], "auto", fakeFetch), /SERVER_TOOLS_REFUSED/);
     assert.equal(ledger.summary().requests, 0);
+  } finally { ledger.close(); run.cleanup(); }
+});
+
+test("cancellation blocks unsent requests and retains the reservation of an in-flight request", async () => {
+  const run = createRunDirectory("request-cancel-test");
+  const file = path.join(run.root, "synthetic-ledger.jsonl");
+  BudgetLedger.initialize(file);
+  const ledger = new BudgetLedger(file);
+  const body = { model: "deepseek-flash", stream: true, store: false, input: [{ role: "user", content: "42" }], tools: [], max_output_tokens: 1024 };
+  let calls = 0;
+  const fakeFetch: typeof fetch = async (_, options) => {
+    calls++;
+    return new Promise<Response>((_, reject) => {
+      assert.ok(options?.signal);
+      options.signal.addEventListener("abort", () => reject(new Error("synthetic cancellation")), { once: true });
+    });
+  };
+  try {
+    const before = new AbortController(); before.abort();
+    await assert.rejects(sendBoundedDeepSeek(ledger, "cancel", fakeKey, body, fakeFetch, before.signal), /ABORTED_BEFORE_REQUEST/);
+    assert.equal(ledger.summary().requests, 0);
+    assert.equal(calls, 0);
+    const during = new AbortController();
+    const pending = sendBoundedDeepSeek(ledger, "cancel", fakeKey, body, fakeFetch, during.signal);
+    during.abort();
+    await assert.rejects(pending, /USAGE_UNKNOWN/);
+    assert.equal(calls, 1);
+    assert.equal(ledger.summary().pending, 1);
+    assert.equal(ledger.summary().committedMicros, 250_000);
   } finally { ledger.close(); run.cleanup(); }
 });
 
