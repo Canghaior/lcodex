@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import path from "node:path";
 import { isolatedEnvironment } from "./isolated-env.js";
@@ -14,8 +14,9 @@ import { checkDiagnosis, checkResponseWire, READ_COMMAND } from "./readonly-cont
 import { evaluatorSource, snapshot } from "./fixtures.js";
 import { evaluateInvoiceSource, INVOICE_BASELINE, previewInvoicePatch } from "./patch-contract.js";
 import { checkRestart } from "./resume-check.js";
-import { mapDeepSeekRoles } from "./deepseek-roles.js";
+import { prepareEngineModelRequest } from "./engine-model-request.js";
 import { assertNoKnownSecrets } from "./outbound-data.js";
+import { sensitivePaths } from "./sensitive-paths.js";
 
 const expectedSha = "03e5cf467f4ef2c06360b00cdc9aef64bb79b2028e25e3e122dd0bd2152ace22";
 const candidateSha = "dce685d569526ef4712fa82d20ff20e1309baad5fcd34215e1126698f611242f";
@@ -67,7 +68,8 @@ async function main() {
   check(!faultCase || ["failed", "incomplete", "missing-terminal", "oversized"].includes(faultCase) && !live && !restartCheck && !toolCase && !readTask && !editTask && engineVersion === "0.162.0", "PROBE_FAULT_MODE_REFUSED");
   check(!restartCheck || toolCase !== "interrupt", "PROBE_RESTART_MODE_REFUSED");
   check(Number(readTask) + Number(editTask) + Number(Boolean(toolCase)) <= 1, "PROBE_CONFLICTING_MODES");
-  check(!toolCase || (["readonly", "write", "interrupt", "deny", "network-control", "network-denied", "concurrent-edit", "temp-scope", "patch-readonly", "patch-write", "patch-sensitive", "patch-outside", "guard-parallel", "guard-delta"].includes(toolCase) && !live && engineVersion === "0.162.0"), "PROBE_TOOL_CASE_REFUSED");
+  check(!toolCase || (["readonly", "write", "interrupt", "deny", "network-control", "network-denied", "concurrent-edit", "temp-scope", "patch-readonly", "patch-write", "patch-sensitive", "patch-outside", "guard-parallel", "guard-delta", "sensitive-search"].includes(toolCase) && !live && engineVersion === "0.162.0"), "PROBE_TOOL_CASE_REFUSED");
+  const sensitiveCase = toolCase === "sensitive-search";
   const guardCase = toolCase?.startsWith("guard-") === true;
   const patchCase = toolCase?.startsWith("patch-") === true || editTask;
   const networkCase = toolCase?.startsWith("network-") === true;
@@ -124,6 +126,21 @@ async function main() {
   const localToken = randomUUID();
   const env = { ...isolatedEnvironment(run.root, process.env), GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "NUL", LCODEX_LOCAL_PROBE_TOKEN: localToken };
   check(spawnSync("git", ["init", "--quiet", cwd], { env, windowsHide: true, timeout: 10_000 }).status === 0, "PROBE_GIT_INIT_FAILED");
+  let inventoriedSensitivePaths: string[] = [];
+  if (sensitiveCase) {
+    mkdirSync(path.join(cwd, "nested")); mkdirSync(path.join(cwd, ".ssh"));
+    writeFileSync(path.join(cwd, "nested/.env.local"), "SYNTHETIC_SENSITIVE_ENV");
+    writeFileSync(path.join(cwd, ".ssh/id_ed25519"), "SYNTHETIC_SENSITIVE_PRIVATE_KEY");
+    appendFileSync(path.join(cwd, ".git/config"), "\n# SYNTHETIC_SENSITIVE_GIT_CONFIG\n");
+    inventoriedSensitivePaths = sensitivePaths(cwd);
+    const reads = [["sensitive", ".env"], ["nestedEnv", "nested/.env.local"], ["privateKey", ".ssh/id_ed25519"], ["gitConfig", ".git/config"]].map(([field, file]) =>
+      `try {$r.${field}=((Get-Content -LiteralPath ${quote(path.join(cwd, file!))} -Raw -ErrorAction Stop).Length -gt 0)} catch {$r.${field}=$false}`);
+    fixedCommand = [`$r=@{inside=((Get-Content -LiteralPath ${quote(path.join(cwd, "inside.txt"))} -Raw) -eq 'INSIDE_SYNTHETIC')}`, ...reads,
+      `$hits=@(Get-ChildItem -LiteralPath ${quote(cwd)} -Recurse -Force -File -ErrorAction SilentlyContinue | Select-String -Pattern 'SYNTHETIC_SENSITIVE' -ErrorAction SilentlyContinue)`,
+      "$r.searchSecret=($hits.Count -gt 0)",
+      `$publicHits=@(Get-ChildItem -LiteralPath ${quote(cwd)} -Recurse -Force -File -ErrorAction SilentlyContinue | Select-String -Pattern 'INSIDE_SYNTHETIC' -ErrorAction SilentlyContinue)`,
+      "$r.publicSearch=($publicHits.Count -gt 0)", "$r | ConvertTo-Json -Compress"].join("; ");
+  }
   const beforeFiles = snapshot(cwd);
   const requests: Record<string, unknown>[] = [];
   const upstream: Record<string, unknown>[] = [];
@@ -165,6 +182,7 @@ async function main() {
       for await (const chunk of req) { body += String(chunk); check(Buffer.byteLength(body) <= 262_144, "PROBE_BODY_TOO_LARGE"); }
       const parsed: unknown = JSON.parse(body);
       check(isObject(parsed), "PROBE_INVALID_BODY");
+      if (sensitiveCase) check(!["SYNTHETIC_SENSITIVE_ENV", "SYNTHETIC_SENSITIVE_PRIVATE_KEY", "SYNTHETIC_SENSITIVE_GIT_CONFIG"].some((value) => body.includes(value)), "PROBE_SENSITIVE_OUTPUT_LEAK");
       requests.push({ bytes: Buffer.byteLength(body), fields: Object.keys(parsed).sort(), model: parsed.model,
         reasoning: parsed.reasoning, maxOutputTokens: parsed.max_output_tokens ?? null,
         store: parsed.store, parallelToolCalls: parsed.parallel_tool_calls,
@@ -282,14 +300,11 @@ async function main() {
           : (readTask || editTask) && requests.length === 1 && Array.isArray(parsed.tools)
           ? parsed.tools.filter(isObject).filter((tool) => editTask ? tool.type === "custom" && tool.name === "apply_patch" : tool.type === "function" && tool.name === "exec_command") : [];
         check(!(readTask || editTask) || requests.length !== 1 || tools.length === 1, "PROBE_SHELL_TOOL_MISSING");
-        const adapted = mapDeepSeekRoles({
-          ...parsed, max_output_tokens: MAX_OUTPUT_TOKENS, reasoning: { effort: "none" }, tools,
-          tool_choice: tools.length ? "auto" : "none", parallel_tool_calls: false, store: false,
-        });
+        const adapted = prepareEngineModelRequest(parsed, tools);
         activeUpstream = sendBoundedDeepSeek(ledger, verifyEdit ? "engine-edit-verify-v1" : compactCheck ? "engine-compact-v1" : editTask ? "engine-edit-v1" : (readTask ? "engine-read-v1" : "engine-text-v1"), key, adapted, fetch, upstreamAbort.signal);
         const response = await activeUpstream;
         activeUpstream = undefined;
-        upstream.push({ terminalType: response.terminalType, events: response.events, usage: response.usage, returnedModel: response.response.model,
+        upstream.push({ terminalType: response.terminalType, events: response.events, usage: response.usage, returnedModel: response.response.model, requestFields: Object.keys(adapted).sort(),
           roles: (adapted.input as Record<string, unknown>[]).map((item) => item.role ?? item.type) });
         check(response.terminalType === "response.completed", "PROBE_TOOL_OUTPUT_REFUSED");
         const call = checkResponseWire(response.wire, response.response, verifyEdit && requests.length === 2 ? { cwd, shell: shellPath!, command: verificationCommand } : readTask && requests.length === 1 ? { cwd, shell: shellPath! } : undefined,
@@ -335,6 +350,7 @@ async function main() {
     ...(scopedTools ? ['[windows]', 'sandbox = "mxc"', '[permissions.scoped.filesystem]', '":minimal" = "read"',
       `${quote(cwd)} = "${editTask || toolCase && ["write", "deny", "interrupt", "concurrent-edit", "patch-write", "patch-sensitive", "patch-outside"].includes(toolCase) ? "write" : "read"}"`, `${quote(path.join(cwd, ".env"))} = "deny"`,
       `${quote(path.join(cwd, ".git"))} = "read"`,
+      ...inventoriedSensitivePaths.filter((file) => file !== path.join(cwd, ".env")).map((file) => `${quote(file)} = "deny"`),
       `${quote(path.dirname(process.env.COMSPEC ?? "C:/Windows/System32/cmd.exe"))} = "read"`,
       `${quote(path.dirname(shellPath!))} = "read"`,
       ...(verifyEdit ? [`${quote(path.dirname(nodePath))} = "read"`, `${quote(evaluatorPath)} = "read"`] : []),
@@ -462,7 +478,11 @@ async function main() {
         readFileSync(outside, "utf8") === "OUTSIDE_SYNTHETIC" && Object.keys(afterFiles).length === Object.keys(beforeFiles).length &&
         Object.entries(beforeFiles).every(([file, hash]) => file === "inside.txt" || afterFiles[file] === hash), "PROBE_PATCH_BOUNDARY_FAILED");
     }
-    if (toolCase && !guardCase && !environmentCase && !patchCase && !["interrupt", "deny", "concurrent-edit"].includes(toolCase)) check(isObject(toolResult) && toolResult.inside === true && toolResult.outside === false && toolResult.sensitive === false &&
+    if (sensitiveCase) {
+      const sensitiveResult = toolResult;
+      check(isObject(sensitiveResult) && sensitiveResult.inside === true && sensitiveResult.publicSearch === true && ["sensitive", "nestedEnv", "privateKey", "gitConfig", "searchSecret"].every((field) => sensitiveResult[field] === false) && JSON.stringify(snapshot(cwd)) === JSON.stringify(beforeFiles), "PROBE_SENSITIVE_SCOPE_FAILED");
+    }
+    if (toolCase && !sensitiveCase && !guardCase && !environmentCase && !patchCase && !["interrupt", "deny", "concurrent-edit"].includes(toolCase)) check(isObject(toolResult) && toolResult.inside === true && toolResult.outside === false && toolResult.sensitive === false &&
       toolResult.write === (toolCase === "write") && existsSync(marker) === (toolCase === "write"), "PROBE_EXECUTION_BOUNDARY_FAILED");
     const readBack = await rpc.request("thread/read", { threadId: thread.thread.id, includeTurns: true });
     check(isObject(readBack) && isObject(readBack.thread) && Array.isArray(readBack.thread.turns), "PROBE_INVALID_THREAD_READ");
@@ -554,9 +574,9 @@ async function main() {
     upstream, gatewayFailure, budget, billVerified: false, realModel: live, toolsStrippedForTextProbe: live && !readTask && !editTask,
     upstreamOutputLimit: live ? MAX_OUTPUT_TOKENS : null, toolCase, faultCase, oversizedHttpCalls, oversizedLedgerRequests, observedTurnStatus, toolResult, markerExists: existsSync(marker),
     interruptedProcessEnded, terminalCounts, blockedAfterStop, networkHits, externalEditWritten, externalEditPreserved,
-    readTask, readToolResultMatched, filesUnchanged: readTask || faultCase || guardCase ? JSON.stringify(snapshot(cwd)) === JSON.stringify(beforeFiles) : "not-tested",
+    readTask, readToolResultMatched, filesUnchanged: readTask || faultCase || guardCase || sensitiveCase ? JSON.stringify(snapshot(cwd)) === JSON.stringify(beforeFiles) : "not-tested",
     editTask, verifyEdit, patchResultMatched, baselineChecks, independentChecks, commandExitCodes, verificationResultMatched,
-    toolExecutionTested: scopedTools, sandboxEnforcement: scopedTools ? "MXC scoped; see bounded results" : "not-tested" };
+    sensitivePathCount: inventoriedSensitivePaths.length, toolExecutionTested: scopedTools, sandboxEnforcement: scopedTools ? "MXC scoped; see bounded results" : "not-tested" };
   mkdirSync(path.resolve(".local/reports"), { recursive: true });
   writeFileSync(path.resolve(`.local/reports/engine-contract-${Date.now()}.json`), `${JSON.stringify(report, null, 2)}\n`, { flag: "wx" });
   if (exitCode === 0 && (!restartCheck || restarted?.exitCode === 0)) run.cleanup();
