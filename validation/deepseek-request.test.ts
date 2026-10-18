@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import { BudgetLedger } from "./budget.js";
 import { createRunDirectory } from "./run-directory.js";
-import { requestDeepSeek } from "./deepseek-request.js";
+import { requestDeepSeek, sendBoundedDeepSeek } from "./deepseek-request.js";
 import { ResponsesStream } from "./responses-stream.js";
 
 const fakeKey = `sk-${"synthetic".repeat(2)}`;
@@ -77,5 +77,29 @@ test("oversized input and server-side tools are refused before HTTP", async () =
     await assert.rejects(requestDeepSeek(ledger, "test", fakeKey, [{ content: "x".repeat(20_000) }], [], "none", fakeFetch), /INPUT_SIZE_LIMIT/);
     await assert.rejects(requestDeepSeek(ledger, "test", fakeKey, [], [{ type: "web_search" }], "auto", fakeFetch), /SERVER_TOOLS_REFUSED/);
     assert.equal(ledger.summary().requests, 0);
+  } finally { ledger.close(); run.cleanup(); }
+});
+
+test("engine entry requires bounded stateless requests and preserves supplied instructions", async () => {
+  const run = createRunDirectory("engine-gate-test");
+  const file = path.join(run.root, "synthetic-ledger.jsonl");
+  BudgetLedger.initialize(file);
+  const ledger = new BudgetLedger(file);
+  const body = { model: "deepseek-flash", stream: true, store: false, input: [{ role: "user", content: "42" }], tools: [],
+    max_output_tokens: 1024, instructions: "synthetic instruction", reasoning: { effort: "none" } };
+  let calls = 0;
+  const fakeFetch: typeof fetch = async (_, options) => {
+    calls++;
+    assert.equal(JSON.parse(String(options?.body)).instructions, "synthetic instruction");
+    return new Response(frame("response.completed", 0, terminal), { headers: { "content-type": "text/event-stream" } });
+  };
+  try {
+    for (const changed of [{ max_output_tokens: undefined }, { previous_response_id: "previous" }, { background: true }, { model: "unknown" }]) {
+      await assert.rejects(sendBoundedDeepSeek(ledger, "engine-test", fakeKey, { ...body, ...changed }, fakeFetch), /REQUEST_BOUNDS_REQUIRED/);
+    }
+    assert.equal(ledger.summary().requests, 0);
+    const result = await sendBoundedDeepSeek(ledger, "engine-test", fakeKey, body, fakeFetch);
+    assert.equal(calls, 1);
+    assert.ok(result.wire.includes("response.completed"));
   } finally { ledger.close(); run.cleanup(); }
 });

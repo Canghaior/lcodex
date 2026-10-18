@@ -24,6 +24,7 @@ export class JsonLineRpc {
     private output: Writable,
     private timeoutMs = 5_000,
     private maxFrameBytes = 1_048_576,
+    private onNotification?: (method: string, params: unknown) => void,
   ) {
     input.setEncoding("utf8");
     input.on("data", (chunk: string) => this.consume(chunk));
@@ -100,6 +101,7 @@ export class JsonLineRpc {
         this.send({ id: message.id, error: { code: -32601, message: "Offline probe denies server requests" } });
       } else {
         this.notifications++;
+        this.onNotification?.(message.method, message.params);
       }
       return;
     }

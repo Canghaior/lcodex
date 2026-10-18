@@ -43,6 +43,21 @@ test("server requests are denied, never executed", () => {
   input.end();
 });
 
+test("notifications reach the observer without being confused with approval requests", async () => {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const received: unknown[] = [];
+  const rpc = new JsonLineRpc(input, output, 1_000, 1_048_576, (method, params) => received.push({ method, params }));
+  const pending = rpc.request("turn/start", {});
+  input.write('{"id":"approval","method":"approve","params":{}}\n');
+  input.write('{"method":"turn/completed","params":{"turn":{"status":"completed"}}}\n');
+  input.write('{"id":1,"result":{}}\n');
+  await pending;
+  assert.equal(rpc.deniedServerRequests, 1);
+  assert.deepEqual(received, [{ method: "turn/completed", params: { turn: { status: "completed" } } }]);
+  input.end();
+});
+
 for (const [label, payload] of [
   ["invalid JSON", "invalid\n"],
   ["unknown ID", '{"id":99,"result":true}\n'],

@@ -16,11 +16,23 @@ export async function requestDeepSeek(
   toolChoice: unknown,
   fetchImpl: typeof fetch = fetch,
 ) {
+  return sendBoundedDeepSeek(ledger, trial, apiKey, { model: "deepseek-flash", input, tools, tool_choice: toolChoice,
+    stream: true, max_output_tokens: MAX_OUTPUT_TOKENS, reasoning: { effort: "none" }, store: false }, fetchImpl);
+}
+
+// The engine text probe preserves the engine's instructions/history, but explicitly
+// disables tools and sets output limits before this shared, budgeted HTTP entry.
+export async function sendBoundedDeepSeek(ledger: BudgetLedger, trial: string, apiKey: string,
+  request: Record<string, unknown>, fetchImpl: typeof fetch = fetch) {
   if (!/^sk-[A-Za-z0-9_-]{16,200}$/.test(apiKey)) throw new Error("API_INVALID_KEY_FORMAT");
+  if (request.model !== "deepseek-flash" || request.stream !== true || request.store !== false ||
+    request.max_output_tokens !== MAX_OUTPUT_TOKENS || request.previous_response_id || request.background || request.conversation) throw new Error("API_REQUEST_BOUNDS_REQUIRED");
+  if (!Array.isArray(request.input) || !Array.isArray(request.tools)) throw new Error("API_INVALID_REQUEST");
+  const input: unknown[] = request.input;
+  const tools: unknown[] = request.tools;
   if (!input.every((item) => isObject(item) && [undefined, "message", "function_call", "function_call_output", "reasoning"].includes(item.type as string | undefined))) throw new Error("API_INPUT_TYPE_REFUSED");
-  if (!tools.every((tool) => tool.type === "function")) throw new Error("API_SERVER_TOOLS_REFUSED");
-  const body = JSON.stringify({ model: "deepseek-flash", input, tools, tool_choice: toolChoice,
-    stream: true, max_output_tokens: MAX_OUTPUT_TOKENS, reasoning: { effort: "none" }, store: false });
+  if (!tools.every((tool) => isObject(tool) && tool.type === "function")) throw new Error("API_SERVER_TOOLS_REFUSED");
+  const body = JSON.stringify(request);
   if (Buffer.byteLength(body) > 16_384) throw new Error("API_INPUT_SIZE_LIMIT");
   // The experiment is deliberately limited to synthetic text (no image/file payloads).
   for (const item of input) {
@@ -44,13 +56,18 @@ export async function requestDeepSeek(
     const reader = result.body.getReader();
     const parser = new ResponsesStream();
     const decoder = new TextDecoder("utf-8", { fatal: true });
+    let wire = "";
     try {
       while (true) {
         const chunk = await reader.read();
         if (chunk.done) break;
-        parser.push(decoder.decode(chunk.value, { stream: true }));
+        const text = decoder.decode(chunk.value, { stream: true });
+        parser.push(text);
+        wire += text;
       }
-      parser.push(decoder.decode());
+      const tail = decoder.decode();
+      parser.push(tail);
+      wire += tail;
     } finally {
       await reader.cancel().catch(() => {});
       reader.releaseLock();
@@ -64,7 +81,7 @@ export async function requestDeepSeek(
     if (!Number.isSafeInteger(estimatedMicros)) throw new Error("API_USAGE_INVALID");
     ledger.settle(id, estimatedMicros);
     if (inputTokens > 100_000 || outputTokens > MAX_OUTPUT_TOKENS || estimatedMicros > REQUEST_RESERVATION_MICROS) throw new Error("API_BOUNDS_VIOLATED");
-    return { ...parsed, usage: { inputTokens, outputTokens, estimatedMicros }, requestedModel: "deepseek-flash" };
+    return { ...parsed, wire, usage: { inputTokens, outputTokens, estimatedMicros }, requestedModel: "deepseek-flash" };
   } catch (error) {
     // Network/HTTP failure or missing usage leaves its reservation pending. No automatic retry.
     controller.abort();
