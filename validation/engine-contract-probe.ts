@@ -13,6 +13,7 @@ import { MAX_OUTPUT_TOKENS, PRICE_REVIEW_DATE, sendBoundedDeepSeek } from "./dee
 import { checkDiagnosis, checkResponseWire, READ_COMMAND } from "./readonly-contract.js";
 import { snapshot } from "./fixtures.js";
 import { evaluateInvoiceSource, INVOICE_BASELINE, previewInvoicePatch } from "./patch-contract.js";
+import { checkRestart } from "./resume-check.js";
 
 const expectedSha = "03e5cf467f4ef2c06360b00cdc9aef64bb79b2028e25e3e122dd0bd2152ace22";
 const candidateSha = "dce685d569526ef4712fa82d20ff20e1309baad5fcd34215e1126698f611242f";
@@ -43,11 +44,14 @@ async function main() {
   check([expectedSha, candidateSha].includes(binarySha), "PROBE_BINARY_MISMATCH");
   const engineVersion = binarySha === candidateSha ? "0.162.0" : "0.140.0";
   const live = process.argv.includes("--live");
+  const restartCheck = process.argv.includes("--resume-check");
+  check(!restartCheck || (!live && engineVersion === "0.162.0"), "PROBE_RESTART_MODE_REFUSED");
   const readTask = process.argv.includes("--read-task");
   const editTask = process.argv.includes("--edit-task");
   check(!editTask || (!readTask && engineVersion === "0.162.0"), "PROBE_EDIT_TASK_REFUSED");
   check(!readTask || engineVersion === "0.162.0", "PROBE_READ_TASK_REFUSED");
   const toolCase = process.argv.find((arg) => arg.startsWith("--tool-case="))?.slice("--tool-case=".length);
+  check(!restartCheck || toolCase !== "interrupt", "PROBE_RESTART_MODE_REFUSED");
   check(Number(readTask) + Number(editTask) + Number(Boolean(toolCase)) <= 1, "PROBE_CONFLICTING_MODES");
   check(!toolCase || (["readonly", "write", "interrupt", "deny", "network-control", "network-denied", "concurrent-edit", "temp-scope", "patch-readonly", "patch-write", "patch-sensitive", "patch-outside"].includes(toolCase) && !live && engineVersion === "0.162.0"), "PROBE_TOOL_CASE_REFUSED");
   const patchCase = toolCase?.startsWith("patch-") === true || editTask;
@@ -285,6 +289,8 @@ async function main() {
   }, toolCase === "deny");
   child.on("error", () => rpc.abort(new Error("PROBE_SPAWN_FAILED")));
   let exitCode: number | null | undefined;
+  let completedIdentity: { threadId: string; turnId: string } | undefined;
+  let restarted: Awaited<ReturnType<typeof checkRestart>> | undefined;
   let shutdownMilliseconds = 0;
   let forcedExit = false;
   let timer: NodeJS.Timeout | undefined;
@@ -369,6 +375,8 @@ async function main() {
     check(isObject(readBack) && isObject(readBack.thread) && Array.isArray(readBack.thread.turns), "PROBE_INVALID_THREAD_READ");
     const lastTurn = readBack.thread.turns.at(-1);
     check(isObject(lastTurn) && lastTurn.status === expectedStatus, "PROBE_READ_STATUS_MISMATCH");
+    if (typeof lastTurn.id === "string" && expectedStatus === "completed") completedIdentity = { threadId: thread.thread.id, turnId: lastTurn.id };
+    check(!restartCheck || completedIdentity, "PROBE_RESTART_ID_MISSING");
     if (toolCase !== "interrupt") check(Array.isArray(lastTurn.items) && lastTurn.items.some((item) => isObject(item) && item.type === "agentMessage" && typeof item.text === "string" &&
       (editTask ? item.text.length > 0 : (readTask ? checkDiagnosis(item.text, readMarker) : item.text === "42"))), "PROBE_READ_TEXT_MISMATCH");
     if (readTask) check(JSON.stringify(snapshot(cwd)) === JSON.stringify(beforeFiles) && readToolResultMatched, "PROBE_READ_FILES_CHANGED");
@@ -404,6 +412,13 @@ async function main() {
       clearTimeout(exitTimer);
     }
     shutdownMilliseconds = Date.now() - shutdownStarted;
+    if (restartCheck && exitCode === 0 && result.status === "passed" && completedIdentity) {
+      const beforeRestart = JSON.stringify(snapshot(cwd));
+      restarted = await checkRestart(binary, cwd, env, completedIdentity.threadId, completedIdentity.turnId);
+      if (!restarted.passed || blockedAfterStop !== 0 || JSON.stringify(snapshot(cwd)) !== beforeRestart) {
+        result = { status: "failed", errorCode: "PROBE_RESTART_CHECK_FAILED" }; process.exitCode = 1;
+      }
+    }
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
@@ -413,7 +428,7 @@ async function main() {
   ledger?.close();
   if (exitCode !== 0) result = { taskResult: result, status: "failed", errorCode: "PROBE_UNCLEAN_EXIT" };
   const report = { kind: live ? (editTask ? "engine-deepseek-bounded-edit-task" : (readTask ? "engine-deepseek-bounded-read-task" : "engine-deepseek-text-only")) : (scopedTools ? "engine-fixed-command-boundary" : "engine-local-synthetic-response-only"), ...result, engineVersion, engineSha256: binarySha,
-    requests, notifications, diagnostics, deniedServerRequests: rpc.deniedServerRequests, stderrBytes, processExit: exitCode, shutdownMilliseconds, forcedExit,
+    requests, notifications, diagnostics, deniedServerRequests: rpc.deniedServerRequests, stderrBytes, processExit: exitCode, shutdownMilliseconds, forcedExit, restarted,
     upstream, gatewayFailure, budget, billVerified: false, realModel: live, toolsStrippedForTextProbe: live && !readTask && !editTask,
     upstreamOutputLimit: live ? MAX_OUTPUT_TOKENS : null, toolCase, toolResult, markerExists: existsSync(marker),
     interruptedProcessEnded, terminalCounts, blockedAfterStop, networkHits, externalEditWritten, externalEditPreserved,
@@ -422,7 +437,7 @@ async function main() {
     toolExecutionTested: scopedTools, sandboxEnforcement: scopedTools ? "MXC scoped; see bounded results" : "not-tested" };
   mkdirSync(path.resolve(".local/reports"), { recursive: true });
   writeFileSync(path.resolve(`.local/reports/engine-contract-${Date.now()}.json`), `${JSON.stringify(report, null, 2)}\n`, { flag: "wx" });
-  if (exitCode === 0) run.cleanup();
+  if (exitCode === 0 && (!restartCheck || restarted?.exitCode === 0)) run.cleanup();
   else process.exitCode = 1;
   console.log(JSON.stringify(report, null, 2));
   } finally { key = ""; ledger?.close(); }
