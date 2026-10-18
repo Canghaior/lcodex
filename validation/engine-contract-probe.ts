@@ -20,11 +20,14 @@ const expectedSha = "03e5cf467f4ef2c06360b00cdc9aef64bb79b2028e25e3e122dd0bd2152
 const candidateSha = "dce685d569526ef4712fa82d20ff20e1309baad5fcd34215e1126698f611242f";
 function check(value: unknown, code: string): asserts value { if (!value) throw new Error(code); }
 
-export function syntheticTextStream(text: string): string {
-  const message = { id: "msg_synthetic", type: "message", role: "assistant", status: "completed",
+export function syntheticTextStream(text: string, fault?: string): string {
+  const status = fault === "failed" ? "failed" : fault === "incomplete" ? "incomplete" : "completed";
+  const message = { id: "msg_synthetic", type: "message", role: "assistant", status: fault ? "incomplete" : "completed",
     content: [{ type: "output_text", text, annotations: [] }] };
-  const response = { id: "resp_synthetic", object: "response", created_at: 1, model: "deepseek-flash", status: "completed",
-    output: [message], usage: { input_tokens: 10, output_tokens: 1, total_tokens: 11, input_tokens_details: { cached_tokens: 0 } } };
+  const response = { id: "resp_synthetic", object: "response", created_at: 1, model: "deepseek-flash", status,
+    output: [message], usage: { input_tokens: 10, output_tokens: 1, total_tokens: 11, input_tokens_details: { cached_tokens: 0 } },
+    ...(fault === "failed" ? { error: { code: "server_error", message: "Synthetic upstream failure" } } : {}),
+    ...(fault === "incomplete" ? { incomplete_details: { reason: "max_output_tokens" } } : {}) };
   const events = [
     { type: "response.created", response: { ...response, status: "in_progress", output: [] } },
     { type: "response.output_item.added", output_index: 0, item: { ...message, status: "in_progress", content: [] } },
@@ -33,7 +36,7 @@ export function syntheticTextStream(text: string): string {
     { type: "response.output_text.done", item_id: message.id, output_index: 0, content_index: 0, text },
     { type: "response.content_part.done", item_id: message.id, output_index: 0, content_index: 0, part: message.content[0] },
     { type: "response.output_item.done", output_index: 0, item: message },
-    { type: "response.completed", response },
+    ...(fault === "missing-terminal" ? [] : [{ type: `response.${status}`, response }]),
   ];
   return events.map((event, sequence_number) => `event: ${event.type}\ndata: ${JSON.stringify({ ...event, sequence_number })}\n\n`).join("");
 }
@@ -52,6 +55,8 @@ async function main() {
   check(!editTask || (!readTask && engineVersion === "0.162.0"), "PROBE_EDIT_TASK_REFUSED");
   check(!readTask || engineVersion === "0.162.0", "PROBE_READ_TASK_REFUSED");
   const toolCase = process.argv.find((arg) => arg.startsWith("--tool-case="))?.slice("--tool-case=".length);
+  const faultCase = process.argv.find((arg) => arg.startsWith("--fault-case="))?.slice("--fault-case=".length);
+  check(!faultCase || ["failed", "incomplete", "missing-terminal"].includes(faultCase) && !live && !restartCheck && !toolCase && !readTask && !editTask && engineVersion === "0.162.0", "PROBE_FAULT_MODE_REFUSED");
   check(!restartCheck || toolCase !== "interrupt", "PROBE_RESTART_MODE_REFUSED");
   check(Number(readTask) + Number(editTask) + Number(Boolean(toolCase)) <= 1, "PROBE_CONFLICTING_MODES");
   check(!toolCase || (["readonly", "write", "interrupt", "deny", "network-control", "network-denied", "concurrent-edit", "temp-scope", "patch-readonly", "patch-write", "patch-sensitive", "patch-outside"].includes(toolCase) && !live && engineVersion === "0.162.0"), "PROBE_TOOL_CASE_REFUSED");
@@ -148,7 +153,7 @@ async function main() {
         developerMarkerPresent: body.includes("SYNTHETIC_DEVELOPER_MARKER"),
       });
       check(requests.length <= (toolCase || readTask || editTask ? 2 : 1), "PROBE_UNEXPECTED_RETRY");
-      let wire = syntheticTextStream("42");
+      let wire = syntheticTextStream(faultCase ? "PARTIAL_SYNTHETIC" : "42", faultCase);
       if ((toolCase || (readTask || editTask) && !live) && requests.length === 1) {
         check(Array.isArray(parsed.tools), "PROBE_SHELL_TOOL_MISSING");
         let item: Record<string, unknown>;
@@ -298,6 +303,7 @@ async function main() {
   let forcedExit = false;
   let timer: NodeJS.Timeout | undefined;
   let result: Record<string, unknown> = { status: "failed" };
+  let observedTurnStatus: unknown = "not-received";
   let interruptedProcessEnded: unknown = "not-tested";
   let terminalCounts: unknown = null;
   try {
@@ -343,7 +349,8 @@ async function main() {
     }
     const terminal = await Promise.race([completed, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("PROBE_TURN_TIMEOUT")), live ? 70_000 : 30_000); })]);
     check(isObject(terminal) && isObject(terminal.turn), "PROBE_INVALID_TERMINAL");
-    const expectedStatus = toolCase === "interrupt" ? "interrupted" : "completed";
+    observedTurnStatus = terminal.turn.status;
+    const expectedStatus = faultCase ? "failed" : toolCase === "interrupt" ? "interrupted" : "completed";
     check(terminal.turn.status === expectedStatus, "PROBE_TURN_FAILED");
     check(requests.length === (readTask || editTask || toolCase && toolCase !== "interrupt" ? 2 : 1) && rpc.deniedServerRequests === (toolCase === "deny" ? 1 : 0), "PROBE_UNEXPECTED_OPERATIONS");
     if (toolCase === "deny") check(!existsSync(marker), "PROBE_DECLINED_COMMAND_EXECUTED");
@@ -380,7 +387,7 @@ async function main() {
     check(isObject(lastTurn) && lastTurn.status === expectedStatus, "PROBE_READ_STATUS_MISMATCH");
     if (typeof lastTurn.id === "string" && expectedStatus === "completed") completedIdentity = { threadId: thread.thread.id, turnId: lastTurn.id };
     check(!restartCheck || completedIdentity, "PROBE_RESTART_ID_MISSING");
-    if (toolCase !== "interrupt") check(Array.isArray(lastTurn.items) && lastTurn.items.some((item) => isObject(item) && item.type === "agentMessage" && typeof item.text === "string" &&
+    if (toolCase !== "interrupt" && !faultCase) check(Array.isArray(lastTurn.items) && lastTurn.items.some((item) => isObject(item) && item.type === "agentMessage" && typeof item.text === "string" &&
       (editTask ? item.text.length > 0 : (readTask ? checkDiagnosis(item.text, readMarker) : item.text === "42"))), "PROBE_READ_TEXT_MISMATCH");
     if (readTask) check(JSON.stringify(snapshot(cwd)) === JSON.stringify(beforeFiles) && readToolResultMatched, "PROBE_READ_FILES_CHANGED");
     if (editTask) {
@@ -391,7 +398,8 @@ async function main() {
       const afterFiles = snapshot(cwd);
       check(Object.keys(afterFiles).length === Object.keys(beforeFiles).length && Object.entries(beforeFiles).every(([file, hash]) => file === "invoice.mjs" || afterFiles[file] === hash), "PROBE_UNRELATED_FILES_CHANGED");
     }
-    result = { status: "passed", turnStatus: terminal.turn.status, readBack: toolCase === "interrupt" ? "interrupted-matched" : (editTask ? "completed-and-independent-checks-passed" : (readTask ? "completed-and-diagnosis-matched" : "completed-and-text-matched")) };
+    if (faultCase) check(JSON.stringify(snapshot(cwd)) === JSON.stringify(beforeFiles) && !notifications.some((method) => method.startsWith("item/commandExecution/") || method === "turn/diff/updated"), "PROBE_FAULT_SIDE_EFFECT");
+    result = { status: "passed", turnStatus: terminal.turn.status, readBack: faultCase ? "failure-matched" : toolCase === "interrupt" ? "interrupted-matched" : (editTask ? "completed-and-independent-checks-passed" : (readTask ? "completed-and-diagnosis-matched" : "completed-and-text-matched")) };
   } catch (error) {
     result = { status: "failed", errorCode: error instanceof Error && /^(PROBE_|RPC_)[A-Z0-9_-]+$/.test(error.message) ? error.message : "PROBE_FAILED" };
     process.exitCode = 1;
@@ -433,9 +441,9 @@ async function main() {
   const report = { kind: live ? (editTask ? "engine-deepseek-bounded-edit-task" : (readTask ? "engine-deepseek-bounded-read-task" : "engine-deepseek-text-only")) : (scopedTools ? "engine-fixed-command-boundary" : "engine-local-synthetic-response-only"), ...result, engineVersion, engineSha256: binarySha,
     requests, notifications, diagnostics, deniedServerRequests: rpc.deniedServerRequests, stderrBytes, processExit: exitCode, shutdownMilliseconds, forcedExit, restarted,
     upstream, gatewayFailure, budget, billVerified: false, realModel: live, toolsStrippedForTextProbe: live && !readTask && !editTask,
-    upstreamOutputLimit: live ? MAX_OUTPUT_TOKENS : null, toolCase, toolResult, markerExists: existsSync(marker),
+    upstreamOutputLimit: live ? MAX_OUTPUT_TOKENS : null, toolCase, faultCase, observedTurnStatus, toolResult, markerExists: existsSync(marker),
     interruptedProcessEnded, terminalCounts, blockedAfterStop, networkHits, externalEditWritten, externalEditPreserved,
-    readTask, readToolResultMatched, filesUnchanged: readTask ? JSON.stringify(snapshot(cwd)) === JSON.stringify(beforeFiles) : "not-tested",
+    readTask, readToolResultMatched, filesUnchanged: readTask || faultCase ? JSON.stringify(snapshot(cwd)) === JSON.stringify(beforeFiles) : "not-tested",
     editTask, patchResultMatched, baselineChecks, independentChecks,
     toolExecutionTested: scopedTools, sandboxEnforcement: scopedTools ? "MXC scoped; see bounded results" : "not-tested" };
   mkdirSync(path.resolve(".local/reports"), { recursive: true });
