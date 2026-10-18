@@ -2,7 +2,7 @@
 
 目标是开发一款接入 DeepSeek 的本地桌面编程助手：选择项目后，通过自然语言完成代码阅读、修改和测试，并能查看执行过程与文件差异。
 
-已进入 P1，建立最小 TypeScript 验证工程并通过本地引擎握手；尚未实现桌面应用，也未验证 DeepSeek 与 Codex 引擎的实际兼容性。
+已进入 P1，TypeScript 验证工程已跑通受限的 DeepSeek 读代码、补丁修改、沙箱测试与总结闭环。完整兼容性和文件保护尚未通过；还没有桌面应用或安装包。
 
 - [开发方案](docs/DEVELOPMENT_PLAN.md)：产品范围、技术路线、阶段任务和验收标准。
 - [编程执行计划](docs/IMPLEMENTATION_PLAN.md)：P0 至 P4 的开发工作包、执行顺序、检查条件和 GitHub 同步规则。
@@ -10,6 +10,7 @@
 - [界面要求](docs/UI_SPEC.md)：用户指定的 Codex 风格布局、视觉参考与 DeepSeek 模型区域。
 - [补充建议评审](docs/PLAN_REVIEW.md)：逐项处理结果、官方资料核对、工作量和待决定事项。
 - [执行记录](docs/PROGRESS.md)：当前阶段、下一步、验证证据和决策记录。
+- [P1 门槛核对](docs/validation/P1_GATE_REVIEW.md)：已通过的限定样本、剩余阻塞和路线判断；避免将局部成功当作阶段完成。
 - [P1 环境与本地通信结果](docs/validation/P1_ENVIRONMENT.md)：固定版本、运行命令、已通过检查与未验证范围。
 - [P1 直接 API 结果](docs/validation/P1_RESPONSES.md)：首个失败、两轮合成工具调用复测、用量与预算；不代表引擎兼容通过。
 - [P1 引擎文本链路](docs/validation/P1_ENGINE_TEXT.md)：本地模拟与实际 DeepSeek 文本请求、引擎状态回读，以及尚未验证的工具执行范围。
