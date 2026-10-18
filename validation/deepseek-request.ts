@@ -1,6 +1,7 @@
 import { BudgetLedger } from "./budget.js";
 import { isObject } from "./rpc.js";
 import { ResponsesStream } from "./responses-stream.js";
+import { assertNoKnownSecrets } from "./outbound-data.js";
 
 export const PRICE_REVIEW_DATE = "2026-10-19";
 export const REQUEST_RESERVATION_MICROS = 250_000;
@@ -35,6 +36,7 @@ export async function sendBoundedDeepSeek(ledger: BudgetLedger, trial: string, a
   if (input.some((item) => isObject(item) && item.type === "custom_tool_call" && item.name !== "apply_patch")) throw new Error("API_INPUT_TYPE_REFUSED");
   const body = JSON.stringify(request);
   if (Buffer.byteLength(body) > 16_384) throw new Error("API_INPUT_SIZE_LIMIT");
+  assertNoKnownSecrets(body, [apiKey]);
   // The experiment is deliberately limited to synthetic text (no image/file payloads).
   for (const item of input) {
     const value = item as Record<string, unknown>;

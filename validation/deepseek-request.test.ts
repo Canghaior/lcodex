@@ -133,3 +133,25 @@ test("engine entry requires bounded stateless requests and preserves supplied in
     assert.ok(result.wire.includes("response.completed"));
   } finally { ledger.close(); run.cleanup(); }
 });
+
+test("known credentials in messages or tool results are refused before reservation and HTTP", async () => {
+  const run = createRunDirectory("outbound-secret-test");
+  const file = path.join(run.root, "synthetic-ledger.jsonl");
+  BudgetLedger.initialize(file);
+  const ledger = new BudgetLedger(file);
+  let calls = 0;
+  const fakeFetch: typeof fetch = async () => { calls++; throw new Error("should not be called"); };
+  try {
+    for (const input of [
+      [{ role: "user", content: `copied credential: ${fakeKey}` }],
+      [{ type: "function_call_output", call_id: "read", output: `command output: ${fakeKey}` }],
+      [{ type: "custom_tool_call_output", call_id: "patch", output: fakeKey }],
+      [{ role: "user", content: Buffer.from(fakeKey).toString("base64") }],
+    ]) {
+      await assert.rejects(requestDeepSeek(ledger, "secret", fakeKey, input, [], "none", fakeFetch), { message: "API_SENSITIVE_INPUT_REFUSED" });
+    }
+    await assert.rejects(requestDeepSeek(ledger, "secret", fakeKey, [], [{ type: "function", name: "read", description: fakeKey }], "none", fakeFetch), { message: "API_SENSITIVE_INPUT_REFUSED" });
+    assert.equal(calls, 0);
+    assert.equal(ledger.summary().requests, 0);
+  } finally { ledger.close(); run.cleanup(); }
+});

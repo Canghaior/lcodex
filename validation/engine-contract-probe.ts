@@ -15,6 +15,7 @@ import { snapshot } from "./fixtures.js";
 import { evaluateInvoiceSource, INVOICE_BASELINE, previewInvoicePatch } from "./patch-contract.js";
 import { checkRestart } from "./resume-check.js";
 import { mapDeepSeekRoles } from "./deepseek-roles.js";
+import { assertNoKnownSecrets } from "./outbound-data.js";
 
 const expectedSha = "03e5cf467f4ef2c06360b00cdc9aef64bb79b2028e25e3e122dd0bd2152ace22";
 const candidateSha = "dce685d569526ef4712fa82d20ff20e1309baad5fcd34215e1126698f611242f";
@@ -48,6 +49,7 @@ async function main() {
   check([expectedSha, candidateSha].includes(binarySha), "PROBE_BINARY_MISMATCH");
   const engineVersion = binarySha === candidateSha ? "0.162.0" : "0.140.0";
   const live = process.argv.includes("--live");
+  const compactCheck = process.argv.includes("--compact-check");
   const restartCheck = process.argv.includes("--resume-check");
   check(!restartCheck || (!live && engineVersion === "0.162.0"), "PROBE_RESTART_MODE_REFUSED");
   const readTask = process.argv.includes("--read-task");
@@ -56,6 +58,7 @@ async function main() {
   check(!readTask || engineVersion === "0.162.0", "PROBE_READ_TASK_REFUSED");
   const toolCase = process.argv.find((arg) => arg.startsWith("--tool-case="))?.slice("--tool-case=".length);
   const faultCase = process.argv.find((arg) => arg.startsWith("--fault-case="))?.slice("--fault-case=".length);
+  check(!compactCheck || !restartCheck && !toolCase && !readTask && !editTask && !faultCase && engineVersion === "0.162.0", "PROBE_COMPACT_MODE_REFUSED");
   check(!faultCase || ["failed", "incomplete", "missing-terminal"].includes(faultCase) && !live && !restartCheck && !toolCase && !readTask && !editTask && engineVersion === "0.162.0", "PROBE_FAULT_MODE_REFUSED");
   check(!restartCheck || toolCase !== "interrupt", "PROBE_RESTART_MODE_REFUSED");
   check(Number(readTask) + Number(editTask) + Number(Boolean(toolCase)) <= 1, "PROBE_CONFLICTING_MODES");
@@ -88,6 +91,7 @@ async function main() {
   writeFileSync(path.join(cwd, ".env"), "ENV_SYNTHETIC");
   writeFileSync(outside, "OUTSIDE_SYNTHETIC");
   const readMarker = `source-${randomUUID()}`;
+  const contextMarker = `context-${randomUUID()}`;
   if (readTask) writeFileSync(path.join(cwd, "invoice.mjs"), `// ${readMarker}\nexport function invoiceTotal(items) {\n  return items.reduce((sum, item) => sum + item.priceCents, 0);\n}\n`);
   if (editTask) writeFileSync(path.join(cwd, "invoice.mjs"), INVOICE_BASELINE);
   const baselineChecks = editTask ? evaluateInvoiceSource(INVOICE_BASELINE) : null;
@@ -151,9 +155,14 @@ async function main() {
         tools: Array.isArray(parsed.tools) ? parsed.tools.filter(isObject).map((tool) => ({ type: tool.type, name: tool.name })) : [],
         ancestorInstructionsDetected: body.includes("本项目开发接入 DeepSeek"),
         developerMarkerPresent: body.includes("SYNTHETIC_DEVELOPER_MARKER"),
+        contextMarkerPresent: compactCheck ? body.includes(contextMarker) : "not-tested",
       });
-      check(requests.length <= (toolCase || readTask || editTask ? 2 : 1), "PROBE_UNEXPECTED_RETRY");
+      check(requests.length <= (compactCheck ? 3 : toolCase || readTask || editTask ? 2 : 1), "PROBE_UNEXPECTED_RETRY");
       let wire = syntheticTextStream(faultCase ? "PARTIAL_SYNTHETIC" : "42", faultCase);
+      if (compactCheck && requests.length > 1) {
+        check(body.includes(contextMarker), "PROBE_CONTEXT_MARKER_LOST");
+        wire = syntheticTextStream(requests.length === 2 ? `Remembered reference marker: ${contextMarker}. No tools have run.` : contextMarker);
+      }
       if ((toolCase || (readTask || editTask) && !live) && requests.length === 1) {
         check(Array.isArray(parsed.tools), "PROBE_SHELL_TOOL_MISSING");
         let item: Record<string, unknown>;
@@ -209,6 +218,7 @@ async function main() {
       }
       if (live && ledger) {
         check(!body.includes("本项目开发接入 DeepSeek"), "PROBE_ANCESTOR_INSTRUCTIONS");
+        assertNoKnownSecrets(body, [localToken, key]);
         const tools = (readTask || editTask) && requests.length === 1 && Array.isArray(parsed.tools)
           ? parsed.tools.filter(isObject).filter((tool) => editTask ? tool.type === "custom" && tool.name === "apply_patch" : tool.type === "function" && tool.name === "exec_command") : [];
         check(!(readTask || editTask) || requests.length !== 1 || tools.length === 1, "PROBE_SHELL_TOOL_MISSING");
@@ -216,7 +226,7 @@ async function main() {
           ...parsed, max_output_tokens: MAX_OUTPUT_TOKENS, reasoning: { effort: "none" }, tools,
           tool_choice: tools.length ? "auto" : "none", parallel_tool_calls: false, store: false,
         });
-        activeUpstream = sendBoundedDeepSeek(ledger, editTask ? "engine-edit-v1" : (readTask ? "engine-read-v1" : "engine-text-v1"), key, adapted, fetch, upstreamAbort.signal);
+        activeUpstream = sendBoundedDeepSeek(ledger, compactCheck ? "engine-compact-v1" : editTask ? "engine-edit-v1" : (readTask ? "engine-read-v1" : "engine-text-v1"), key, adapted, fetch, upstreamAbort.signal);
         const response = await activeUpstream;
         activeUpstream = undefined;
         upstream.push({ terminalType: response.terminalType, events: response.events, usage: response.usage, returnedModel: response.response.model,
@@ -276,18 +286,21 @@ async function main() {
       : ['exclude = ["LCODEX_LOCAL_PROBE_TOKEN", "DEEPSEEK_API_KEY"]']),
     '[analytics]', 'enabled = false', '[model_providers.local_contract]',
     'name = "Local synthetic protocol probe"', `base_url = "http://127.0.0.1:${address.port}/v1"`,
-    'wire_api = "responses"', 'requires_openai_auth = false', 'env_key = "LCODEX_LOCAL_PROBE_TOKEN"', 'request_max_retries = 0', 'stream_max_retries = 0', '',
+    'wire_api = "responses"', 'requires_openai_auth = false', 'env_key = "LCODEX_LOCAL_PROBE_TOKEN"', 'request_max_retries = 0', 'stream_max_retries = 0',
+    ...(compactCheck ? ['[model_providers.local_contract.capabilities]', 'remote_compaction = "unsupported"'] : []), '',
   ].join("\n"));
   const child = spawn(binary, ["app-server", "--listen", "stdio://", "--strict-config"], { env, cwd, windowsHide: true, stdio: ["pipe", "pipe", "pipe"], shell: false });
   let stderrBytes = 0;
   child.stderr.on("data", (chunk: Buffer) => { stderrBytes += chunk.length; });
   const closed = new Promise<number | null>((resolve) => child.once("close", resolve));
   const notifications: string[] = [];
+  const itemTypes: string[] = [];
   const diagnostics: unknown[] = [];
   let complete!: (value: unknown) => void;
-  const completed = new Promise<unknown>((resolve) => { complete = resolve; });
+  let completed = new Promise<unknown>((resolve) => { complete = resolve; });
   const rpc = new JsonLineRpc(child.stdout, child.stdin, 15_000, 1_048_576, (method, params) => {
     notifications.push(method);
+    if (method === "item/completed" && isObject(params) && isObject(params.item) && typeof params.item.type === "string") itemTypes.push(params.item.type);
     if (["error", "warning"].includes(method) && isObject(params)) {
       const error = isObject(params.error) ? params.error : params;
       diagnostics.push({ method, info: error.codexErrorInfo,
@@ -304,6 +317,7 @@ async function main() {
   let timer: NodeJS.Timeout | undefined;
   let result: Record<string, unknown> = { status: "failed" };
   let observedTurnStatus: unknown = "not-received";
+  let compactionResult: unknown = "not-tested";
   let interruptedProcessEnded: unknown = "not-tested";
   let terminalCounts: unknown = null;
   try {
@@ -316,7 +330,7 @@ async function main() {
       ? `Fix invoiceTotal to account for each line's quantity, and add applyDiscount(cents, percent) that returns integer cents rounded with Math.round after a percentage discount. Use only arithmetic expressions. Keep the existing exported function signatures and the items.reduce((sum, item) => expression, 0) form. Apply exactly one apply_patch call, a single Update File: invoice.mjs hunk (one @@), with no other file edits. The complete current file is:\n${INVOICE_BASELINE}\nDo not run commands. After patch success, briefly report the change and say tests have not been run by you.`
       : readTask
       ? `Read invoice.mjs and diagnose invoiceTotal for one line with priceCents=125, quantity=4. Use exec_command exactly once with cmd=${JSON.stringify(READ_COMMAND)}, shell=${JSON.stringify(shellPath)}, login=false, workdir=${JSON.stringify(cwd)}, yield_time_ms=10000, max_output_tokens=2048. No other commands. Return only a JSON object with file, ignoresQuantity (boolean), observedTotal, expectedTotal, and marker (the source comment without // or spaces). Do not modify files.`
-      : "Reply with only 42. Do not use any tools.";
+      : compactCheck ? `Remember this exact reference marker for later: ${contextMarker}. Reply with only 42. Do not use tools.` : "Reply with only 42. Do not use any tools.";
     const started = await rpc.request("turn/start", { threadId: thread.thread.id, input: [{ type: "text", text: prompt, text_elements: [] }] });
     let commandPid: number | undefined;
     if (toolCase === "concurrent-edit") {
@@ -399,6 +413,25 @@ async function main() {
       check(Object.keys(afterFiles).length === Object.keys(beforeFiles).length && Object.entries(beforeFiles).every(([file, hash]) => file === "invoice.mjs" || afterFiles[file] === hash), "PROBE_UNRELATED_FILES_CHANGED");
     }
     if (faultCase) check(JSON.stringify(snapshot(cwd)) === JSON.stringify(beforeFiles) && !notifications.some((method) => method.startsWith("item/commandExecution/") || method === "turn/diff/updated"), "PROBE_FAULT_SIDE_EFFECT");
+    if (compactCheck) {
+      const nextTerminal = async (method: string, params: Record<string, unknown>) => {
+        clearTimeout(timer);
+        completed = new Promise<unknown>((resolve) => { complete = resolve; });
+        await rpc.request(method, params);
+        const next = await Promise.race([completed, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("PROBE_COMPACT_TIMEOUT")), live ? 70_000 : 30_000); })]);
+        clearTimeout(timer);
+        check(isObject(next) && isObject(next.turn) && next.turn.status === "completed", "PROBE_COMPACT_TURN_FAILED");
+      };
+      await nextTerminal("thread/compact/start", { threadId: thread.thread.id });
+      check(itemTypes.includes("contextCompaction") && requests.length === 2, "PROBE_COMPACTION_NOT_OBSERVED");
+      await nextTerminal("turn/start", { threadId: thread.thread.id, input: [{ type: "text", text: "Return only the exact reference marker I asked you to remember earlier. No tools.", text_elements: [] }] });
+      const compactHistory = await rpc.request("thread/read", { threadId: thread.thread.id, includeTurns: true });
+      check(isObject(compactHistory) && isObject(compactHistory.thread) && Array.isArray(compactHistory.thread.turns), "PROBE_COMPACT_HISTORY_MISSING");
+      const last = compactHistory.thread.turns.at(-1);
+      const markerMatched = isObject(last) && last.status === "completed" && Array.isArray(last.items) && last.items.some((item) => isObject(item) && item.type === "agentMessage" && typeof item.text === "string" && item.text.trim() === contextMarker);
+      compactionResult = { markerMatched, requests: requests.length, compactionItemObserved: itemTypes.includes("contextCompaction"), filesUnchanged: JSON.stringify(snapshot(cwd)) === JSON.stringify(beforeFiles) };
+      check(markerMatched && Number(requests.length) === 3 && rpc.deniedServerRequests === 0 && JSON.stringify(snapshot(cwd)) === JSON.stringify(beforeFiles), "PROBE_COMPACT_CHECK_FAILED");
+    }
     result = { status: "passed", turnStatus: terminal.turn.status, readBack: faultCase ? "failure-matched" : toolCase === "interrupt" ? "interrupted-matched" : (editTask ? "completed-and-independent-checks-passed" : (readTask ? "completed-and-diagnosis-matched" : "completed-and-text-matched")) };
   } catch (error) {
     result = { status: "failed", errorCode: error instanceof Error && /^(PROBE_|RPC_)[A-Z0-9_-]+$/.test(error.message) ? error.message : "PROBE_FAILED" };
@@ -439,7 +472,7 @@ async function main() {
   ledger?.close();
   if (exitCode !== 0) result = { taskResult: result, status: "failed", errorCode: "PROBE_UNCLEAN_EXIT" };
   const report = { kind: live ? (editTask ? "engine-deepseek-bounded-edit-task" : (readTask ? "engine-deepseek-bounded-read-task" : "engine-deepseek-text-only")) : (scopedTools ? "engine-fixed-command-boundary" : "engine-local-synthetic-response-only"), ...result, engineVersion, engineSha256: binarySha,
-    requests, notifications, diagnostics, deniedServerRequests: rpc.deniedServerRequests, stderrBytes, processExit: exitCode, shutdownMilliseconds, forcedExit, restarted,
+    requests, notifications, diagnostics, compactCheck, compactionResult, deniedServerRequests: rpc.deniedServerRequests, stderrBytes, processExit: exitCode, shutdownMilliseconds, forcedExit, restarted,
     upstream, gatewayFailure, budget, billVerified: false, realModel: live, toolsStrippedForTextProbe: live && !readTask && !editTask,
     upstreamOutputLimit: live ? MAX_OUTPUT_TOKENS : null, toolCase, faultCase, observedTurnStatus, toolResult, markerExists: existsSync(marker),
     interruptedProcessEnded, terminalCounts, blockedAfterStop, networkHits, externalEditWritten, externalEditPreserved,
