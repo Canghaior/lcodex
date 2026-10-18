@@ -42,3 +42,18 @@
 - 仍需真实 DeepSeek 的新版本协议、模型代码任务、实际编辑工具、并行/限额、网络与数据出口、已有改动和并发保护、恢复可行性、重连。MXC 临时目录警告未解决。P1 尚未通过，不进入 P2。
 
 接口语义依据：[app-server 官方文档](https://learn.chatgpt.com/docs/app-server)，实际可用性和以上结论以固定版本的 schema、工具输出、进程与文件观察为准。
+
+## 后续补充：实际 apply_patch 边界
+
+同日补充固定补丁样本，仍使用模拟模型、真实工具。按 0.162.0 的 ModelInfo 将 apply_patch_tool_type 设为 freeform，实际注册 custom 类型 apply_patch；工具结果为 custom_tool_call_output，通过 call_id 关联。
+
+- 只读项目：补丁被权限/审批策略拒绝，原文件不变。
+- 可写项目：inside.txt 修改成功，其他文件不变，收到 file change 生命周期和 turn/diff/updated。
+- 可写项目中的 .env：读取阶段被拒绝，文件不变。
+- 项目外的合成文件：读取阶段被拒绝，文件不变。
+
+可写样本首次和第一次复测均出现“任务成功、引擎退出超时”：原来 3 秒以及改为 10 秒的退出窗口均触发兜底结束，不能算该次完整探针通过。随后查阅固定源码 [thread_processor.rs](https://raw.githubusercontent.com/openai/codex/rust-v0.162.0/codex-rs/app-server/src/request_processors/thread_processor.rs)，正常关闭依次包含各最多 10 秒的后台任务与线程收尾，因此将窗口设为 25 秒，并分别记录任务结果、退出码、耗时、是否兜底结束。
+
+之后一轮可写复测通过，实际正常退出仅 27 毫秒，无强制结束。由于它没有经历长等待，**不能据此确认先前间歇性退出问题的根因已解决**；后续写任务仍须记录和核对退出，超时不能假报正常。通过进程查询确认本项目候选引擎无遗留后，清理两个失败副本共 6,804,784 字节；报告和预算账本保留。
+
+模型尚未生成真实补丁，当前付费入口仍拒绝 custom 工具和相应历史；后续若开放，要先验证 apply_patch 专用输入、流式内容合同和独立验收环境，不能直接放开任意工具。

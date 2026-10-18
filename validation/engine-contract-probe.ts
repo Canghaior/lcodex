@@ -45,7 +45,8 @@ async function main() {
   const readTask = process.argv.includes("--read-task");
   check(!readTask || engineVersion === "0.162.0", "PROBE_READ_TASK_REFUSED");
   const toolCase = process.argv.find((arg) => arg.startsWith("--tool-case="))?.slice("--tool-case=".length);
-  check(!toolCase || (["readonly", "write", "interrupt", "deny", "network-control", "network-denied", "concurrent-edit", "temp-scope"].includes(toolCase) && !live && engineVersion === "0.162.0"), "PROBE_TOOL_CASE_REFUSED");
+  check(!toolCase || (["readonly", "write", "interrupt", "deny", "network-control", "network-denied", "concurrent-edit", "temp-scope", "patch-readonly", "patch-write", "patch-sensitive", "patch-outside"].includes(toolCase) && !live && engineVersion === "0.162.0"), "PROBE_TOOL_CASE_REFUSED");
+  const patchCase = toolCase?.startsWith("patch-") === true;
   const networkCase = toolCase?.startsWith("network-") === true;
   const tempCase = toolCase?.startsWith("temp-") === true;
   const environmentCase = networkCase || tempCase;
@@ -133,14 +134,23 @@ async function main() {
       let wire = syntheticTextStream("42");
       if ((toolCase || readTask && !live) && requests.length === 1) {
         check(Array.isArray(parsed.tools), "PROBE_SHELL_TOOL_MISSING");
+        let item: Record<string, unknown>;
+        if (patchCase) {
+          check(parsed.tools.filter(isObject).some((tool) => tool.name === "apply_patch" && tool.type === "custom"), "PROBE_PATCH_TOOL_MISSING");
+          const patchPath = toolCase === "patch-sensitive" ? ".env" : (toolCase === "patch-outside" ? outside : "inside.txt");
+          const oldText = toolCase === "patch-sensitive" ? "ENV_SYNTHETIC" : (toolCase === "patch-outside" ? "OUTSIDE_SYNTHETIC" : "INSIDE_SYNTHETIC");
+          item = { id: "fc_synthetic", call_id: "call_synthetic", type: "custom_tool_call", name: "apply_patch", status: "completed",
+            input: `*** Begin Patch\n*** Update File: ${patchPath}\n@@\n-${oldText}\n+EDITED_SYNTHETIC\n*** End Patch` };
+        } else {
         const shellTool = parsed.tools.filter(isObject).find((tool) => ["shell_command", "exec_command"].includes(String(tool.name)));
         check(shellTool, "PROBE_SHELL_TOOL_MISSING");
         const args = shellTool.name === "exec_command"
           ? { cmd: readTask ? READ_COMMAND : fixedCommand, workdir: cwd, yield_time_ms: 10_000, max_output_tokens: 2048, login: false, shell: shellPath,
             ...(toolCase === "deny" ? { sandbox_permissions: "require_escalated", justification: "Synthetic validation request; the client will decline it." } : {}) }
           : { command: fixedCommand, workdir: cwd, timeout_ms: 10_000, login: false };
-        const item = { id: "fc_synthetic", call_id: "call_synthetic", type: "function_call", name: shellTool.name,
+        item = { id: "fc_synthetic", call_id: "call_synthetic", type: "function_call", name: shellTool.name,
           arguments: JSON.stringify(args), status: "completed" };
+        }
         const events = [
           { type: "response.created", response: { id: "resp_tool", status: "in_progress", output: [] } },
           { type: "response.output_item.added", output_index: 0, item },
@@ -151,7 +161,7 @@ async function main() {
         if (readTask) readCallId = "call_synthetic";
       } else if (toolCase) {
         check(Array.isArray(parsed.input), "PROBE_NO_TOOL_HISTORY");
-        const outputs = parsed.input.filter(isObject).filter((item) => item.type === "function_call_output" && item.call_id === "call_synthetic");
+        const outputs = parsed.input.filter(isObject).filter((item) => item.type === (patchCase ? "custom_tool_call_output" : "function_call_output") && item.call_id === "call_synthetic");
         check(outputs.length === 1 && typeof outputs[0]?.output === "string", "PROBE_TOOL_RESULT_MISSING");
         const output = outputs[0].output as string;
         const json = output.match(/\{[^{}]*"(?:inside|network)"[^{}]*\}/)?.[0];
@@ -206,14 +216,14 @@ async function main() {
     "$r | ConvertTo-Json -Compress",
   ].join("; ");
   const catalogPath = path.join(run.root, "home/models.json");
-  writeFileSync(catalogPath, JSON.stringify(validationCatalog(scopedTools, readTask)));
+  writeFileSync(catalogPath, JSON.stringify(validationCatalog(scopedTools, readTask, patchCase)));
   writeFileSync(path.join(run.root, "home/config.toml"), [
     'model = "deepseek-flash"', 'model_provider = "local_contract"', 'model_reasoning_effort = "none"',
     `model_catalog_json = '${catalogPath}'`,
     `approval_policy = "${toolCase === "deny" ? "on-request" : "never"}"`, ...(scopedTools ? ['default_permissions = "scoped"'] : ['sandbox_mode = "read-only"']),
     'web_search = "disabled"', 'allow_login_shell = false',
     ...(scopedTools ? ['[windows]', 'sandbox = "mxc"', '[permissions.scoped.filesystem]', '":minimal" = "read"',
-      `${quote(cwd)} = "${toolCase && ["write", "deny", "interrupt", "concurrent-edit"].includes(toolCase) ? "write" : "read"}"`, `${quote(path.join(cwd, ".env"))} = "deny"`,
+      `${quote(cwd)} = "${toolCase && ["write", "deny", "interrupt", "concurrent-edit", "patch-write", "patch-sensitive", "patch-outside"].includes(toolCase) ? "write" : "read"}"`, `${quote(path.join(cwd, ".env"))} = "deny"`,
       `${quote(path.join(cwd, ".git"))} = "read"`,
       `${quote(path.dirname(process.env.COMSPEC ?? "C:/Windows/System32/cmd.exe"))} = "read"`,
       `${quote(path.dirname(shellPath!))} = "read"`,
@@ -248,6 +258,8 @@ async function main() {
   }, toolCase === "deny");
   child.on("error", () => rpc.abort(new Error("PROBE_SPAWN_FAILED")));
   let exitCode: number | null | undefined;
+  let shutdownMilliseconds = 0;
+  let forcedExit = false;
   let timer: NodeJS.Timeout | undefined;
   let result: Record<string, unknown> = { status: "failed" };
   let interruptedProcessEnded: unknown = "not-tested";
@@ -316,7 +328,13 @@ async function main() {
       externalEditPreserved = readFileSync(path.join(cwd, "inside.txt"), "utf8").includes("USER_CONCURRENT_EDIT");
       check(externalEditPreserved, "PROBE_EXTERNAL_EDIT_OVERWRITTEN");
     }
-    if (toolCase && !environmentCase && !["interrupt", "deny", "concurrent-edit"].includes(toolCase)) check(isObject(toolResult) && toolResult.inside === true && toolResult.outside === false && toolResult.sensitive === false &&
+    if (patchCase) {
+      const afterFiles = snapshot(cwd);
+      check(readFileSync(path.join(cwd, "inside.txt"), "utf8").trim() === (toolCase === "patch-write" ? "EDITED_SYNTHETIC" : "INSIDE_SYNTHETIC") &&
+        readFileSync(outside, "utf8") === "OUTSIDE_SYNTHETIC" && Object.keys(afterFiles).length === Object.keys(beforeFiles).length &&
+        Object.entries(beforeFiles).every(([file, hash]) => file === "inside.txt" || afterFiles[file] === hash), "PROBE_PATCH_BOUNDARY_FAILED");
+    }
+    if (toolCase && !environmentCase && !patchCase && !["interrupt", "deny", "concurrent-edit"].includes(toolCase)) check(isObject(toolResult) && toolResult.inside === true && toolResult.outside === false && toolResult.sensitive === false &&
       toolResult.write === (toolCase === "write") && existsSync(marker) === (toolCase === "write"), "PROBE_EXECUTION_BOUNDARY_FAILED");
     const readBack = await rpc.request("thread/read", { threadId: thread.thread.id, includeTurns: true });
     check(isObject(readBack) && isObject(readBack.thread) && Array.isArray(readBack.thread.turns), "PROBE_INVALID_THREAD_READ");
@@ -331,16 +349,21 @@ async function main() {
     process.exitCode = 1;
   } finally {
     clearTimeout(timer);
+    const shutdownStarted = Date.now();
     rpc.abort(new Error("PROBE_CLOSED"));
     child.stdin.end();
     let exitTimer: NodeJS.Timeout | undefined;
-    exitCode = await Promise.race([closed, new Promise<undefined>((resolve) => { exitTimer = setTimeout(() => resolve(undefined), 3_000); })]);
+    // Pinned 0.162.0 drains background tasks and then threads, each with a 10s
+    // bound. Allow those phases to finish instead of killing at their first deadline.
+    exitCode = await Promise.race([closed, new Promise<undefined>((resolve) => { exitTimer = setTimeout(() => resolve(undefined), 25_000); })]);
     clearTimeout(exitTimer);
     if (exitCode === undefined) {
+      forcedExit = true;
       child.kill();
       exitCode = await Promise.race([closed, new Promise<undefined>((resolve) => { exitTimer = setTimeout(() => resolve(undefined), 3_000); })]);
       clearTimeout(exitTimer);
     }
+    shutdownMilliseconds = Date.now() - shutdownStarted;
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
@@ -348,9 +371,9 @@ async function main() {
   if (toolCase === "interrupt" && interruptedProcessEnded !== true) await new Promise((resolve) => setTimeout(resolve, 8_500));
   const budget = ledger?.summary();
   ledger?.close();
-  if (exitCode !== 0) result = { status: "failed", errorCode: "PROBE_UNCLEAN_EXIT" };
+  if (exitCode !== 0) result = { taskResult: result, status: "failed", errorCode: "PROBE_UNCLEAN_EXIT" };
   const report = { kind: live ? (readTask ? "engine-deepseek-bounded-read-task" : "engine-deepseek-text-only") : (scopedTools ? "engine-fixed-command-boundary" : "engine-local-synthetic-response-only"), ...result, engineVersion, engineSha256: binarySha,
-    requests, notifications, diagnostics, deniedServerRequests: rpc.deniedServerRequests, stderrBytes, processExit: exitCode,
+    requests, notifications, diagnostics, deniedServerRequests: rpc.deniedServerRequests, stderrBytes, processExit: exitCode, shutdownMilliseconds, forcedExit,
     upstream, gatewayFailure, budget, billVerified: false, realModel: live, toolsStrippedForTextProbe: live && !readTask,
     upstreamOutputLimit: live ? MAX_OUTPUT_TOKENS : null, toolCase, toolResult, markerExists: existsSync(marker),
     interruptedProcessEnded, terminalCounts, blockedAfterStop, networkHits, externalEditWritten, externalEditPreserved,
