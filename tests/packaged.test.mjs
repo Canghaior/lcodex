@@ -35,7 +35,7 @@ test("packaged application uses bundled runtimes with a fresh profile and no dev
     assert.equal(initial.state.version, JSON.parse(readFileSync("package.json", "utf8")).version);
     assert.deepEqual([initial.state.runtime.engine, initial.state.runtime.shell, initial.state.runtime.node], [true, true, true]);
     assert.equal(initial.state.budget.scope, "personal"); assert.equal(initial.state.budget.configured, false); assert.equal(initial.state.pricing.current, false);
-    await app.evaluate((_electron, command) => { globalThis.lcodexTestCommand = command; }, command);
+    await app.evaluate((_electron, command) => { globalThis.lcodexTestCommand = command; globalThis.lcodexTestReadBeforeChecks = true; }, command);
     await app.evaluate((_electron, script) => { (0, eval)(script); }, readFileSync("tests/mock-model.mjs", "utf8"));
     await page.getByRole("button", { name: "设置", exact: true }).click();
     await page.getByLabel("DeepSeek API Key", { exact: true }).fill("sk-synthetic-packaged-not-a-real-key");

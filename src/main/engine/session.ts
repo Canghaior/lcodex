@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { BudgetLedger } from "../../../validation/budget.js";
-import { sendBoundedDeepSeek } from "../../../validation/deepseek-request.js";
+import { PROJECT_MAX_INPUT_BYTES, sendBoundedDeepSeek } from "../../../validation/deepseek-request.js";
 import { localDay } from "../storage/pricing.js";
 import { prepareEngineModelRequest } from "../../../validation/engine-model-request.js";
 import { isolatedEnvironment } from "../../../validation/isolated-env.js";
@@ -79,7 +79,7 @@ export async function executeSession(options: EngineOptions): Promise<EngineResu
         limits.request(); requests++;
         const tools = projectModelTools(parsed.tools.filter(isObject), workspace, shell).filter(tool => mode === "write" || tool.name !== "apply_patch");
         const request = prepareEngineModelRequest(parsed, tools);
-        activeUpstream = sendBoundedDeepSeek(ledger, trial, key, request, options.fetchImpl ?? fetch, abort.signal, 49_152);
+        activeUpstream = sendBoundedDeepSeek(ledger, trial, key, request, options.fetchImpl ?? fetch, abort.signal, PROJECT_MAX_INPUT_BYTES);
         const result = await activeUpstream;
         limits.check();
         const batch = prepareSerialResponse(result.wire, result.response, policy);
@@ -136,7 +136,7 @@ export async function executeSession(options: EngineOptions): Promise<EngineResu
     }, true);
     await rpc.request("initialize", { clientInfo: { name: "lcodex_desktop", version: "0.1.0" }, capabilities: { experimentalApi: true } }); rpc.notify("initialized", {});
     const threadParameters = { cwd: workspace, approvalPolicy: "never", approvalsReviewer: "user",
-      developerInstructions: `Work only in the current isolated project copy. It is a fresh snapshot of the original project; previous tool paths and permissions are historical and no longer valid. Mode=${mode}. For exec_command always supply shell=${JSON.stringify(shell)}, login=false, workdir=${JSON.stringify(workspace)}, yield_time_ms=10000, max_output_tokens<=4096. Run one tool at a time. Command limit 45 seconds, task limit 8 model requests. Node executable: ${node}; use --preserve-symlinks --preserve-symlinks-main before its arguments. No network, dependency installation or escalation. ${options.testCommand ? `The user-selected verification command is exactly: ${options.testCommand}. Run it before and after changes.` : "No verification command was configured. Inspect existing project instructions and report which checks you actually ran; missing tests must remain unverified."} Do not modify protected resources, dependencies, root marker, credentials or unrelated user work. Final response: changes, files, actual checks/results, unfinished work and next step. Changes are pending review, never claim the original project was modified.` };
+      developerInstructions: `Work only in the current isolated project copy. It is a fresh snapshot of the original project; previous tool paths and permissions are historical and no longer valid. Mode=${mode}. For exec_command always supply shell=${JSON.stringify(shell)}, login=false, workdir=${JSON.stringify(workspace)}, yield_time_ms=10000, max_output_tokens<=4096. Run one tool at a time. Command limit 45 seconds, task limit 8 model requests. Node executable: ${node}; use --preserve-symlinks --preserve-symlinks-main before its arguments. No network, dependency installation or escalation. ${options.testCommand ? `The user-selected verification command is exactly: ${options.testCommand}. Run it before and after changes as a separate exec_command call with exactly that cmd string; do not prepend or append other commands, so its exit status can be identified.` : "No verification command was configured. Inspect existing project instructions and report which checks you actually ran; missing tests must remain unverified."} Do not modify protected resources, dependencies, root marker, credentials or unrelated user work. Final response: changes, files, actual checks/results, unfinished work and next step. Changes are pending review, never claim the original project was modified.` };
     const thread = options.resume
       ? await rpc.request("thread/resume", { ...threadParameters, threadId: options.resume.threadId, model: "deepseek-flash", modelProvider: "workflow", config: { default_permissions: "scoped" } })
       : await rpc.request("thread/start", { ...threadParameters, ephemeral: false });

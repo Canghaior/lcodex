@@ -11,17 +11,19 @@ globalThis.fetch = async (url, init) => {
   const n = (counts.get(cwd) ?? 0) + 1; counts.set(cwd, n);
   const callSuffix = crypto.randomUUID();
   const writeMode = body.tools.some(tool => tool.name === "apply_patch");
+  const readBeforeChecks = writeMode && globalThis.lcodexTestReadBeforeChecks === true;
+  const step = n - (readBeforeChecks ? 1 : 0);
   const stopping = JSON.stringify(body.input).includes("STOP_TREE");
   const continuing = JSON.stringify(body.input).includes("CONTINUE_AFTER_RESTART");
   if (continuing && n === 1 && !body.input.some(item => ["function_call_output", "custom_tool_call_output"].includes(item.type))) throw new Error("TEST_HISTORY_MISSING");
   const command = globalThis.lcodexTestCommand ?? "& 'C:/nvm4w/nodejs/node.exe' --preserve-symlinks --preserve-symlinks-main --test; exit $LASTEXITCODE";
   const patch = "*** Begin Patch\n*** Update File: catalog.mjs\n@@\n-export function total(items) { return items.reduce((sum, item) => sum + item.unitCents, 0); }\n+export function total(items) { return items.reduce((sum, item) => sum + item.unitCents * item.quantity, 0); }\n*** End Patch";
-  const message = connecting || (writeMode ? n >= 4 : n >= 2);
+  const message = connecting || (writeMode ? step >= 4 : n >= 2);
   const text = "模拟模型联测：已处理 catalog.mjs，实际工具结果见记录。原项目等待审阅后应用。";
   const item = stopping ? { id: `item-${n}`, type: "function_call", name: "exec_command", call_id: `call-${n}`, status: "completed", arguments: JSON.stringify({ cmd: "& 'C:/nvm4w/nodejs/node.exe' --preserve-symlinks --preserve-symlinks-main './process-tree.mjs' parent; exit $LASTEXITCODE", shell, login: false, workdir: cwd, yield_time_ms: 10000, max_output_tokens: 2048 }) }
     : message ? { id: `message-${n}`, type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text, annotations: [] }] }
-    : writeMode && n === 2 ? { id: `item-${n}`, type: "custom_tool_call", name: "apply_patch", call_id: `call-${n}`, status: "completed", input: patch }
-    : { id: `item-${n}`, type: "function_call", name: "exec_command", call_id: `call-${n}`, status: "completed", arguments: JSON.stringify({ cmd: writeMode ? command : `try { [IO.File]::WriteAllText(${quote(cwd + "/read-only-marker.txt")}, 'unexpected'); Write-Output 'UNEXPECTED_WRITE' } catch { Write-Output 'READ_ONLY_DENIED' }; Get-Content -LiteralPath './catalog.mjs' -Raw`, shell, login: false, workdir: cwd, yield_time_ms: 10000, max_output_tokens: 2048 }) };
+    : writeMode && step === 2 ? { id: `item-${n}`, type: "custom_tool_call", name: "apply_patch", call_id: `call-${n}`, status: "completed", input: patch }
+    : { id: `item-${n}`, type: "function_call", name: "exec_command", call_id: `call-${n}`, status: "completed", arguments: JSON.stringify({ cmd: readBeforeChecks && step === 0 ? "Get-Content -LiteralPath './catalog.mjs' -Raw" : writeMode ? command : `try { [IO.File]::WriteAllText(${quote(cwd + "/read-only-marker.txt")}, 'unexpected'); Write-Output 'UNEXPECTED_WRITE' } catch { Write-Output 'READ_ONLY_DENIED' }; Get-Content -LiteralPath './catalog.mjs' -Raw`, shell, login: false, workdir: cwd, yield_time_ms: 10000, max_output_tokens: 2048 }) };
   item.id += "-" + callSuffix;
   if (item.call_id) item.call_id += "-" + callSuffix;
   if (continuing && item.type === "function_call") { const args = JSON.parse(item.arguments); args.cmd += "; Get-Content -LiteralPath './latest-note.txt' -Raw"; item.arguments = JSON.stringify(args); }

@@ -132,7 +132,6 @@ export class Tasks {
     let processKnownEnded = true;
     let finalExecution: Chat["execution"] = "failed";
     const plannedCommands = new Map<string, string>();
-    const startToolIndex = chat.tools.length;
     const chatRoot = path.join(this.options.root, "tasks", chat.id), root = path.join(chatRoot, "turns", randomUUID()), state = path.join(this.options.root, "reviews");
     const sanitize = (text: string) => text.replaceAll(key, "[已隐藏凭据]").slice(0, 65_536);
     try {
@@ -169,7 +168,10 @@ export class Tasks {
                 tool.exitCode = typeof item.exitCode === "number" ? item.exitCode : null;
                 tool.status = item.status === "completed" && (item.type === "fileChange" || item.exitCode === 0) ? "completed" : "failed";
                 if (project.testCommand && plannedCommands.get(item.id) === project.testCommand && Number.isInteger(item.exitCode)) {
-                  if (chat.tools.length === startToolIndex + 1) chat.baselineExit = Number(item.exitCode);
+                  // Reading the project before testing must not hide the first
+                  // real verification result. This is the first matching check,
+                  // not proof that no earlier shell command changed files.
+                  if (chat.baselineExit === undefined) chat.baselineExit = Number(item.exitCode);
                   chat.verificationCommand = project.testCommand;
                   chat.verification = item.exitCode === 0 ? "passed" : "failed";
                 }

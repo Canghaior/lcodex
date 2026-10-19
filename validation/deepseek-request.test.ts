@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import { BudgetLedger } from "./budget.js";
 import { createRunDirectory } from "./run-directory.js";
-import { requestDeepSeek, sendBoundedDeepSeek } from "./deepseek-request.js";
+import { PROJECT_MAX_INPUT_BYTES, requestDeepSeek, sendBoundedDeepSeek } from "./deepseek-request.js";
 import { ResponsesStream } from "./responses-stream.js";
 
 const fakeKey = `sk-${"synthetic".repeat(2)}`;
@@ -21,6 +21,23 @@ test("larger workflow context is explicit and still refuses oversized input befo
     assert.equal(ledger.summary().requests, 0);
     await sendBoundedDeepSeek(ledger, "context", fakeKey, body, fakeFetch, undefined, 49_152);
     await assert.rejects(sendBoundedDeepSeek(ledger, "context", fakeKey, { ...body, input: [{ role: "user", content: "x".repeat(50_000) }] }, fakeFetch, undefined, 49_152), /INPUT_SIZE_LIMIT/);
+    assert.equal(calls, 1); assert.equal(ledger.summary().requests, 1);
+  } finally { ledger.close(); run.cleanup(); }
+});
+
+test("desktop context stays within the same reservation and rejects excess before HTTP", async () => {
+  const run = createRunDirectory("desktop context"), file = path.join(run.root, "ledger.jsonl"); BudgetLedger.initialize(file);
+  const ledger = new BudgetLedger(file); let calls = 0;
+  const fakeFetch: typeof fetch = async () => {
+    calls++; assert.equal(ledger.pendingRequests()[0]!.maxMicros, 250_000);
+    return new Response(frame("response.completed", 0, { ...terminal, usage: { input_tokens: 100_000, output_tokens: 1024 } }), { headers: { "content-type": "text/event-stream" } });
+  };
+  const body = { model: "deepseek-flash", stream: true, store: false, max_output_tokens: 1024, tools: [], input: [{ role: "user", content: "x".repeat(70_000) }] };
+  try {
+    await assert.rejects(sendBoundedDeepSeek(ledger, "context", fakeKey, body, fakeFetch, undefined, 49_152), /INPUT_SIZE_LIMIT/);
+    await sendBoundedDeepSeek(ledger, "context", fakeKey, body, fakeFetch, undefined, PROJECT_MAX_INPUT_BYTES);
+    assert.equal(ledger.summary().estimatedMicros, 208_192); assert.equal(ledger.summary().pending, 0);
+    await assert.rejects(sendBoundedDeepSeek(ledger, "context", fakeKey, { ...body, input: [{ role: "user", content: "x".repeat(PROJECT_MAX_INPUT_BYTES) }] }, fakeFetch, undefined, PROJECT_MAX_INPUT_BYTES), /INPUT_SIZE_LIMIT/);
     assert.equal(calls, 1); assert.equal(ledger.summary().requests, 1);
   } finally { ledger.close(); run.cleanup(); }
 });
