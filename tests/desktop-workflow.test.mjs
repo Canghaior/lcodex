@@ -47,6 +47,8 @@ test("desktop real MXC tools: encrypted key, read-only mode, frozen review, appl
     await page.getByText("密钥已加密保存", { exact: true }).waitFor();
     assert.equal(await page.getByLabel("DeepSeek API Key", { exact: true }).inputValue(), "");
     assert.equal(readFileSync(path.join(run.root, "desktop/deepseek.bin")).includes(Buffer.from(key)), false);
+    await page.getByRole("button", { name: "验证模型连接", exact: true }).click();
+    await page.getByText("模型接口已响应", { exact: true }).waitFor();
     const snapshot = await page.evaluate(() => window.lcodex.request({ type: "snapshot" }));
     assert.equal(JSON.stringify(snapshot).includes(key), false);
     assert.equal(snapshot.state.runtime.ready, true, JSON.stringify(snapshot.state.runtime));

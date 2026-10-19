@@ -7,6 +7,34 @@ import type { AppState, Chat, Command, FilePreview, Reply } from "../shared/cont
 const executionLabels = { idle: "尚未开始", running: "执行中", waiting: "等待确认", stopping: "正在停止", stopped: "已停止", failed: "失败", reconcile: "需要核对", ended: "已结束" };
 const verificationLabels = { passed: "验证通过", failed: "验证失败", unverified: "尚未验证", "not-applicable": "不适用" };
 function errorText(code: string) {
+  const actionable: Record<string, string> = {
+    GUARD_TEXT_LIMIT: "单文件超过当前上限（源码 1 MiB，普通依赖 16 MiB）。请选择范围内的项目。",
+    GUARD_TOTAL_LIMIT: "项目超过当前总容量上限（源码与资源 16 MiB，普通依赖 64 MiB）。请先选择较小的项目。",
+    GUARD_ENTRY_LIMIT: "项目文件或目录项过多，首版暂不能准备安全副本。",
+    GUARD_TYPE_REFUSED: "项目含链接、硬链接或不支持的文件类型。首版只支持普通本地文件。",
+    GUARD_PATH_ALIAS_REFUSED: "项目路径含重定向或短名别名，请通过实际本地路径重新选择。",
+    REVIEW_DISK_LOW: "工作盘剩余空间不足 5 GiB。请释放空间后重试，已有记录不会自动删除。",
+    REVIEW_DEPENDENCY_SENSITIVE_CONTENT: "依赖目录中发现受保护文件，无法安全复制。请检查依赖的本地凭据配置。",
+    REVIEW_DEPENDENCY_CHANGED: "任务期间只读依赖发生变化，已保留记录并停止生成可应用改动。",
+    PROJECT_SCOPE_UNSUPPORTED: "修改任务目前只支持含 package.json 的小型单包 JS/TS 项目，暂不支持 workspace 多包。",
+    PROJECT_LOCK_BUSY_RECONCILE_REQUIRED: "这个项目仍有待审阅或待核对任务。请先处理原任务，再开始新的修改。",
+    TASK_ALREADY_RUNNING: "已有任务或文件应用正在进行，请等待结束或先停止它。",
+    TASK_NEW_CHAT_REQUIRED: "这个任务已经结束；当前版本请新建聊天开始下一项任务。",
+    TASK_RECONCILE_REQUIRED: "上次执行或审阅尚未核对。已有记录和文件基线保留，操作不会自动重放。",
+    KEY_MISSING: "请先在设置中保存 DeepSeek API Key。",
+    KEY_ENCRYPTION_UNAVAILABLE: "Windows 密钥加密当前不可用。请检查登录环境后重试，不会改用明文保存。",
+    API_HTTP_401: "DeepSeek 未接受这个密钥。请检查设置；此次请求用量未知，预留预算已保留。",
+    API_HTTP_402: "DeepSeek 账户额度不足，请检查账户余额。此次请求不会自动重试。",
+    API_HTTP_429: "DeepSeek 暂时限流，请稍后检查。用量未知的预留仍保留，不会自动重试。",
+    BUDGET_PENDING_RECONCILIATION: "有未确认用量的请求，预算账本已保留，核对前不会再调用模型。",
+    BUDGET_TOTAL_LIMIT: "累计预算已到上限。已有结果保留，继续前需要调整预算授权。",
+    BUDGET_TRIAL_LIMIT: "本次任务已达到 ¥1 预算上限。已有结果保留，不再发送请求。",
+    TASK_REQUEST_LIMIT: "本次任务达到 8 次模型请求上限。请查看已完成内容和未完成事项。",
+    TASK_COMMAND_LIMIT: "命令超过 45 秒限制，已停止新操作并核对相关进程。",
+    API_INPUT_SIZE_LIMIT: "当前对话超过已验证的上下文上限。请新建聊天并缩小任务范围。",
+    PRICE_REVIEW_REQUIRED: "开发版的价格记录需要重新核对；在更新记录前不会开始计费请求。",
+  };
+  if (actionable[code]) return actionable[code]!;
   const entries: Record<string, string> = { SHELL_UNAVAILABLE: "未找到已验证的 PowerShell。请在设置中检查执行环境。", GUARD_CAPTURE_REFUSED: "这个项目暂不符合首版的文件范围，请选择小型单包 JS/TS 项目。", GUARD_CAPACITY_REFUSED: "项目超过首版容量上限，请选择较小的项目。", GUARD_REPARSE_REFUSED: "项目包含链接或目录重定向，首版暂不支持。", FILE_UNAVAILABLE: "文件已变化或不再存在，请重新选择项目。", FILE_OUTSIDE_SELECTION: "这个文件不在已授权项目的可预览范围内。", ACTION_FAILED: "操作未完成，请重试；已有项目和任务记录已保留。" };
   return entries[code] ?? `操作未完成（${code}），已有内容已保留。`;
 }
@@ -17,6 +45,7 @@ export function App() {
   const [state, setState] = useState<AppState | null>(null), [error, setError] = useState<string | null>(null), [busy, setBusy] = useState(false);
   const [settings, setSettings] = useState(false), [sidebar, setSidebar] = useState(true), [workspace, setWorkspace] = useState(true), [tab, setTab] = useState<"files" | "changes" | "output">("files");
   const [keyInput, setKeyInput] = useState(""), [keyBusy, setKeyBusy] = useState(false), [testCommand, setTestCommand] = useState(""), [selectedChange, setSelectedChange] = useState<string | null>(null), [applying, setApplying] = useState(false);
+  const [checkingConnection, setCheckingConnection] = useState(false), [connectionVerified, setConnectionVerified] = useState(false);
   const [preview, setPreview] = useState<FilePreview | null>(null), [files, setFiles] = useState<FilePreview[]>([]), [sourceView, setSourceView] = useState(false);
   const [drafts, setDrafts] = useState<Record<string, string>>({}), [query, setQuery] = useState(""), [searching, setSearching] = useState(false);
   const [chatWidth, setChatWidth] = useState(45), [dragging, setDragging] = useState(false);
@@ -32,6 +61,7 @@ export function App() {
   useEffect(() => { setPreview(null); setFiles([]); }, [project?.id]);
   useEffect(() => { setTestCommand(project?.testCommand ?? ""); }, [project?.id, project?.testCommand]);
   useEffect(() => { if (!settings) setKeyInput(""); }, [settings]);
+  useEffect(() => { if (!state?.runtime.key) setConnectionVerified(false); }, [state?.runtime.key]);
   useEffect(() => { setSelectedChange(null); }, [chat?.id]);
   useEffect(() => { bottom.current?.scrollIntoView({ behavior: "smooth" }); }, [chat?.messages.length, chat?.tools.length]);
   useEffect(() => {
@@ -63,8 +93,13 @@ export function App() {
   }
   async function saveKey() {
     setKeyBusy(true);
-    try { const reply = await request({ type: "set-key", key: keyInput.trim() }); if (reply?.ok) setKeyInput(""); }
+    try { const reply = await request({ type: "set-key", key: keyInput.trim() }); if (reply?.ok) { setKeyInput(""); setConnectionVerified(false); } }
     finally { setKeyBusy(false); }
+  }
+  async function checkConnection() {
+    setCheckingConnection(true); setConnectionVerified(false);
+    try { const reply = await request({ type: "check-connection" }); if (reply?.ok && reply.connectionVerified) setConnectionVerified(true); }
+    finally { setCheckingConnection(false); }
   }
   async function applyChanges(files: string[]) {
     if (!chat?.reviewId) return;
@@ -115,7 +150,7 @@ export function App() {
       </main>
     </div>
     {error && <div className="toast" role="alert"><span>{error}</span><IconButton label="关闭提示" onClick={() => setError(null)}><X size={15} /></IconButton></div>}
-    {settings && <div className="modal-backdrop" onClick={() => setSettings(false)}><section className="settings-dialog" role="dialog" aria-modal="true" aria-label="设置" onClick={event => event.stopPropagation()}><div className="settings-heading"><h2>设置</h2><IconButton label="关闭设置" onClick={() => setSettings(false)}><X size={18} /></IconButton></div><div className="settings-section"><h3>模型与密钥</h3><div className="setting-row"><span>DeepSeek Flash</span><span className="subtle-badge">{state?.runtime.key ? "密钥已加密保存" : "尚未配置密钥"}</span></div><label className="setting-label" htmlFor="api-key">DeepSeek API Key</label><div className="key-field"><input id="api-key" type="password" autoComplete="off" spellCheck={false} placeholder={state?.runtime.key ? "输入新密钥以替换" : "输入 API Key"} value={keyInput} onChange={event => setKeyInput(event.target.value)} /><button disabled={keyBusy || !keyInput.trim() || !!active} onClick={() => void saveKey()}>{keyBusy ? "保存中…" : "保存密钥"}</button></div>{state?.runtime.key && <button className="text-link small" disabled={!!active} onClick={() => void request({ type: "delete-key" })}>删除本机密钥</button>}<p>密钥由 Windows 加密保存，保存后不回传。任务中选择的代码与工具输出会发送至 DeepSeek 官方 API；项目文件和命令在本机处理。</p></div>
+    {settings && <div className="modal-backdrop" onClick={() => setSettings(false)}><section className="settings-dialog" role="dialog" aria-modal="true" aria-label="设置" onClick={event => event.stopPropagation()}><div className="settings-heading"><h2>设置</h2><IconButton label="关闭设置" onClick={() => setSettings(false)}><X size={18} /></IconButton></div><div className="settings-section"><h3>模型与密钥</h3><div className="setting-row"><span>DeepSeek Flash</span><span className="subtle-badge">{state?.runtime.key ? "密钥已加密保存" : "尚未配置密钥"}</span></div><label className="setting-label" htmlFor="api-key">DeepSeek API Key</label><div className="key-field"><input id="api-key" type="password" autoComplete="off" spellCheck={false} placeholder={state?.runtime.key ? "输入新密钥以替换" : "输入 API Key"} value={keyInput} onChange={event => setKeyInput(event.target.value)} /><button disabled={keyBusy || !keyInput.trim() || !!active} onClick={() => void saveKey()}>{keyBusy ? "保存中…" : "保存密钥"}</button></div>{state?.runtime.key && <button className="text-link small" disabled={!!active} onClick={() => void request({ type: "delete-key" })}>删除本机密钥</button>}<div className="connection-check"><button disabled={!state?.runtime.key || checkingConnection || !!active} onClick={() => void checkConnection()}>{checkingConnection ? "正在验证连接…" : "验证模型连接"}</button><span>{connectionVerified ? "模型接口已响应" : "将发起一次计费请求，计入现有预算"}</span></div><p>密钥由 Windows 加密保存，保存后不回传。任务中选择的代码与工具输出会发送至 DeepSeek 官方 API；项目文件和命令在本机处理。</p></div>
       {project && <div className="settings-section"><h3>项目验证 · {project.name}</h3><label className="setting-label" htmlFor="test-command">验证命令（可选）</label><textarea id="test-command" value={testCommand} onChange={event => setTestCommand(event.target.value)} placeholder="填写已准备好的项目测试命令" rows={2} maxLength={2048} /><button className="text-link small" disabled={!!active} onClick={() => void request({ type: "set-test-command", projectId: project.id, command: testCommand })}>保存验证命令</button><p>命令在隔离副本内运行。只有该命令实际执行并返回成功，才标记通过；它不代替人工审阅。未配置时保留实际工具记录，整体状态为尚未验证。</p></div>}
       <div className="settings-section"><h3>开发验证预算</h3><div className="setting-row"><span>累计占用 / 上限</span><span>¥{state?.budget.committed.toFixed(4)} / ¥{state?.budget.limit}</span></div><p>含未知用量与在途预留 ¥{state?.budget.unknown.toFixed(4)}。单任务最多 ¥1，最多 8 次模型请求；按已核对价格保守估算，非实际账单。达到限制会停止新调用并保留结果。</p></div><div className="settings-section"><h3>本地执行环境</h3>{([['engine', 'Codex 0.162.0'], ['shell', 'PowerShell 7.6.5'], ['node', 'Node 24.8.0']] as const).map(([key, label]) => <div className="setting-row" key={key}><span>{label}</span><span className={state?.runtime[key] ? "status-ok" : "status-missing"}>{state?.runtime[key] ? <><Check size={14} />版本校验通过</> : "未找到匹配版本"}</span></div>)}<p>开发版本使用已验证的本机运行环境；独立安装包尚未验收。</p></div><div className="settings-section"><h3>首版项目范围</h3><p>Windows 小型单包 JS/TS。源码与资源合计 16 MiB，单文件 1 MiB；普通预装依赖合计 64 MiB。暂不支持链接依赖与大型多包项目。</p><div className="setting-row"><span>修改方式</span><span>隔离副本 · 审阅后应用</span></div></div><div className="settings-footer"><span>lcodex {state?.version}</span><span>个人 · 本地使用</span></div></section></div>}
   </div>;

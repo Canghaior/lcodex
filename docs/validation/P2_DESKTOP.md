@@ -48,4 +48,6 @@ P2-02/03：本机密钥保护、真实引擎连接、只读和修改任务、工
 
 真实闭环已经通过，不等于 P3/P4 已完成。待补：连接测试入口、重启后依据引擎历史核对、继续聊天、持久审阅重开与历史删除；当前单聊天一次任务是开发中间状态，不是对最终聊天体验的永久缩减。
 
+随后补齐主动连接验证按钮：明确提示会发起计费请求，仍经过同一预算与用量检查；只证明模型接口响应，不冒充工具能力测试。合成连接响应与原生桌面任务联测通过；没有增加真实 API 请求。常见容量、路径、缺密钥、限额与未知状态错误补充具体下一步。当前开发版仍要求当日价格记录有效；该限制与独立分发、日常预算配置在交付前继续完善。
+
 参考：[Electron 安全](https://www.electronjs.org/docs/latest/tutorial/security)、[Preload](https://www.electronjs.org/docs/latest/tutorial/tutorial-preload)、[React 版本](https://react.dev/versions)、[Vite](https://vite.dev/guide/)。2026-10-20 核对；实际依赖以 package-lock.json 和运行记录为准。

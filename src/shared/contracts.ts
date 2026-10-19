@@ -18,13 +18,14 @@ export type Command =
   | { type: "open-file"; projectId: string; relative: string }
   | { type: "set-key"; key: string }
   | { type: "delete-key" }
+  | { type: "check-connection" }
   | { type: "set-test-command"; projectId: string; command: string }
   | { type: "send"; chatId: string; text: string }
   | { type: "stop"; chatId: string }
   | { type: "apply"; chatId: string; reviewId: string; files: string[] }
   | { type: "discard"; chatId: string; reviewId: string }
   | { type: "window"; action: "minimize" | "maximize" | "close" };
-export type Reply = { ok: true; state: AppState; file?: FilePreview } | { ok: false; code: string };
+export type Reply = { ok: true; state: AppState; file?: FilePreview; connectionVerified?: boolean } | { ok: false; code: string };
 export type DesktopAPI = { request: (command: Command) => Promise<Reply>; subscribe: (listener: (state: AppState) => void) => () => void };
 
 const id = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9-]{36}$/.test(value);
@@ -33,7 +34,7 @@ export function validCommand(value: unknown): value is Command {
   const data = value as Record<string, unknown>;
   const exact = (...keys: string[]) => Object.keys(data).length === keys.length && keys.every(key => key in data);
   switch (data.type) {
-    case "snapshot": case "choose-project": case "delete-key": return exact("type");
+    case "snapshot": case "choose-project": case "delete-key": case "check-connection": return exact("type");
     case "set-key": return exact("type", "key") && typeof data.key === "string" && /^sk-[A-Za-z0-9_-]{16,200}$/.test(data.key);
     case "set-test-command": return exact("type", "projectId", "command") && id(data.projectId) && typeof data.command === "string" && data.command.length <= 2048 && !data.command.includes("\0");
     case "send": return exact("type", "chatId", "text") && id(data.chatId) && typeof data.text === "string" && data.text.trim().length > 0 && data.text.length <= 8000 && !data.text.includes("\0");

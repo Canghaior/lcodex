@@ -6,19 +6,20 @@ globalThis.fetch = async (url, init) => {
   if (url !== "https://api.deepseek.com/responses") throw new Error("TEST_UNEXPECTED_NETWORK");
   const body = JSON.parse(init.body);
   const tool = body.tools.find(tool => tool.name === "exec_command");
-  const cwd = tool.parameters.properties.workdir.enum[0], shell = tool.parameters.properties.shell.enum[0];
+  const connecting = !tool;
+  const cwd = tool?.parameters.properties.workdir.enum[0] ?? "connection", shell = tool?.parameters.properties.shell.enum[0] ?? "";
   const n = (counts.get(cwd) ?? 0) + 1; counts.set(cwd, n);
   const writeMode = body.tools.some(tool => tool.name === "apply_patch");
   const stopping = JSON.stringify(body.input).includes("STOP_TREE");
   const command = "& 'C:/nvm4w/nodejs/node.exe' --preserve-symlinks --preserve-symlinks-main --test; exit $LASTEXITCODE";
   const patch = "*** Begin Patch\n*** Update File: catalog.mjs\n@@\n-export function total(items) { return items.reduce((sum, item) => sum + item.unitCents, 0); }\n+export function total(items) { return items.reduce((sum, item) => sum + item.unitCents * item.quantity, 0); }\n*** End Patch";
-  const message = writeMode ? n >= 4 : n >= 2;
+  const message = connecting || (writeMode ? n >= 4 : n >= 2);
   const text = "模拟模型联测：已处理 catalog.mjs，实际工具结果见记录。原项目等待审阅后应用。";
   const item = stopping ? { id: `item-${n}`, type: "function_call", name: "exec_command", call_id: `call-${n}`, status: "completed", arguments: JSON.stringify({ cmd: "& 'C:/nvm4w/nodejs/node.exe' --preserve-symlinks --preserve-symlinks-main './process-tree.mjs' parent; exit $LASTEXITCODE", shell, login: false, workdir: cwd, yield_time_ms: 10000, max_output_tokens: 2048 }) }
     : message ? { id: `message-${n}`, type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text, annotations: [] }] }
     : writeMode && n === 2 ? { id: `item-${n}`, type: "custom_tool_call", name: "apply_patch", call_id: `call-${n}`, status: "completed", input: patch }
     : { id: `item-${n}`, type: "function_call", name: "exec_command", call_id: `call-${n}`, status: "completed", arguments: JSON.stringify({ cmd: writeMode ? command : `try { [IO.File]::WriteAllText(${quote(cwd + "/read-only-marker.txt")}, 'unexpected'); Write-Output 'UNEXPECTED_WRITE' } catch { Write-Output 'READ_ONLY_DENIED' }; Get-Content -LiteralPath './catalog.mjs' -Raw`, shell, login: false, workdir: cwd, yield_time_ms: 10000, max_output_tokens: 2048 }) };
-  const response = { id: `mock-${n}`, object: "response", status: "completed", model: "deepseek-flash", output: [item], usage: { input_tokens: 50, output_tokens: 100, total_tokens: 150 } };
+  const response = { id: `mock-${n}`, object: "response", status: "completed", model: "deepseek-flash", output: [item], usage: { input_tokens: 50, output_tokens: connecting ? 8 : 100, total_tokens: connecting ? 58 : 150 } };
   const events = [{ type: "response.created", response: { ...response, output: [], status: "in_progress" } },
     { type: "response.output_item.added", output_index: 0, item: message ? { ...item, content: [], status: "in_progress" } : item },
     ...(message ? [{ type: "response.content_part.added", item_id: item.id, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } }, { type: "response.output_text.delta", item_id: item.id, output_index: 0, content_index: 0, delta: text }, { type: "response.output_text.done", item_id: item.id, output_index: 0, content_index: 0, text }, { type: "response.content_part.done", item_id: item.id, output_index: 0, content_index: 0, part: item.content[0] }] : []),

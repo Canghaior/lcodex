@@ -119,6 +119,10 @@ async function main() {
         if (tasks?.busy()) throw new Error("TASK_ALREADY_RUNNING");
         const project = store.projects.find(project => project.id === command.projectId); if (!project) throw new Error("PROJECT_NOT_FOUND");
         project.testCommand = command.command.trim(); store.save();
+      } else if (command.type === "check-connection") {
+        if (!tasks) throw new Error("RUNTIME_UNAVAILABLE");
+        await tasks.checkConnection();
+        return { ok: true, state: state(), connectionVerified: true };
       } else if (["send", "stop", "apply", "discard"].includes(command.type)) {
         if (!("chatId" in command) || !tasks) throw new Error("RUNTIME_UNAVAILABLE");
         const chat = store.chats.find(chat => chat.id === command.chatId); if (!chat) throw new Error("CHAT_NOT_FOUND");

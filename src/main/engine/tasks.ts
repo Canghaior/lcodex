@@ -10,6 +10,7 @@ import type { Chat, Project } from "../../shared/contracts.js";
 import type { AppStore } from "../storage/store.js";
 import type { Credentials } from "../storage/credentials.js";
 import { executeSession, safeCode } from "./session.js";
+import { PRICE_REVIEW_DATE, sendBoundedDeepSeek } from "../../../validation/deepseek-request.js";
 
 type Workspace = Awaited<ReturnType<typeof prepareReviewWorkspace>>;
 type ReviewEntry = { task: Workspace; review: Review; applying: boolean };
@@ -18,6 +19,7 @@ export class Tasks {
   private active: { chatId: string; abort: AbortController; done: Promise<void> } | undefined;
   private reviews = new Map<string, ReviewEntry>();
   private ledger: BudgetLedger | undefined;
+  private connectionAbort: AbortController | undefined;
   private lastBudget = { committed: 0, unknown: 0, limit: 10 };
   budgetError: string | null = null;
   constructor(private readonly options: Options) {
@@ -26,7 +28,25 @@ export class Tasks {
   }
   private recordBudget(ledger: BudgetLedger) { const info = ledger.summary(); this.lastBudget = { committed: info.committedMicros / 1_000_000, unknown: (info.committedMicros - info.estimatedMicros) / 1_000_000, limit: 10 }; }
   budget() { if (this.ledger) this.recordBudget(this.ledger); return this.lastBudget; }
-  busy() { return !!this.active || [...this.reviews.values()].some(review => review.applying); }
+  busy() { return !!this.active || !!this.connectionAbort || [...this.reviews.values()].some(review => review.applying); }
+  async checkConnection() {
+    if (this.busy()) throw new Error("TASK_ALREADY_RUNNING");
+    const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
+    if (today !== PRICE_REVIEW_DATE) throw new Error("PRICE_REVIEW_REQUIRED");
+    this.connectionAbort = new AbortController();
+    let key = "";
+    try {
+      key = await this.options.credentials.read();
+      this.ledger = new BudgetLedger(this.options.ledgerFile);
+      const result = await sendBoundedDeepSeek(this.ledger, `connect-${randomUUID()}`, key, { model: "deepseek-flash", stream: true, store: false,
+        input: [{ role: "user", content: [{ type: "input_text", text: "Reply with CONNECTION_OK." }] }], tools: [], tool_choice: "none", max_output_tokens: 32, reasoning: { effort: "none" } }, fetch, this.connectionAbort.signal);
+      if (result.response.status !== "completed") throw new Error("API_CONNECTION_INCOMPLETE");
+      this.budgetError = null;
+    } finally {
+      if (this.ledger) { this.recordBudget(this.ledger); this.ledger.close(); this.ledger = undefined; }
+      key = ""; this.connectionAbort = undefined; this.options.notify();
+    }
+  }
   private publish(save = true) { if (save) this.options.store.save(); this.options.notify(); }
   async start(chat: Chat, project: Project, prompt: string) {
     if (this.busy()) throw new Error("TASK_ALREADY_RUNNING");
@@ -140,6 +160,7 @@ export class Tasks {
     this.active.abort.abort(); this.publish();
   }
   async stopAll() {
+    this.connectionAbort?.abort();
     if (this.active) { this.stop(this.active.chatId); await this.active?.done; }
     const deadline = Date.now() + 30_000;
     while (this.busy() && Date.now() < deadline) await new Promise<void>(resolve => setTimeout(resolve, 50));
