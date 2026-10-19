@@ -14,6 +14,7 @@ public sealed class GuardEntry {
     public string relative { get; set; }
     public string sha256 { get; set; }
     public string base64 { get; set; }
+    public string kind { get; set; }
 }
 public sealed class GuardCapture {
     public List<GuardEntry> files { get; set; } = new List<GuardEntry>();
@@ -32,6 +33,7 @@ public sealed class WindowsFileGuard : IDisposable {
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetFileInformationByHandle(SafeFileHandle handle, out Info info);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle, StringBuilder path, uint size, uint flags);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetFileInformationByHandle(SafeFileHandle handle, int kind, ref Disposition data, uint size);
     readonly List<IDisposable> held = new List<IDisposable>();
     FileStream target;
@@ -44,6 +46,10 @@ public sealed class WindowsFileGuard : IDisposable {
         if (bytes.Length > SingleLimit || Array.IndexOf(bytes, (byte)0) >= 0) throw Error("TEXT_LIMIT");
         try { new UTF8Encoding(false, true).GetString(bytes); } catch { throw Error("TEXT_ENCODING"); }
     }
+    static bool IsText(byte[] bytes) {
+        if (Array.IndexOf(bytes, (byte)0) >= 0) return false;
+        try { new UTF8Encoding(false, true).GetString(bytes); return true; } catch { return false; }
+    }
     static void Segment(string part) {
         if (String.IsNullOrEmpty(part) || part == "." || part == ".." || part.EndsWith(".") || part.EndsWith(" ") ||
             part.IndexOfAny(new [] {'\\', '/', ':', '<', '>', '"', '|', '?', '*'}) >= 0 || part.Any(c => c < 32) ||
@@ -51,7 +57,7 @@ public sealed class WindowsFileGuard : IDisposable {
     }
     public static bool Excluded(string part) {
         string lower = part.ToLowerInvariant();
-        return new [] { ".git", ".ssh", ".aws", ".azure", ".kube", ".gnupg", ".npmrc", ".pypirc", ".git-credentials", "credentials.json", "node_modules" }.Contains(lower) ||
+        return new [] { ".git", ".codex", ".agents", ".ssh", ".aws", ".azure", ".kube", ".gnupg", ".npmrc", ".pypirc", ".git-credentials", "credentials.json", "node_modules" }.Contains(lower) ||
             lower == ".env" || lower.StartsWith(".env.") || Regex.IsMatch(lower, @"^(id_rsa|id_dsa|id_ecdsa|id_ed25519)(\.|$)|\.(pem|key|p12|pfx|keystore)$");
     }
     SafeFileHandle Open(string name, uint access, uint share, uint creation, bool directory) {
@@ -67,6 +73,14 @@ public sealed class WindowsFileGuard : IDisposable {
         Info info;
         if (!GetFileInformationByHandle(handle, out info)) throw Error("INFO_FAILED");
         if ((info.Attributes & 0x400) != 0 || ((info.Attributes & 0x10) != 0) != directory || (!directory && info.Links != 1)) throw Error("TYPE_REFUSED");
+        var resolved = new StringBuilder(32768);
+        uint length = GetFinalPathNameByHandleW(handle, resolved, (uint)resolved.Capacity, 0);
+        if (length == 0 || length >= resolved.Capacity) throw Error("FINAL_PATH_FAILED");
+        string finalPath = resolved.ToString();
+        if (!finalPath.StartsWith(@"\\?\")) throw Error("FINAL_PATH_FAILED");
+        // Short-name aliases must not turn an allowed candidate directory into
+        // excluded original metadata. Check the opened handle, not just strings.
+        if (!String.Equals(finalPath.Substring(4).TrimEnd('\\'), Path.GetFullPath(name).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase)) throw Error("PATH_ALIAS_REFUSED");
         return handle;
     }
     string Root(string root) {
@@ -81,9 +95,9 @@ public sealed class WindowsFileGuard : IDisposable {
         }
         return normalized;
     }
-    byte[] ReadAll(FileStream stream) {
+    byte[] ReadAll(FileStream stream, bool textOnly = true) {
         if (stream.Length > SingleLimit) throw Error("TEXT_LIMIT");
-        byte[] bytes = new byte[(int)stream.Length]; stream.Position = 0; stream.ReadExactly(bytes); TextOnly(bytes); return bytes;
+        byte[] bytes = new byte[(int)stream.Length]; stream.Position = 0; stream.ReadExactly(bytes); if (textOnly) TextOnly(bytes); return bytes;
     }
     public GuardCapture Capture(string root) {
         string canonical = Root(root); var result = new GuardCapture(); int total = 0, entries = 0;
@@ -99,9 +113,9 @@ public sealed class WindowsFileGuard : IDisposable {
                 if (directory) walk(file, relative + "/");
                 else {
                     var stream = new FileStream(handle, FileAccess.Read); held.Add(stream);
-                    byte[] bytes = ReadAll(stream); total += bytes.Length;
+                    byte[] bytes = ReadAll(stream, false); total += bytes.Length;
                     if (total > ByteLimit) throw Error("TOTAL_LIMIT");
-                    result.files.Add(new GuardEntry { relative = relative, sha256 = Hash(bytes), base64 = Convert.ToBase64String(bytes) });
+                    result.files.Add(new GuardEntry { relative = relative, sha256 = Hash(bytes), base64 = Convert.ToBase64String(bytes), kind = IsText(bytes) ? "text" : "binary" });
                 }
             }
         };
@@ -127,13 +141,22 @@ public sealed class WindowsFileGuard : IDisposable {
         if (!createNew && Hash(ReadAll(target)) != expected) status = "conflict";
     }
     public void Apply(byte[] bytes, bool deletion) {
+        ApplyWithCheckpoint(bytes, deletion, null);
+    }
+    // Trusted validation hook only. The normal JSON bridge never supplies it.
+    // It permits deterministic process termination after a flushed partial write.
+    public void ApplyWithCheckpoint(byte[] bytes, bool deletion, Action checkpoint) {
         if (status != "ready" || target == null) throw Error("NOT_READY");
         mayHaveChanged = true;
         if (deletion) {
             var disposition = new Disposition { DeleteFile = 1 };
             if (!SetFileInformationByHandle(targetHandle, 4, ref disposition, 4)) throw Error("DELETE_FAILED");
         } else {
-            TextOnly(bytes); target.Position = 0; target.Write(bytes, 0, bytes.Length); target.SetLength(bytes.Length); target.Flush(true);
+            TextOnly(bytes); target.Position = 0;
+            int first = bytes.Length / 2;
+            target.Write(bytes, 0, first); target.Flush(true);
+            if (checkpoint != null) checkpoint();
+            target.Write(bytes, first, bytes.Length - first); target.SetLength(bytes.Length); target.Flush(true);
             if (Hash(ReadAll(target)) != Hash(bytes)) throw Error("WRITE_VERIFY_FAILED");
         }
         status = "applied";

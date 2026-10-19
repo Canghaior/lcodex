@@ -11,6 +11,20 @@ const frame = (type: string, sequence_number: number, response?: unknown) =>
   `event: ${type}\r\ndata: ${JSON.stringify({ type, sequence_number, response })}\r\n\r\n`;
 const terminal = { status: "completed", usage: { input_tokens: 100, output_tokens: 20 }, output: [] };
 
+test("larger workflow context is explicit and still refuses oversized input before budget reservation", async () => {
+  const run = createRunDirectory("workflow context"), file = path.join(run.root, "ledger.jsonl"); BudgetLedger.initialize(file);
+  const ledger = new BudgetLedger(file); let calls = 0;
+  const fakeFetch: typeof fetch = async () => { calls++; return new Response(frame("response.completed", 0, terminal), { headers: { "content-type": "text/event-stream" } }); };
+  const body = { model: "deepseek-flash", stream: true, store: false, max_output_tokens: 1024, tools: [], input: [{ role: "user", content: "x".repeat(20_000) }] };
+  try {
+    await assert.rejects(sendBoundedDeepSeek(ledger, "context", fakeKey, body, fakeFetch), /INPUT_SIZE_LIMIT/);
+    assert.equal(ledger.summary().requests, 0);
+    await sendBoundedDeepSeek(ledger, "context", fakeKey, body, fakeFetch, undefined, 49_152);
+    await assert.rejects(sendBoundedDeepSeek(ledger, "context", fakeKey, { ...body, input: [{ role: "user", content: "x".repeat(50_000) }] }, fakeFetch, undefined, 49_152), /INPUT_SIZE_LIMIT/);
+    assert.equal(calls, 1); assert.equal(ledger.summary().requests, 1);
+  } finally { ledger.close(); run.cleanup(); }
+});
+
 test("SSE handles fragments and keeps failed/incomplete terminal distinct", () => {
   for (const status of ["completed", "failed", "incomplete"]) {
     const parser = new ResponsesStream();

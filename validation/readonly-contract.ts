@@ -6,27 +6,32 @@ function requireValue(value: unknown): asserts value { if (!value) throw new Err
 
 // Buffer and check every execution-bearing event before giving any bytes to the
 // engine. Checking only response.completed would miss a conflicting earlier call.
-export function checkResponseWire(wire: string, response: Record<string, unknown>, readScope?: { cwd: string; shell: string; command?: string }, patchCheck?: (input: string) => void) {
+export function checkResponseWire(wire: string, response: Record<string, unknown>, readScope?: { cwd: string; shell: string; command?: string }, patchCheck?: (input: string) => void,
+  functionCheck?: (name: string, args: Record<string, unknown>) => void) {
   requireValue(Array.isArray(response.output));
   const output = response.output;
   requireValue(output.every((item) => isObject(item) && ["message", "reasoning", "function_call", ...(patchCheck ? ["custom_tool_call"] : [])].includes(String(item.type))));
   const calls = output.filter(isObject).filter((item) => ["function_call", "custom_tool_call"].includes(String(item.type)));
-  requireValue(calls.length <= (readScope || patchCheck ? 1 : 0));
+  requireValue(calls.length <= (readScope || patchCheck || functionCheck ? 1 : 0));
   const call = calls[0];
   const payloadKey = call?.type === "custom_tool_call" ? "input" : "arguments";
   if (call?.type === "custom_tool_call") {
     requireValue(patchCheck && call.name === "apply_patch" && typeof call.input === "string" && typeof call.call_id === "string" && typeof call.id === "string");
     patchCheck(call.input);
   } else if (call) {
-    requireValue(readScope && call.name === "exec_command" && typeof call.arguments === "string" &&
+    requireValue((readScope || functionCheck) && typeof call.name === "string" && typeof call.arguments === "string" &&
       typeof call.call_id === "string" && typeof call.id === "string");
     let args: unknown;
     try { args = JSON.parse(call.arguments); } catch { throw new Error("PROBE_RESPONSE_CONTRACT_REFUSED"); }
-    requireValue(isObject(args) && Object.keys(args).every((key) => ["cmd", "workdir", "shell", "login", "yield_time_ms", "max_output_tokens"].includes(key)));
+    requireValue(isObject(args));
+    if (functionCheck) functionCheck(call.name, args);
+    else {
+    requireValue(readScope && call.name === "exec_command" && Object.keys(args).every((key) => ["cmd", "workdir", "shell", "login", "yield_time_ms", "max_output_tokens"].includes(key)));
     requireValue(args.cmd === (readScope.command ?? READ_COMMAND) && args.shell === readScope.shell && args.login === false &&
       (args.workdir === undefined || args.workdir === readScope.cwd));
     requireValue(args.yield_time_ms === undefined || (Number.isSafeInteger(args.yield_time_ms) && Number(args.yield_time_ms) > 0 && Number(args.yield_time_ms) <= 10_000));
     requireValue(args.max_output_tokens === undefined || (Number.isSafeInteger(args.max_output_tokens) && Number(args.max_output_tokens) > 0 && Number(args.max_output_tokens) <= 2048));
+    }
   }
   let added = 0, done = 0, argumentDone = 0;
   let deltas = "";

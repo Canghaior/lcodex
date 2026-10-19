@@ -23,7 +23,7 @@ export async function requestDeepSeek(
 
 // Callers constrain tools and set output limits before this shared, budgeted HTTP entry.
 export async function sendBoundedDeepSeek(ledger: BudgetLedger, trial: string, apiKey: string,
-  request: Record<string, unknown>, fetchImpl: typeof fetch = fetch, externalSignal?: AbortSignal) {
+  request: Record<string, unknown>, fetchImpl: typeof fetch = fetch, externalSignal?: AbortSignal, maxInputBytes: 16_384 | 49_152 = 16_384) {
   if (!/^sk-[A-Za-z0-9_-]{16,200}$/.test(apiKey)) throw new Error("API_INVALID_KEY_FORMAT");
   if (request.model !== "deepseek-flash" || request.stream !== true || request.store !== false ||
     !Number.isSafeInteger(request.max_output_tokens) || Number(request.max_output_tokens) <= 0 || Number(request.max_output_tokens) > MAX_OUTPUT_TOKENS ||
@@ -35,7 +35,10 @@ export async function sendBoundedDeepSeek(ledger: BudgetLedger, trial: string, a
   if (!tools.every((tool) => isObject(tool) && (tool.type === "function" || tool.type === "custom" && tool.name === "apply_patch"))) throw new Error("API_SERVER_TOOLS_REFUSED");
   if (input.some((item) => isObject(item) && item.type === "custom_tool_call" && item.name !== "apply_patch")) throw new Error("API_INPUT_TYPE_REFUSED");
   const body = JSON.stringify(request);
-  if (Buffer.byteLength(body) > 16_384) throw new Error("API_INPUT_SIZE_LIMIT");
+  // The larger opt-in window supports a bounded multi-step P1 task. At reviewed
+  // peak text rates, 49,152 one-byte tokens plus 1,024 output tokens stay below
+  // the unchanged 0.25-yuan request reservation; actual usage is still checked.
+  if (![16_384, 49_152].includes(maxInputBytes) || Buffer.byteLength(body) > maxInputBytes) throw new Error("API_INPUT_SIZE_LIMIT");
   assertNoKnownSecrets(body, [apiKey]);
   // The experiment is deliberately limited to synthetic text (no image/file payloads).
   for (const item of input) {

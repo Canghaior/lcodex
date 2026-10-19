@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { sensitivePaths } from "./sensitive-paths.js";
 import { createRunDirectory } from "./run-directory.js";
@@ -26,7 +26,6 @@ test("inventory refuses an incomplete scan instead of silently admitting remaini
 test("inventory does not follow a junction to files outside the selected project", () => {
   const run = createRunDirectory("sensitive-link");
   const target = path.join(run.root, "outside"), project = path.join(run.root, "project"), link = path.join(project, "alias");
-  mkdirSync(target); mkdirSync(project); symlinkSync(target, link, "junction");
-  try { assert.throws(() => sensitivePaths(project), /LINK_REFUSED/); }
-  finally { unlinkSync(link); run.cleanup(); }
+  try { mkdirSync(target); mkdirSync(project); symlinkSync(target, link, "junction"); assert.throws(() => sensitivePaths(project), /LINK_REFUSED/); }
+  finally { if (existsSync(link)) unlinkSync(link); run.cleanup(); }
 });

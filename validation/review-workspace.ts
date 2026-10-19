@@ -6,7 +6,7 @@ import { CapturedTree, contentHash, WindowsFileGuard } from "./windows-file-guar
 
 export type ReviewChange = { relative: string; before: string | null; after: string | null; kind: "add" | "modify" | "delete" };
 export type FileOutcome = { relative: string; status: "applied" | "conflict" | "refused" | "needs-reconcile"; code?: string };
-export type Review = { id: string; changes: ReviewChange[]; excluded: string[]; verificationLocation: "isolated-copy" };
+export type Review = { id: string; changes: ReviewChange[]; excluded: string[]; readOnlyAssets: string[]; verificationLocation: "isolated-copy" };
 
 function persist(file: string, bytes: string | Buffer) {
   const fd = openSync(file, "wx", 0o600);
@@ -38,6 +38,7 @@ export async function prepareReviewWorkspace(project: string, state: string, gua
   const completed = new Set<string>();
   try {
     const baseline = await guard.capture(root), before = contents(baseline);
+    const assets = new Set(baseline.files.filter(file => file.kind === "binary").map(file => file.relative));
     mkdirSync(taskDirectory);
     const workspace = path.join(taskDirectory, "workspace"), privateDir = path.join(taskDirectory, "private");
     mkdirSync(workspace); mkdirSync(privateDir);
@@ -57,7 +58,7 @@ export async function prepareReviewWorkspace(project: string, state: string, gua
     }
     function requireActive() { if (!active || unresolved || sealing) throw new Error("REVIEW_RECONCILE_REQUIRED"); }
     return {
-      workspace, taskDirectory, rootMarker,
+      workspace, taskDirectory, rootMarker, readOnlyAssets: [...assets],
       async seal(): Promise<Review> {
         requireActive(); if (sealed) throw new Error("REVIEW_ALREADY_SEALED");
         sealing = true;
@@ -65,6 +66,8 @@ export async function prepareReviewWorkspace(project: string, state: string, gua
         const captured = await guard.capture(workspace);
         if (captured.excluded.length) throw new Error("REVIEW_EXCLUDED_CHANGE");
         frozen = contents(captured);
+        if (captured.files.some(file => file.kind === "binary" && !assets.has(file.relative)) || [...assets].some(relative =>
+          !frozen.has(relative) || contentHash(frozen.get(relative)!) !== contentHash(before.get(relative)!))) throw new Error("REVIEW_BINARY_CHANGE");
         if (frozen.get(rootMarker)?.toString("utf8") !== markerContent) throw new Error("REVIEW_ROOT_MARKER_CHANGED");
         frozen.delete(rootMarker);
         const changes: ReviewChange[] = [];
@@ -74,7 +77,7 @@ export async function prepareReviewWorkspace(project: string, state: string, gua
           if (oldHash !== newHash) changes.push({ relative, before: oldHash, after: newHash, kind: oldHash === null ? "add" : newHash === null ? "delete" : "modify" });
         }
         const id = contentHash(JSON.stringify({ taskId, changes }));
-        sealed = { id, changes, excluded: baseline.excluded, verificationLocation: "isolated-copy" };
+        sealed = { id, changes, excluded: baseline.excluded, readOnlyAssets: [...assets], verificationLocation: "isolated-copy" };
         persist(path.join(privateDir, "frozen.json"), JSON.stringify({ id, files: captured.files.filter(file => file.relative !== rootMarker) }));
         persist(path.join(privateDir, "review.json"), JSON.stringify(sealed));
         record({ type: "sealed", reviewId: id });
@@ -99,7 +102,7 @@ export async function prepareReviewWorkspace(project: string, state: string, gua
             // Any refusal may follow a partially created file. Conservatively stop
             // and retain baseline/journal unless the result is a known no-write case.
             const noWrite = outcome.status === "conflict" || outcome.status === "refused" && outcome.mayHaveChanged === false &&
-              ["GUARD_MISSING", "GUARD_EXISTS", "GUARD_OPEN_REFUSED", "GUARD_TYPE_REFUSED", "GUARD_EXCLUDED", "GUARD_PATH_REFUSED"].includes(outcome.code ?? "");
+              ["GUARD_MISSING", "GUARD_EXISTS", "GUARD_OPEN_REFUSED", "GUARD_TYPE_REFUSED", "GUARD_EXCLUDED", "GUARD_PATH_REFUSED", "GUARD_PATH_ALIAS_REFUSED", "GUARD_FINAL_PATH_FAILED"].includes(outcome.code ?? "");
             const final: FileOutcome = { relative, status: outcome.status === "applied" ? "applied" : noWrite ? outcome.status : "needs-reconcile", ...(outcome.code ? { code: outcome.code } : {}) };
             record({ type: "result", reviewId, ...final }); outcomes.push(final);
             if (final.status === "needs-reconcile") break;

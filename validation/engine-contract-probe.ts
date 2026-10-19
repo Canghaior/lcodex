@@ -384,6 +384,7 @@ async function main() {
       `${quote(cwd)} = "${editTask || toolCase && ["write", "deny", "interrupt", "concurrent-edit", "patch-write", "patch-sensitive", "patch-outside"].includes(toolCase) ? "write" : "read"}"`, `${quote(path.join(cwd, ".env"))} = "deny"`,
       `${quote(path.join(cwd, ".git"))} = "read"`,
       ...(isolatedReview ? [`${quote(originalProject)} = "deny"`, `${quote(path.join(reviewTask!.taskDirectory, "private"))} = "deny"`, `${quote(path.join(cwd, reviewTask!.rootMarker))} = "read"`] : []),
+      ...(isolatedReview ? [".codex", ".agents"].map(name => `${quote(path.join(cwd, name))} = "deny"`) : []),
       ...inventoriedSensitivePaths.filter((file) => file !== path.join(cwd, ".env")).map((file) => `${quote(file)} = "deny"`),
       `${quote(path.dirname(process.env.COMSPEC ?? "C:/Windows/System32/cmd.exe"))} = "read"`,
       `${quote(path.dirname(shellPath!))} = "read"`,

@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { isolatedEnvironment } from "./isolated-env.js";
 
-export type CapturedFile = { relative: string; sha256: string; base64: string };
+export type CapturedFile = { relative: string; sha256: string; base64: string; kind: "text" | "binary" };
 export type CapturedTree = { files: CapturedFile[]; excluded: string[] };
 export type ApplyResult = { status: "applied" | "conflict" | "refused"; code?: string; mayHaveChanged?: boolean };
 export const contentHash = (bytes: Buffer | string) => createHash("sha256").update(bytes).digest("hex");
@@ -50,7 +50,7 @@ export class WindowsFileGuard {
     const value = await this.invoke({ mode: "capture", root: path.resolve(root) }) as Partial<CapturedTree> & Partial<ApplyResult>;
     if (value.status === "refused") throw new Error(value.code || "GUARD_CAPTURE_REFUSED");
     if (!Array.isArray(value.files) || !Array.isArray(value.excluded) || value.files.some(file =>
-      typeof file.relative !== "string" || !/^[a-f0-9]{64}$/.test(file.sha256) || typeof file.base64 !== "string" || contentHash(Buffer.from(file.base64, "base64")) !== file.sha256)) throw new Error("GUARD_CAPTURE_INVALID");
+      typeof file.relative !== "string" || !/^[a-f0-9]{64}$/.test(file.sha256) || !["text", "binary"].includes(file.kind) || typeof file.base64 !== "string" || contentHash(Buffer.from(file.base64, "base64")) !== file.sha256)) throw new Error("GUARD_CAPTURE_INVALID");
     return { files: value.files, excluded: value.excluded };
   }
   async apply(root: string, relative: string, expected: string | null, contents: Buffer | null, onLocked?: () => void): Promise<ApplyResult> {

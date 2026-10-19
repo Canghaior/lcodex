@@ -14,12 +14,14 @@ const options = { skip: process.platform !== "win32" || !existsSync(shell), time
 
 for (const git of [false, true]) test(`isolated review: original preserved, frozen review applied, conflicts retained (git=${git})`, options, async () => {
   const fixture = createFixture(git), state = path.join(fixture.root, "state"); mkdirSync(state);
+  mkdirSync(path.join(fixture.project, ".codex")); writeFileSync(path.join(fixture.project, ".codex/config.toml"), "# synthetic local engine configuration\n");
   const guard = new WindowsFileGuard(shell, fixture.root);
   const original = snapshot(fixture.project);
   const task = await prepareReviewWorkspace(fixture.project, state, guard);
   try {
     assert.equal(existsSync(path.join(task.workspace, ".env")), false);
     assert.equal(existsSync(path.join(task.workspace, ".git")), false);
+    assert.equal(existsSync(path.join(task.workspace, ".codex")), false);
     writeFileSync(path.join(task.workspace, "invoice.mjs"), "// reviewed version\n");
     unlinkSync(path.join(task.workspace, "README.md"));
     writeFileSync(path.join(task.workspace, "new file 中文.txt"), "new file\n");
@@ -94,8 +96,29 @@ test("unsupported content and excluded candidate files refuse review without ori
     await assert.rejects(task.seal(), /EXCLUDED_CHANGE/);
     unlinkSync(path.join(task.workspace, ".env.local"));
     writeFileSync(path.join(task.workspace, "binary.bin"), Buffer.from([0, 255]));
-    await assert.rejects(task.seal(), /TEXT_LIMIT/);
+    await assert.rejects(task.seal(), /BINARY_CHANGE/);
     assert.deepEqual(snapshot(fixture.project), baseline);
+  } finally { task.close(); fixture.cleanup(); }
+});
+
+test("bounded binary assets survive the copy unchanged and cannot become writable proposals", options, async () => {
+  const fixture = createFixture(false), state = path.join(fixture.root, "state"); mkdirSync(state);
+  const asset = path.join(fixture.project, "asset.bin"), bytes = Buffer.from([137, 80, 78, 71, 0, 255]); writeFileSync(asset, bytes);
+  const guard = new WindowsFileGuard(shell, fixture.root), task = await prepareReviewWorkspace(fixture.project, state, guard);
+  try {
+    assert.deepEqual(task.readOnlyAssets, ["asset.bin"]);
+    assert.deepEqual(readFileSync(path.join(task.workspace, "asset.bin")), bytes);
+    writeFileSync(path.join(task.workspace, "asset.bin"), "changed into text");
+    await assert.rejects(task.seal(), /BINARY_CHANGE/);
+    unlinkSync(path.join(task.workspace, "asset.bin"));
+    await assert.rejects(task.seal(), /BINARY_CHANGE/);
+    writeFileSync(path.join(task.workspace, "asset.bin"), bytes);
+    writeFileSync(path.join(task.workspace, "README.md"), "Updated project instructions\n");
+    const review = await task.seal();
+    assert.deepEqual(review.readOnlyAssets, ["asset.bin"]);
+    assert.deepEqual(review.changes.map(change => change.relative), ["README.md"]);
+    assert.equal((await task.apply(review.id, ["README.md"]))[0]?.status, "applied");
+    assert.deepEqual(readFileSync(asset), bytes);
   } finally { task.close(); fixture.cleanup(); }
 });
 
@@ -150,5 +173,33 @@ test("interrupted addition leaves durable evidence, blocks replay and retains th
     assert.ok(readFileSync(path.join(result.taskDirectory, "private/frozen.json"), "utf8").includes(Buffer.from("complete candidate").toString("base64")));
     await assert.rejects(prepareReviewWorkspace(fixture.project, state, guard), /PROJECT_LOCK_BUSY_RECONCILE/);
     assert.equal(readFileSync(path.join(fixture.project, "interrupted.txt")).length, 0);
+  } finally { clearTimeout(timer); fixture.cleanup(); }
+});
+
+test("a mid-write process and coordinator exit preserves partial bytes and durable reconciliation evidence", options, async () => {
+  const fixture = createFixture(false), state = path.join(fixture.root, "state"); mkdirSync(state);
+  const file = path.join(fixture.project, "interrupted.txt"), before = "a".repeat(256 * 1024), after = "b".repeat(256 * 1024);
+  writeFileSync(file, before);
+  const child = spawn(process.execPath, [path.resolve("dist/validation/apply-interruption-worker.js"), fixture.project, state, fixture.root, shell],
+    { cwd: process.cwd(), env: isolatedEnvironment(fixture.root, process.env), windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+  let output = ""; child.stdout.setEncoding("utf8"); child.stdout.on("data", chunk => { output += String(chunk); }); child.stderr.resume();
+  const timer = setTimeout(() => child.kill(), 30_000);
+  try {
+    const code = await new Promise<number | null>((resolve, reject) => { child.once("close", resolve); child.once("error", reject); });
+    assert.equal(code, 17);
+    const result = JSON.parse(output.trim()) as { taskDirectory: string };
+    const actual = readFileSync(file, "utf8");
+    assert.equal(actual, after.slice(0, after.length / 2) + before.slice(before.length / 2));
+    const journal = readFileSync(path.join(result.taskDirectory, "private/apply.jsonl"), "utf8");
+    assert.ok(!journal.includes('"type":"result"'));
+    const guard = new WindowsFileGuard(shell, fixture.root), captured = await guard.capture(fixture.project);
+    const pending = inspectApplyJournal(journal, new Map(captured.files.map(entry => [entry.relative, entry.sha256])));
+    assert.deepEqual(pending.map(item => [item.relative, item.observation, item.action]), [["interrupted.txt", "diverged", "needs-reconcile"]]);
+    const baseline = JSON.parse(readFileSync(path.join(result.taskDirectory, "private/baseline.json"), "utf8")) as { files: { relative: string; base64: string }[] };
+    const frozen = JSON.parse(readFileSync(path.join(result.taskDirectory, "private/frozen.json"), "utf8")) as typeof baseline;
+    assert.equal(Buffer.from(baseline.files.find(entry => entry.relative === "interrupted.txt")!.base64, "base64").toString(), before);
+    assert.equal(Buffer.from(frozen.files.find(entry => entry.relative === "interrupted.txt")!.base64, "base64").toString(), after);
+    await assert.rejects(prepareReviewWorkspace(fixture.project, state, guard), /PROJECT_LOCK_BUSY_RECONCILE/);
+    assert.equal(readFileSync(file, "utf8"), actual);
   } finally { clearTimeout(timer); fixture.cleanup(); }
 });

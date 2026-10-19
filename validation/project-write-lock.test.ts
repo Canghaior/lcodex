@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, readdirSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import path from "node:path";
@@ -37,7 +37,7 @@ test("aliases cannot bypass a project lock and linked control state is refused",
     assert.throws(() => acquireProjectWriteLock(run.state, alias), /BUSY_RECONCILE/);
     assert.throws(() => acquireProjectWriteLock(stateAlias, run.project), /STATE_UNSAFE/);
     lock.release();
-  } finally { unlinkSync(alias); unlinkSync(stateAlias); run.cleanup(); }
+  } finally { if (existsSync(alias)) unlinkSync(alias); if (existsSync(stateAlias)) unlinkSync(stateAlias); run.cleanup(); }
 });
 
 test("changed ownership is preserved for reconciliation instead of deleting another record", () => {
