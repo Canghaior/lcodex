@@ -20,6 +20,7 @@ mkdirSync(dataRoot, { recursive: true });
 for (const relative of ["home", "profile/roaming", "profile/local/Packages", "temp"]) mkdirSync(path.join(dataRoot, relative), { recursive: true });
 app.setPath("userData", dataRoot);
 app.setPath("sessionData", path.join(dataRoot, "chromium"));
+const ownsInstance = app.requestSingleInstanceLock();
 app.setAppUserModelId("local.lcodex.desktop");
 protocol.registerSchemesAsPrivileged([{ scheme: "lcodex", privileges: { standard: true, secure: true, supportFetchAPI: true } }]);
 app.enableSandbox();
@@ -66,6 +67,7 @@ async function main() {
   win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   win.webContents.on("will-navigate", event => event.preventDefault());
   win.webContents.on("will-attach-webview", event => event.preventDefault());
+  app.on("second-instance", () => { if (win.isMinimized()) win.restore(); win.show(); win.focus(); });
   if (guard && runtime.engine && runtime.node) tasks = new Tasks({ root: dataRoot, engine, shell, node, ledgerFile, guard, credentials, store,
     notify: () => { if (!win.isDestroyed()) win.webContents.send("lcodex:state", state()); } });
   let closePending = false;
@@ -77,7 +79,10 @@ async function main() {
         if (store.chats.some(chat => chat.execution === "reconcile")) dialog.showMessageBox(win, { type: "warning", title: "任务需要核对", message: "未能确认最后一次操作的完整结果。记录已保留，请查看任务状态后再关闭。", buttons: ["保留窗口"] });
         else win.close();
       }).catch(() => { closePending = false; }); }
+      return;
     }
+    try { tasks?.suspendReviews(); }
+    catch { event.preventDefault(); void dialog.showMessageBox(win, { type: "warning", title: "审阅记录需要核对", message: "未能安全保存待应用改动的交接记录。窗口和文件基线已保留，请检查磁盘后重试。", buttons: ["保留窗口"] }); }
   });
   let choosing = false;
   ipcMain.handle("lcodex:request", async (event, command: unknown): Promise<Reply> => {
@@ -123,7 +128,7 @@ async function main() {
         if (!tasks) throw new Error("RUNTIME_UNAVAILABLE");
         await tasks.checkConnection();
         return { ok: true, state: state(), connectionVerified: true };
-      } else if (["send", "stop", "apply", "discard"].includes(command.type)) {
+      } else if (["send", "stop", "apply", "discard", "reopen-review"].includes(command.type)) {
         if (!("chatId" in command) || !tasks) throw new Error("RUNTIME_UNAVAILABLE");
         const chat = store.chats.find(chat => chat.id === command.chatId); if (!chat) throw new Error("CHAT_NOT_FOUND");
         const project = store.projects.find(project => project.id === chat.projectId); if (!project) throw new Error("PROJECT_NOT_FOUND");
@@ -131,6 +136,7 @@ async function main() {
         if (command.type === "stop") tasks.stop(chat.id);
         if (command.type === "apply") await tasks.apply(chat, command.reviewId, command.files);
         if (command.type === "discard") tasks.discard(chat, command.reviewId);
+        if (command.type === "reopen-review") await tasks.reopenReview(chat, project);
       } else if (command.type === "window") {
         if (command.action === "minimize") win.minimize();
         if (command.action === "maximize") win.isMaximized() ? win.unmaximize() : win.maximize();
@@ -142,5 +148,6 @@ async function main() {
   await win.loadURL("lcodex://app/index.html");
   win.show();
 }
-main().catch(() => { dialog.showErrorBox("lcodex 无法启动", "本地配置或运行文件无法读取。请保留 .local/desktop 供核对，不要删除任务记录。"); app.exit(1); });
+if (ownsInstance) main().catch(() => { dialog.showErrorBox("lcodex 无法启动", "本地配置或运行文件无法读取。请保留 .local/desktop 供核对，不要删除任务记录。"); app.exit(1); });
+else app.exit(0);
 app.on("window-all-closed", () => app.quit());

@@ -16,6 +16,7 @@ import { TaskLimits, TASK_LIMITS } from "../../../validation/task-limits.js";
 import { ToolResponseGate } from "../../../validation/tool-response-gate.js";
 import { stopAndReadThread } from "../../../validation/workflow-lifecycle.js";
 import type { TaskMode } from "../../shared/contracts.js";
+import { writePrivate } from "../../../validation/private-files.js";
 
 export type EngineOptions = { engine: string; shell: string; node: string; root: string; workspace: string; privateDir: string; original: string; rootMarker: string;
   readOnlyAssets: string[]; readOnlyDirectories: string[]; mode: TaskMode; prompt: string; testCommand: string; key: string; ledger: BudgetLedger;
@@ -99,8 +100,8 @@ export async function executeSession(options: EngineOptions): Promise<EngineResu
     const catalog = validationCatalog(true, mode === "read", mode === "write", true);
     catalog.models[0]!.display_name = "DeepSeek Flash";
     catalog.models[0]!.base_instructions = `You are a coding assistant in an isolated project copy. ${mode === "read" ? "This task is read-only. Analyse and explain; do not modify files or install anything." : "Read relevant code, reproduce issues, implement the requested change, and verify."} Preserve unrelated files. Be concise. Report actual results and limitations, never claim tests you did not run. Reply in the user's language.`;
-    writeFileSync(path.join(historyHome, "models.json"), JSON.stringify(catalog));
-    writeFileSync(path.join(historyHome, "config.toml"), [
+    writePrivate(historyHome, "models.json", JSON.stringify(catalog));
+    writePrivate(historyHome, "config.toml", [
       'model="deepseek-flash"', 'model_provider="workflow"', 'model_reasoning_effort="none"', `model_catalog_json=${quote(path.join(historyHome, "models.json"))}`,
       `project_root_markers=[${quote(options.rootMarker)}]`, 'approval_policy="never"', 'default_permissions="scoped"', 'web_search="disabled"', 'allow_login_shell=false',
       '[windows]', 'sandbox="mxc"', '[permissions.scoped.filesystem]', '":minimal"="read"', `${quote(workspace)}="${mode === "read" ? "read" : "write"}"`,

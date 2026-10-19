@@ -35,7 +35,7 @@ try {
   report.baseline = evaluator.run(binary, shell, original, verificationEnv);
   assert.equal(report.baseline.passed, 1); assert.equal(report.baseline.total, 8);
   application = await _electron.launch({ executablePath: electronPath, args: ["."], cwd: path.resolve("."), env });
-  const page = await application.firstWindow(); await page.getByRole("heading", { name: "从一个本地项目开始" }).waitFor();
+  let page = await application.firstWindow(); await page.getByRole("heading", { name: "从一个本地项目开始" }).waitFor();
   await application.evaluate(({ dialog }, directory) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [directory] }); }, original);
   await page.getByRole("button", { name: "选择项目", exact: true }).click();
   await page.getByRole("heading", { name: "一起构建 catalog project" }).waitFor();
@@ -70,6 +70,14 @@ try {
   assert.ok(chat.changes.length > 0);
   report.changedFiles = chat.changes.map(change => change.relative);
   assert.deepEqual(report.changedFiles, ["src/catalog.mjs"]);
+  await application.close();
+  application = await _electron.launch({ executablePath: electronPath, args: ["."], cwd: path.resolve("."), env }); page = await application.firstWindow();
+  await page.getByRole("button", { name: "核对并重开审阅", exact: true }).click();
+  await page.getByText("1 个待应用文件", { exact: true }).waitFor();
+  const restored = await page.evaluate(() => window.lcodex.request({ type: "snapshot" }));
+  const restoredChat = restored.state.chats.find(item => item.id === chatId);
+  assert.equal(restoredChat.reviewId, chat.reviewId); assert.equal(restoredChat.execution, "ended");
+  assert.deepEqual(snapshot(original), originalBefore); report.reviewReopened = true;
   await page.getByRole("button", { name: /^改动/ }).click();
   await page.screenshot({ path: path.resolve(".local/reports/desktop-live-review.png") });
   await page.getByRole("button", { name: "应用全部", exact: true }).click();
@@ -78,6 +86,29 @@ try {
   report.appliedAcceptance = evaluator.run(binary, shell, original, verificationEnv);
   assert.equal(report.appliedAcceptance.passed, 8); assert.equal(report.appliedAcceptance.protocolValid, true);
   assert.equal(snapshot(original)["user-notes.txt"], originalBefore["user-notes.txt"]);
+  const originalAfter = snapshot(original), oldToolCount = chat.tools.length;
+  await application.close();
+  application = await _electron.launch({ executablePath: electronPath, args: ["."], cwd: path.resolve("."), env }); page = await application.firstWindow();
+  await page.getByRole("combobox", { name: "任务方式" }).selectOption("read");
+  await page.evaluate(projectId => window.lcodex.request({ type: "set-test-command", projectId, command: "" }), projectId);
+  await page.getByRole("textbox", { name: "输入任务" }).fill("仅根据这个聊天已有的工具记录，用中文回顾刚才修改的文件和 total 函数的问题，以及实际运行的验证结果。这次不调用任何工具，不重新运行命令，也不修改文件。");
+  await page.getByRole("button", { name: "发送任务", exact: true }).click();
+  let continued;
+  const continuationDeadline = Date.now() + 220_000;
+  while (Date.now() < continuationDeadline) {
+    const result = await page.evaluate(() => window.lcodex.request({ type: "snapshot" }));
+    continued = result.state.chats.find(item => item.id === chatId);
+    if (["ended", "failed", "stopped", "reconcile"].includes(continued.execution)) break;
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
+  report.continuation = { execution: continued?.execution, code: continued?.error, newTools: continued?.tools.length - oldToolCount };
+  assert.equal(continued.execution, "ended", continued.error ?? "unfinished continuation");
+  assert.equal(continued.tools.length, oldToolCount);
+  assert.match(continued.messages.at(-1).text, /catalog\.mjs|total/);
+  assert.deepEqual(snapshot(original), originalAfter);
+  const continuedOutcome = JSON.parse(readFileSync(path.join(taskRoot, "outcome.json"), "utf8"));
+  report.continuation.requests = continuedOutcome.requests;
+  report.continuation.cleanExit = continuedOutcome.cleanExit;
   report.status = "passed"; clean = true;
 } catch (error) { report.failure = error instanceof assert.AssertionError ? "ACCEPTANCE_FAILED" : error instanceof Error && /^[A-Z_]+$/.test(error.message) ? error.message : "DESKTOP_LIVE_FAILED"; process.exitCode = 1; }
 finally {

@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { BudgetLedger } from "../../../validation/budget.js";
-import { prepareReviewWorkspace, type Review } from "../../../validation/review-workspace.js";
+import { prepareReviewWorkspace, restoreReviewWorkspace, type Review } from "../../../validation/review-workspace.js";
 import { contentHash, WindowsFileGuard } from "../../../validation/windows-file-guard.js";
 import { isObject } from "../../../validation/rpc.js";
 import { assertNoKnownSecrets } from "../../../validation/outbound-data.js";
@@ -11,6 +11,8 @@ import type { AppStore } from "../storage/store.js";
 import type { Credentials } from "../storage/credentials.js";
 import { executeSession, safeCode } from "./session.js";
 import { PRICE_REVIEW_DATE, sendBoundedDeepSeek } from "../../../validation/deepseek-request.js";
+import { readPrivate, writePrivate } from "../../../validation/private-files.js";
+import { verifyCompletedHistory } from "./history.js";
 
 type Workspace = Awaited<ReturnType<typeof prepareReviewWorkspace>>;
 type ReviewEntry = { task: Workspace; review: Review; applying: boolean };
@@ -20,6 +22,7 @@ export class Tasks {
   private reviews = new Map<string, ReviewEntry>();
   private ledger: BudgetLedger | undefined;
   private connectionAbort: AbortController | undefined;
+  private reconciling = false;
   private lastBudget = { committed: 0, unknown: 0, limit: 10 };
   budgetError: string | null = null;
   constructor(private readonly options: Options) {
@@ -28,7 +31,7 @@ export class Tasks {
   }
   private recordBudget(ledger: BudgetLedger) { const info = ledger.summary(); this.lastBudget = { committed: info.committedMicros / 1_000_000, unknown: (info.committedMicros - info.estimatedMicros) / 1_000_000, limit: 10 }; }
   budget() { if (this.ledger) this.recordBudget(this.ledger); return this.lastBudget; }
-  busy() { return !!this.active || !!this.connectionAbort || [...this.reviews.values()].some(review => review.applying); }
+  busy() { return !!this.active || !!this.connectionAbort || this.reconciling || [...this.reviews.values()].some(review => review.applying); }
   async checkConnection() {
     if (this.busy()) throw new Error("TASK_ALREADY_RUNNING");
     const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
@@ -52,13 +55,14 @@ export class Tasks {
     if (this.busy()) throw new Error("TASK_ALREADY_RUNNING");
     const canStart = () => ["idle", "ended"].includes(chat.execution) && !chat.changes.some(change => change.status === "pending" || change.status === "needs-reconcile") && !this.reviews.has(chat.id);
     if (!canStart()) throw new Error("TASK_REVIEW_OR_RECONCILE_REQUIRED");
+    if (this.options.store.chats.some(other => other.id !== chat.id && other.projectId === project.id && (other.execution === "reconcile" || other.changes.some(change => change.status === "pending")))) throw new Error("PROJECT_LOCK_BUSY_RECONCILE_REQUIRED");
     const key = await this.options.credentials.read();
     // The async credential lookup must not let two concurrent UI requests start.
     if (this.busy() || !canStart()) throw new Error("TASK_ALREADY_RUNNING");
     assertNoKnownSecrets(prompt, [key]);
     let resume: { threadId: string; turnId: string } | undefined;
     if (chat.execution === "ended") {
-      const previous = JSON.parse(readFileSync(path.join(this.options.root, "tasks", chat.id, "outcome.json"), "utf8"));
+      const previous = JSON.parse(readPrivate(this.options.root, `tasks/${chat.id}/outcome.json`));
       if (previous.status !== "completed" || previous.cleanExit !== true || typeof previous.threadId !== "string" || typeof previous.turnId !== "string") throw new Error("ENGINE_HISTORY_MISMATCH");
       resume = { threadId: previous.threadId, turnId: previous.turnId };
     }
@@ -93,12 +97,12 @@ export class Tasks {
         if (!manifest || JSON.parse(Buffer.from(manifest.base64, "base64").toString("utf8")).workspaces) throw new Error("PROJECT_SCOPE_UNSUPPORTED");
       }
       const taskRecord = JSON.stringify({ chatId: chat.id, projectId: project.id, taskDirectory: task.taskDirectory, runRoot: root, mode: chat.mode, state: "prepared" });
-      writeFileSync(path.join(root, "task.json"), taskRecord, { flag: "wx" }); writeFileSync(path.join(chatRoot, "task.json"), taskRecord);
+      writeFileSync(path.join(root, "task.json"), taskRecord, { flag: "wx" }); writePrivate(chatRoot, "task.json", taskRecord);
       if (abort.signal.aborted) throw new Error("TASK_USER_STOP");
       processKnownEnded = false;
       const result = await executeSession({ ...this.options, root, historyHome: path.join(chatRoot, "home"), ...(resume ? { resume } : {}), workspace: task.workspace, privateDir: path.join(task.taskDirectory, "private"), original: project.path,
         rootMarker: task.rootMarker, readOnlyAssets: task.readOnlyAssets, readOnlyDirectories: task.readOnlyDirectories, mode: chat.mode, prompt, testCommand: project.testCommand ?? "", key, ledger: this.ledger!, signal: abort.signal,
-        onIdentity: (threadId, turnId) => { const bytes = JSON.stringify({ threadId, turnId }); writeFileSync(path.join(root, "identity.json"), bytes, { flag: "wx" }); writeFileSync(path.join(chatRoot, "identity.json"), bytes); },
+        onIdentity: (threadId, turnId) => { const bytes = JSON.stringify({ threadId, turnId }); writeFileSync(path.join(root, "identity.json"), bytes, { flag: "wx" }); writePrivate(chatRoot, "identity.json", bytes); },
         onEvent: (method, params) => {
           if (!isObject(params)) return;
           if (method === "boundary/toolPlan" && typeof params.id === "string" && typeof params.command === "string") { plannedCommands.set(params.id, params.command); return; }
@@ -135,7 +139,7 @@ export class Tasks {
       });
       processKnownEnded = result.cleanExit;
       writeFileSync(path.join(root, "outcome.json"), JSON.stringify(result), { flag: "wx" });
-      writeFileSync(path.join(chatRoot, "outcome.json"), JSON.stringify(result));
+      writePrivate(chatRoot, "outcome.json", JSON.stringify(result));
       chat.error = result.code;
       finalExecution = result.status === "completed" ? "ended" : result.status === "reconcile" ? "reconcile" : result.status;
       if (result.status !== "completed") return;
@@ -170,6 +174,39 @@ export class Tasks {
     if (!this.active || this.active.chatId !== chatId) throw new Error("TASK_NOT_RUNNING");
     const chat = this.options.store.chats.find(chat => chat.id === chatId)!; chat.execution = "stopping";
     this.active.abort.abort(); this.publish();
+  }
+  suspendReviews() {
+    if (this.busy()) throw new Error("TASK_ALREADY_RUNNING");
+    for (const [chatId, entry] of this.reviews) {
+      const chat = this.options.store.chats.find(chat => chat.id === chatId);
+      if (!chat || chat.execution !== "ended") continue;
+      entry.task.suspend(); this.reviews.delete(chatId);
+    }
+    this.options.store.save();
+  }
+  async reopenReview(chat: Chat, project: Project) {
+    if (this.busy()) throw new Error("TASK_ALREADY_RUNNING");
+    if (chat.execution !== "reconcile" || !chat.reviewId || this.reviews.has(chat.id)) throw new Error("REVIEW_UNAVAILABLE");
+    this.reconciling = true;
+    try {
+      const chatRoot = path.join(this.options.root, "tasks", chat.id);
+      const taskRecord = JSON.parse(readPrivate(chatRoot, "task.json")), outcome = JSON.parse(readPrivate(chatRoot, "outcome.json"));
+      const identity = JSON.parse(readPrivate(chatRoot, "identity.json"));
+      if (taskRecord.chatId !== chat.id || taskRecord.projectId !== project.id || outcome.status !== "completed" || outcome.cleanExit !== true ||
+        typeof identity.threadId !== "string" || typeof identity.turnId !== "string" || identity.threadId !== outcome.threadId || identity.turnId !== outcome.turnId ||
+        path.dirname(taskRecord.runRoot).toLowerCase() !== path.join(chatRoot, "turns").toLowerCase()) throw new Error("REVIEW_RECONCILE_REQUIRED");
+      await verifyCompletedHistory(this.options.engine, taskRecord.runRoot, path.join(chatRoot, "home"), identity.threadId, identity.turnId);
+      const task = restoreReviewWorkspace(project.path, path.join(this.options.root, "reviews"), taskRecord.taskDirectory, chat.reviewId, this.options.guard);
+      this.reviews.set(chat.id, { task, review: task.review, applying: false });
+      // The current workspace.json display is not authority for frozen bytes or
+      // partial results. Reconstruct the visible review from verified evidence.
+      const baseline = JSON.parse(readPrivate(task.taskDirectory, "private/baseline.json", 24 * 1024 * 1024));
+      const frozen = JSON.parse(readPrivate(task.taskDirectory, "private/frozen.json", 24 * 1024 * 1024));
+      const bytes = (files: { relative: string; base64: string }[], relative: string) => Buffer.from(files.find(file => file.relative === relative)?.base64 ?? "", "base64").toString("utf8");
+      chat.changes = task.review.changes.map(change => ({ relative: change.relative, kind: change.kind, before: bytes(baseline.files, change.relative), after: bytes(frozen.files, change.relative),
+        status: task.outcomes.find(outcome => outcome.relative === change.relative)?.status ?? "pending" }));
+      chat.execution = "ended"; chat.error = null; this.publish();
+    } finally { this.reconciling = false; }
   }
   async stopAll() {
     this.connectionAbort?.abort();

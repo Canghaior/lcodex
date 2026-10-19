@@ -56,6 +56,6 @@ P2-02/03：本机密钥保护、真实引擎连接、只读和修改任务、工
 
 实际 Electron 联测从修复并应用开始，关闭应用、在原项目新增备注、重启后切换只读继续。同一引擎聊天包含之前的工具结果，新工具读取到最新备注，只读写入被拒绝，原文件不变，两轮副本不同。模型为固定模拟响应。类型检查、构建、原生工作流与停止回归通过，真实 API 占用仍为 0.676492 元。首次失败是测试在重启后的默认文件页寻找应用按钮，显式切换改动页后复测通过。
 
-待应用审阅恢复、异常核对、数据删除与真实模型桌面续聊仍待完成；此项不代表 P3 退出。
+后续已完成正常关闭后的审阅交接与真实模型桌面续聊，证据更新在 [P3_RECOVERY.md](P3_RECOVERY.md)。异常核对与数据管理仍在开发，不代表 P3 退出。
 
 参考：[Electron 安全](https://www.electronjs.org/docs/latest/tutorial/security)、[Preload](https://www.electronjs.org/docs/latest/tutorial/tutorial-preload)、[React 版本](https://react.dev/versions)、[Vite](https://vite.dev/guide/)。2026-10-20 核对；实际依赖以 package-lock.json 和运行记录为准。

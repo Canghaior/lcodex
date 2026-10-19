@@ -4,13 +4,56 @@ import { existsSync, linkSync, mkdirSync, readFileSync, renameSync, symlinkSync,
 import path from "node:path";
 import test from "node:test";
 import { createFixture, snapshot } from "./fixtures.js";
-import { prepareReviewWorkspace } from "./review-workspace.js";
+import { prepareReviewWorkspace, restoreReviewWorkspace } from "./review-workspace.js";
 import { contentHash, WindowsFileGuard } from "./windows-file-guard.js";
 import { inspectApplyJournal } from "./apply-journal.js";
 import { isolatedEnvironment } from "./isolated-env.js";
 
 const shell = "C:/Users/lijin/.cache/codex-runtimes/codex-primary-runtime/dependencies/native/powershell/pwsh.exe";
 const options = { skip: process.platform !== "win32" || !existsSync(shell), timeout: 90_000 };
+
+test("orderly suspended review reopens frozen bytes, preserves partial outcomes and refuses replay", options, async () => {
+  const fixture = createFixture(false), state = path.join(fixture.root, "state"); mkdirSync(state);
+  const guard = new WindowsFileGuard(shell, fixture.root), task = await prepareReviewWorkspace(fixture.project, state, guard);
+  writeFileSync(path.join(task.workspace, "invoice.mjs"), "// frozen proposal\n");
+  writeFileSync(path.join(task.workspace, "added.txt"), "only once\n");
+  writeFileSync(path.join(task.workspace, "user-notes.txt"), "proposed notes\n");
+  const review = await task.seal();
+  assert.equal((await task.apply(review.id, ["added.txt"]))[0]?.status, "applied");
+  task.suspend();
+  writeFileSync(path.join(task.workspace, "invoice.mjs"), "// changed after suspension\n");
+  writeFileSync(path.join(fixture.project, "user-notes.txt"), "new user edit\n");
+  const restored = restoreReviewWorkspace(fixture.project, state, task.taskDirectory, review.id, guard);
+  try {
+    assert.deepEqual(restored.outcomes, [{ relative: "added.txt", status: "applied" }]);
+    await assert.rejects(restored.apply(review.id, ["added.txt"]), /REVIEW_SELECTION_INVALID/);
+    const results = await restored.apply(review.id, ["invoice.mjs", "user-notes.txt"]);
+    assert.deepEqual(results.map(result => result.status), ["applied", "conflict"]);
+    assert.equal(readFileSync(fixture.sourceFile, "utf8"), "// frozen proposal\n");
+    assert.equal(readFileSync(path.join(fixture.project, "user-notes.txt"), "utf8"), "new user edit\n");
+    assert.equal(restored.journal().split('"type":"intent"').length - 1, 3);
+  } finally { restored.close(); fixture.cleanup(); }
+});
+
+test("reopening rejects changed evidence, unfinished writes and unsafe handoffs", options, async () => {
+  const fixture = createFixture(false), state = path.join(fixture.root, "state"); mkdirSync(state);
+  const guard = new WindowsFileGuard(shell, fixture.root), task = await prepareReviewWorkspace(fixture.project, state, guard);
+  writeFileSync(path.join(task.workspace, "invoice.mjs"), "// frozen\n");
+  const review = await task.seal(); task.suspend();
+  const file = path.join(task.taskDirectory, "private/frozen.json"), previous = readFileSync(file);
+  try {
+    writeFileSync(file, Buffer.concat([previous, Buffer.from(" ")]));
+    assert.throws(() => restoreReviewWorkspace(fixture.project, state, task.taskDirectory, review.id, guard), /REVIEW_CONTENT_CHANGED/);
+    writeFileSync(file, previous);
+    const restored = restoreReviewWorkspace(fixture.project, state, task.taskDirectory, review.id, guard);
+    const result = await restored.apply(review.id, ["invoice.mjs"], () => { throw new Error("synthetic interruption"); });
+    assert.equal(result[0]?.status, "needs-reconcile");
+    assert.throws(() => restored.suspend(), /REVIEW_RECONCILE_REQUIRED/);
+    assert.throws(() => restored.close(), /REVIEW_RECONCILE_REQUIRED/);
+    assert.throws(() => restoreReviewWorkspace(fixture.project, state, task.taskDirectory, review.id, guard));
+    await assert.rejects(prepareReviewWorkspace(fixture.project, state, guard), /PROJECT_LOCK_BUSY_RECONCILE/);
+  } finally { fixture.cleanup(); }
+});
 
 test("installed dependencies are copied independently, excluded from proposals and checked for mutation", options, async () => {
   const fixture = createFixture(false), state = path.join(fixture.root, "state"); mkdirSync(state);
