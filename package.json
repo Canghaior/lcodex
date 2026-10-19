@@ -13,6 +13,7 @@
     "build": "tsc -p tsconfig.desktop.json && tsc -p tsconfig.renderer.json && vite build",
     "start": "npm run build && electron .",
     "test:desktop": "npm run build:validation && npm run build && node --test --test-concurrency=1 tests/desktop*.test.mjs",
+    "test:storage": "npm run build:validation && npm run build && node --test tests/storage.test.mjs tests/deletion.test.mjs",
     "build:validation": "tsc",
     "test": "npm run build:validation && node --test dist/validation/*.test.js",
     "validate:offline": "npm run build:validation && node dist/validation/offline-probe.js",

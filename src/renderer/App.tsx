@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { ArrowUp, Check, ChevronDown, ChevronRight, Code2, FileCode2, FileDiff, FileText, Folder, FolderOpen, ListChecks, Maximize2, MessageSquare, Minus, PanelLeft, PanelRight, Plus, Search, Settings2, ShieldCheck, Square, SquarePen, Terminal, X } from "lucide-react";
+import { ArrowUp, Check, ChevronDown, ChevronRight, Code2, FileCode2, FileDiff, FileText, Folder, FolderOpen, ListChecks, Maximize2, MessageSquare, Minus, PanelLeft, PanelRight, Plus, Search, Settings2, ShieldCheck, Square, SquarePen, Terminal, Trash2, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { AppState, Chat, Command, FilePreview, Reply } from "../shared/contracts.js";
@@ -24,6 +24,10 @@ function errorText(code: string) {
     REVIEW_REOPEN_REQUIRED: "待应用改动已保留。请先核对并重开审阅；这不会调用模型或自动应用文件。",
     REVIEW_RECONCILE_REQUIRED: "无法确认上次写入结果。基线与冻结改动已保留，不会重放或覆盖原文件。",
     REVIEW_CONTENT_CHANGED: "审阅内容或应用记录发生变化，已阻止恢复。请保留记录供核对。",
+    CHAT_DELETE_REFUSED: "请先结束任务并处理待审阅改动。存在未决写入时不能删除恢复依据。",
+    CHAT_DELETE_INCOMPLETE: "这次删除尚未完成，记录已保留。请再次点击删除聊天以继续清理。",
+    CHAT_DELETE_LINK_REFUSED: "本机任务数据中发现链接或路径变化，已停止清理；不会跟随链接删除其他位置。",
+    CHAT_COUNT_LIMIT: "已达到 1000 个聊天的保存上限，请删除不再需要的已结束聊天。",
     TASK_REVIEW_OR_RECONCILE_REQUIRED: "请先应用或放弃待审阅改动；若状态需要核对，请先完成核对，再继续对话。",
     KEY_MISSING: "请先在设置中保存 DeepSeek API Key。",
     KEY_ENCRYPTION_UNAVAILABLE: "Windows 密钥加密当前不可用。请检查登录环境后重试，不会改用明文保存。",
@@ -50,12 +54,14 @@ export function App() {
   const [settings, setSettings] = useState(false), [sidebar, setSidebar] = useState(true), [workspace, setWorkspace] = useState(true), [tab, setTab] = useState<"files" | "changes" | "output">("files");
   const [keyInput, setKeyInput] = useState(""), [keyBusy, setKeyBusy] = useState(false), [testCommand, setTestCommand] = useState(""), [selectedChange, setSelectedChange] = useState<string | null>(null), [applying, setApplying] = useState(false);
   const [checkingConnection, setCheckingConnection] = useState(false), [connectionVerified, setConnectionVerified] = useState(false);
+  const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null), [deleting, setDeleting] = useState(false);
   const [preview, setPreview] = useState<FilePreview | null>(null), [files, setFiles] = useState<FilePreview[]>([]), [sourceView, setSourceView] = useState(false);
   const [drafts, setDrafts] = useState<Record<string, string>>({}), [query, setQuery] = useState(""), [searching, setSearching] = useState(false);
   const [chatWidth, setChatWidth] = useState(45), [dragging, setDragging] = useState(false);
   const center = useRef<HTMLDivElement>(null), composer = useRef<HTMLTextAreaElement>(null), bottom = useRef<HTMLDivElement>(null);
   const chat = state?.chats.find(item => item.id === state.activeChatId);
   const project = state?.projects.find(item => item.id === chat?.projectId);
+  const deleteTarget = state?.chats.find(item => item.id === deleteTargetId);
   const draft = drafts[chat?.id ?? "empty"] ?? "";
   const request = useCallback(async (command: Command): Promise<Reply | undefined> => {
     try { const reply = await window.lcodex.request(command); if (reply.ok) { setState(reply.state); return reply; } setError(errorText(reply.code)); }
@@ -132,7 +138,7 @@ export function App() {
       </aside>}
       <main className="main-panels" ref={center}>
         <section className="chat-panel" style={{ flexBasis: workspace ? `${chatWidth}%` : "100%" }} aria-label="聊天区">
-          <div className="panel-header"><Folder size={15} /><span className="panel-title">{chat?.title ?? "新聊天"}</span><IconButton label="切换工作区" onClick={() => setWorkspace(value => !value)}><PanelRight size={16} /></IconButton></div>
+          <div className="panel-header"><Folder size={15} /><span className="panel-title">{chat?.title ?? "新聊天"}</span>{chat && <IconButton label="删除聊天" disabled={deleting || !(["idle", "ended"].includes(chat.execution) && !chat.changes.some(change => ["pending", "needs-reconcile"].includes(change.status)) || chat.error === "CHAT_DELETE_INCOMPLETE")} onClick={() => setDeleteTargetId(chat.id)}><Trash2 size={15} /></IconButton>}<IconButton label="切换工作区" onClick={() => setWorkspace(value => !value)}><PanelRight size={16} /></IconButton></div>
           <div className="conversation">
             {!chat?.messages.length && <div className="welcome"><div className="welcome-symbol"><Code2 size={31} strokeWidth={1.4} /></div><h1>{project ? `一起构建 ${project.name}` : "从一个本地项目开始"}</h1><p>{project ? "理解代码、修复问题，把一个小想法变成可用的功能。" : "让 DeepSeek 理解你的代码，在本机完成编程任务。"}</p>
               {!project ? <button className="primary-button" onClick={() => void chooseProject()} disabled={busy}><FolderOpen size={16} />{busy ? "正在检查项目…" : "选择项目"}</button> : <div className="suggestions">{[["理解这个项目", "介绍这个项目的结构和主要入口，先不要修改文件。"], ["定位一个问题", "帮我定位这个问题的原因，并说明需要怎样验证："], ["实现一个小功能", "我想在这个项目中增加一个小功能："]].map(([title, text]) => <button key={title} onClick={() => { setDrafts(old => ({ ...old, [chat!.id]: text! })); composer.current?.focus(); }}><MessageSquare size={15} /><span>{title}</span><ChevronRight size={14} /></button>)}</div>}
@@ -155,6 +161,7 @@ export function App() {
       </main>
     </div>
     {error && <div className="toast" role="alert"><span>{error}</span><IconButton label="关闭提示" onClick={() => setError(null)}><X size={15} /></IconButton></div>}
+    {deleteTarget && <div className="modal-backdrop"><section className="settings-dialog" role="dialog" aria-modal="true" aria-label="删除聊天"><div className="settings-heading"><h2>删除这个聊天？</h2><IconButton label="取消删除" disabled={deleting} onClick={() => setDeleteTargetId(null)}><X size={18} /></IconButton></div><div className="settings-section"><p>将删除“{deleteTarget.title}”的聊天、工具记录和已结束任务的本机副本。原项目文件、模型密钥和预算记录会保留。</p><p>删除后不能在应用内恢复这些聊天记录。</p><button className="primary-button" disabled={deleting} onClick={async () => { const targetId = deleteTarget.id; setDeleting(true); try { const result = await request({ type: "delete-chat", chatId: targetId }); if (result?.ok) { setDeleteTargetId(null); setDrafts(old => { const next = { ...old }; delete next[targetId]; return next; }); } } finally { setDeleting(false); } }}>{deleting ? "正在删除…" : "删除聊天和副本"}</button></div></section></div>}
     {settings && <div className="modal-backdrop" onClick={() => setSettings(false)}><section className="settings-dialog" role="dialog" aria-modal="true" aria-label="设置" onClick={event => event.stopPropagation()}><div className="settings-heading"><h2>设置</h2><IconButton label="关闭设置" onClick={() => setSettings(false)}><X size={18} /></IconButton></div><div className="settings-section"><h3>模型与密钥</h3><div className="setting-row"><span>DeepSeek Flash</span><span className="subtle-badge">{state?.runtime.key ? "密钥已加密保存" : "尚未配置密钥"}</span></div><label className="setting-label" htmlFor="api-key">DeepSeek API Key</label><div className="key-field"><input id="api-key" type="password" autoComplete="off" spellCheck={false} placeholder={state?.runtime.key ? "输入新密钥以替换" : "输入 API Key"} value={keyInput} onChange={event => setKeyInput(event.target.value)} /><button disabled={keyBusy || !keyInput.trim() || !!active} onClick={() => void saveKey()}>{keyBusy ? "保存中…" : "保存密钥"}</button></div>{state?.runtime.key && <button className="text-link small" disabled={!!active} onClick={() => void request({ type: "delete-key" })}>删除本机密钥</button>}<div className="connection-check"><button disabled={!state?.runtime.key || checkingConnection || !!active} onClick={() => void checkConnection()}>{checkingConnection ? "正在验证连接…" : "验证模型连接"}</button><span>{connectionVerified ? "模型接口已响应" : "将发起一次计费请求，计入现有预算"}</span></div><p>密钥由 Windows 加密保存，保存后不回传。任务中选择的代码与工具输出会发送至 DeepSeek 官方 API；项目文件和命令在本机处理。</p></div>
       {project && <div className="settings-section"><h3>项目验证 · {project.name}</h3><label className="setting-label" htmlFor="test-command">验证命令（可选）</label><textarea id="test-command" value={testCommand} onChange={event => setTestCommand(event.target.value)} placeholder="填写已准备好的项目测试命令" rows={2} maxLength={2048} /><button className="text-link small" disabled={!!active} onClick={() => void request({ type: "set-test-command", projectId: project.id, command: testCommand })}>保存验证命令</button><p>命令在隔离副本内运行。只有该命令实际执行并返回成功，才标记通过；它不代替人工审阅。未配置时保留实际工具记录，整体状态为尚未验证。</p></div>}
       <div className="settings-section"><h3>开发验证预算</h3><div className="setting-row"><span>累计占用 / 上限</span><span>¥{state?.budget.committed.toFixed(4)} / ¥{state?.budget.limit}</span></div><p>含未知用量与在途预留 ¥{state?.budget.unknown.toFixed(4)}。单任务最多 ¥1，最多 8 次模型请求；按已核对价格保守估算，非实际账单。达到限制会停止新调用并保留结果。</p></div><div className="settings-section"><h3>本地执行环境</h3>{([['engine', 'Codex 0.162.0'], ['shell', 'PowerShell 7.6.5'], ['node', 'Node 24.8.0']] as const).map(([key, label]) => <div className="setting-row" key={key}><span>{label}</span><span className={state?.runtime[key] ? "status-ok" : "status-missing"}>{state?.runtime[key] ? <><Check size={14} />版本校验通过</> : "未找到匹配版本"}</span></div>)}<p>开发版本使用已验证的本机运行环境；独立安装包尚未验收。</p></div><div className="settings-section"><h3>首版项目范围</h3><p>Windows 小型单包 JS/TS。源码与资源合计 16 MiB，单文件 1 MiB；普通预装依赖合计 64 MiB。暂不支持链接依赖与大型多包项目。</p><div className="setting-row"><span>修改方式</span><span>隔离副本 · 审阅后应用</span></div></div><div className="settings-footer"><span>lcodex {state?.version}</span><span>个人 · 本地使用</span></div></section></div>}

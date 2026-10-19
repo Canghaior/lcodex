@@ -110,7 +110,7 @@ async function main() {
         if (!store.chats.some(chat => chat.id === command.chatId)) throw new Error("CHAT_NOT_FOUND");
         store.activeChatId = command.chatId; store.save();
       } else if (command.type === "set-mode") {
-        const chat = store.chats.find(chat => chat.id === command.chatId);
+        const chat = store.chat(command.chatId);
         if (!chat || !["idle", "ended"].includes(chat.execution) || chat.changes.some(change => ["pending", "needs-reconcile"].includes(change.status))) throw new Error("CHAT_MODE_LOCKED");
         chat.mode = command.mode; store.save();
       } else if (command.type === "open-file") {
@@ -128,15 +128,18 @@ async function main() {
         if (!tasks) throw new Error("RUNTIME_UNAVAILABLE");
         await tasks.checkConnection();
         return { ok: true, state: state(), connectionVerified: true };
-      } else if (["send", "stop", "apply", "discard", "reopen-review"].includes(command.type)) {
+      } else if (["send", "stop", "apply", "discard", "reopen-review", "delete-chat"].includes(command.type)) {
         if (!("chatId" in command) || !tasks) throw new Error("RUNTIME_UNAVAILABLE");
-        const chat = store.chats.find(chat => chat.id === command.chatId); if (!chat) throw new Error("CHAT_NOT_FOUND");
+        const chat = store.chat(command.chatId); if (!chat) throw new Error("CHAT_NOT_FOUND");
         const project = store.projects.find(project => project.id === chat.projectId); if (!project) throw new Error("PROJECT_NOT_FOUND");
-        if (command.type === "send") await tasks.start(chat, project, command.text);
-        if (command.type === "stop") tasks.stop(chat.id);
-        if (command.type === "apply") await tasks.apply(chat, command.reviewId, command.files);
-        if (command.type === "discard") tasks.discard(chat, command.reviewId);
-        if (command.type === "reopen-review") await tasks.reopenReview(chat, project);
+        await store.hold(chat.id, async () => {
+          if (command.type === "send") await tasks.start(chat, project, command.text);
+          if (command.type === "stop") tasks.stop(chat.id);
+          if (command.type === "apply") await tasks.apply(chat, command.reviewId, command.files);
+          if (command.type === "discard") tasks.discard(chat, command.reviewId);
+          if (command.type === "reopen-review") await tasks.reopenReview(chat, project);
+          if (command.type === "delete-chat") await tasks.deleteChat(chat);
+        });
       } else if (command.type === "window") {
         if (command.action === "minimize") win.minimize();
         if (command.action === "maximize") win.isMaximized() ? win.unmaximize() : win.maximize();

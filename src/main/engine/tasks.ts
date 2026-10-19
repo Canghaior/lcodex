@@ -13,6 +13,7 @@ import { executeSession, safeCode } from "./session.js";
 import { PRICE_REVIEW_DATE, sendBoundedDeepSeek } from "../../../validation/deepseek-request.js";
 import { readPrivate, writePrivate } from "../../../validation/private-files.js";
 import { verifyCompletedHistory } from "./history.js";
+import { finishChatDeletion, performChatDeletion, prepareChatDeletion } from "../storage/deletion.js";
 
 type Workspace = Awaited<ReturnType<typeof prepareReviewWorkspace>>;
 type ReviewEntry = { task: Workspace; review: Review; applying: boolean };
@@ -172,13 +173,13 @@ export class Tasks {
   }
   stop(chatId: string) {
     if (!this.active || this.active.chatId !== chatId) throw new Error("TASK_NOT_RUNNING");
-    const chat = this.options.store.chats.find(chat => chat.id === chatId)!; chat.execution = "stopping";
+    const chat = this.options.store.chat(chatId)!; chat.execution = "stopping";
     this.active.abort.abort(); this.publish();
   }
   suspendReviews() {
     if (this.busy()) throw new Error("TASK_ALREADY_RUNNING");
     for (const [chatId, entry] of this.reviews) {
-      const chat = this.options.store.chats.find(chat => chat.id === chatId);
+      const chat = this.options.store.chat(chatId);
       if (!chat || chat.execution !== "ended") continue;
       entry.task.suspend(); this.reviews.delete(chatId);
     }
@@ -206,6 +207,18 @@ export class Tasks {
       chat.changes = task.review.changes.map(change => ({ relative: change.relative, kind: change.kind, before: bytes(baseline.files, change.relative), after: bytes(frozen.files, change.relative),
         status: task.outcomes.find(outcome => outcome.relative === change.relative)?.status ?? "pending" }));
       chat.execution = "ended"; chat.error = null; this.publish();
+    } finally { this.reconciling = false; }
+  }
+  async deleteChat(chat: Chat) {
+    if (this.busy() || this.reviews.has(chat.id)) throw new Error("CHAT_DELETE_REFUSED");
+    prepareChatDeletion(this.options.root, chat);
+    this.reconciling = true;
+    chat.execution = "reconcile"; chat.error = "CHAT_DELETE_INCOMPLETE";
+    try {
+      this.publish();
+      await performChatDeletion(this.options.root, chat.id);
+      this.options.store.forget(chat.id); finishChatDeletion(this.options.root, chat.id);
+      this.options.notify();
     } finally { this.reconciling = false; }
   }
   async stopAll() {
