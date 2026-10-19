@@ -17,6 +17,7 @@ import { finishChatDeletion, performChatDeletion, prepareChatDeletion } from "..
 import { abandonStoppedIsolatedWorkspace, assertNeverApplied } from "../../../validation/abandon-isolated.js";
 import type { Pricing } from "../storage/pricing.js";
 import { recoverBudgetLock } from "../storage/budget-recovery.js";
+import { assertProjectDataSeparation } from "../projects/projects.js";
 
 type Workspace = Awaited<ReturnType<typeof prepareReviewWorkspace>>;
 type ReviewEntry = { task: Workspace; review: Review; applying: boolean };
@@ -97,6 +98,7 @@ export class Tasks {
   }
   private publish(save = true) { if (save) this.options.store.save(); this.options.notify(); }
   async start(chat: Chat, project: Project, prompt: string) {
+    assertProjectDataSeparation(project.path, this.options.root);
     if (this.busy()) throw new Error("TASK_ALREADY_RUNNING");
     this.options.pricing.requireCurrent();
     const canStart = () => ["idle", "ended"].includes(chat.execution) && !chat.changes.some(change => change.status === "pending" || change.status === "needs-reconcile") && !this.reviews.has(chat.id);

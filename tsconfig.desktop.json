@@ -1,6 +1,6 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": { "lib": ["ES2023", "DOM"], "outDir": "dist" },
-  "include": ["src/main/**/*.ts", "src/preload/**/*.cts", "src/shared/**/*.ts"],
+  "include": ["src/main/**/*.ts", "src/main/**/*.cts", "src/preload/**/*.cts", "src/shared/**/*.ts"],
   "exclude": ["validation/**/*.test.ts"]
 }

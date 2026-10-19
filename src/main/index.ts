@@ -1,22 +1,26 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, net, protocol, session, shell as desktopShell } from "electron";
 import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
-import { createHash } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 import { validCommand, type AppState, type Reply } from "../shared/contracts.js";
 import { AppStore } from "./storage/store.js";
-import { inspectProject, newChat, previewFile } from "./projects/projects.js";
+import { assertProjectDataSeparation, inspectProject, newChat, previewFile } from "./projects/projects.js";
 import { WindowsFileGuard } from "../../validation/windows-file-guard.js";
 import { BudgetLedger } from "../../validation/budget.js";
 import { Credentials } from "./storage/credentials.js";
 import { Tasks } from "./engine/tasks.js";
 import { Pricing, PRICE_SOURCE } from "./storage/pricing.js";
+import { runtimePaths, verifyRuntime } from "./runtime.js";
 
 const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 const testRoot = !app.isPackaged ? process.env.LCODEX_DESKTOP_TEST_ROOT : undefined;
 if (testRoot && (path.dirname(realpathSync(testRoot)).toLowerCase() !== path.join(sourceRoot, ".local/runs").toLowerCase() ||
   JSON.parse(readFileSync(path.join(testRoot, ".lcodex-run.json"), "utf8")).kind !== "generated-validation-run")) throw new Error("TEST_ROOT_REFUSED");
-const dataRoot = testRoot ? path.join(testRoot, "desktop") : app.isPackaged ? app.getPath("userData") : path.join(sourceRoot, ".local", "desktop");
+// Explicit local profiles support portable use and isolated package acceptance.
+// Require an existing, non-redirected absolute directory; never infer one from a project.
+const customData = app.commandLine.getSwitchValue("user-data-dir");
+if (customData && (!path.isAbsolute(customData) || realpathSync(customData).toLowerCase() !== path.resolve(customData).toLowerCase())) throw new Error("DATA_DIRECTORY_REFUSED");
+const dataRoot = testRoot ? path.join(testRoot, "desktop") : customData || (app.isPackaged ? app.getPath("userData") : path.join(sourceRoot, ".local", "desktop"));
 mkdirSync(dataRoot, { recursive: true });
 for (const relative of ["home", "profile/roaming", "profile/local/Packages", "temp"]) mkdirSync(path.join(dataRoot, relative), { recursive: true });
 app.setPath("userData", dataRoot);
@@ -25,18 +29,14 @@ const ownsInstance = app.requestSingleInstanceLock();
 app.setAppUserModelId("local.lcodex.desktop");
 protocol.registerSchemesAsPrivileged([{ scheme: "lcodex", privileges: { standard: true, secure: true, supportFetchAPI: true } }]);
 app.enableSandbox();
-const shell = path.join(app.getPath("home"), ".cache/codex-runtimes/codex-primary-runtime/dependencies/native/powershell/pwsh.exe");
-const engine = path.join(sourceRoot, ".local/engines/codex-0.162.0/package/vendor/x86_64-pc-windows-msvc/bin/codex.exe");
-const node = "C:/nvm4w/nodejs/node.exe";
-function matches(file: string, sha: string) { try { return createHash("sha256").update(readFileSync(file)).digest("hex") === sha; } catch { return false; } }
+const paths = runtimePaths(sourceRoot, process.resourcesPath, app.isPackaged, app.getPath("home"));
+const { engine, shell, node } = paths;
 
 async function main() {
   await app.whenReady();
-  const store = new AppStore(dataRoot);
-  const runtime = { engine: matches(engine, "dce685d569526ef4712fa82d20ff20e1309baad5fcd34215e1126698f611242f"),
-    shell: matches(shell, "362a356ce7f0940ec74f73a8fc2c990a2cc24a38a11c90bbd8eca947110ad139"),
-    node: matches(node, "3a9ac860c566b7aebf144be914f95e3ec36dc88040aa7acb5d9d1e6e0c7afd5e"), key: false, ready: false, platform: "Windows · MXC" };
-  const guard = runtime.shell ? new WindowsFileGuard(shell, dataRoot, path.join(sourceRoot, "validation")) : undefined;
+  const store = new AppStore(dataRoot, app.getVersion() + (app.isPackaged ? "" : "-dev"));
+  const runtime = { ...await verifyRuntime(paths, process.resourcesPath, app.isPackaged), key: false, ready: false, platform: "Windows · MXC", bundled: app.isPackaged };
+  const guard = runtime.shell ? new WindowsFileGuard(shell, dataRoot, paths.guard) : undefined;
   const credentials = new Credentials(dataRoot);
   const pricing = new Pricing(dataRoot, !app.isPackaged), budgetScope = app.isPackaged ? "personal" : "development";
   const ledgerFile = app.isPackaged ? path.join(dataRoot, "usage.jsonl") : testRoot && process.env.LCODEX_LIVE_TEST !== "1" ? path.join(testRoot, "test-budget.jsonl") : path.join(sourceRoot, ".local/state/p1-budget.jsonl");
@@ -97,6 +97,7 @@ async function main() {
           const result = await dialog.showOpenDialog(win, { title: "选择本地项目", properties: ["openDirectory"] });
           if (!result.canceled && result.filePaths[0]) {
             if (!guard) throw new Error("SHELL_UNAVAILABLE");
+            assertProjectDataSeparation(result.filePaths[0], dataRoot);
             const candidate = await inspectProject(result.filePaths[0], guard);
             const old = store.projects.find(project => project.path.toLowerCase() === candidate.path.toLowerCase());
             if (old) { old.files = candidate.files; old.excluded = candidate.excluded; }
@@ -162,6 +163,6 @@ async function main() {
   await win.loadURL("lcodex://app/index.html");
   win.show();
 }
-if (ownsInstance) main().catch(() => { dialog.showErrorBox("lcodex 无法启动", "本地配置或运行文件无法读取。请保留 .local/desktop 供核对，不要删除任务记录。"); app.exit(1); });
+if (ownsInstance) main().catch(() => { console.error("LCODEX_START_FAILED"); dialog.showErrorBox("lcodex 无法启动", "本地配置或运行文件无法读取。请保留应用数据目录供核对，不要删除任务记录。"); app.exit(1); });
 else app.exit(0);
 app.on("window-all-closed", () => app.quit());

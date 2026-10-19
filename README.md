@@ -2,7 +2,7 @@
 
 目标是开发一款接入 DeepSeek 的本地桌面编程助手：选择项目后，通过自然语言完成代码阅读、修改和测试，并能查看执行过程与文件差异。
 
-P1 已在用户确认的小型 JS/TS 项目范围内通过。桌面已走通真实 DeepSeek 修复、差异审阅、应用、重启审阅及再次续聊；只读、停止与冲突保护有实际桌面联测。P3 持续使用核心条件已通过，正在准备 P4 独立分发与验收，尚无安装版交付。证据见 [桌面检查](docs/validation/P2_DESKTOP.md)与[恢复检查](docs/validation/P3_RECOVERY.md)。
+P1 已在用户确认的小型 JS/TS 项目范围内通过。桌面已走通真实 DeepSeek 修复、差异审阅、应用、重启审阅及再次续聊；只读、停止与冲突保护有实际桌面联测。P3 当前范围核心条件已通过，P4 已生成带运行时的 Windows 0.0.1 安装候选，整体验收尚未完成。证据见 [桌面检查](docs/validation/P2_DESKTOP.md)、[恢复检查](docs/validation/P3_RECOVERY.md)和[分发验证](docs/validation/P4_PACKAGING.md)。首次操作见[候选版使用说明](docs/USER_GUIDE.md)。
 
 - [开发方案](docs/DEVELOPMENT_PLAN.md)：产品范围、技术路线、阶段任务和验收标准。
 - [编程执行计划](docs/IMPLEMENTATION_PLAN.md)：P0 至 P4 的开发工作包、执行顺序、检查条件和 GitHub 同步规则。
@@ -40,7 +40,7 @@ npm run check
 npm test
 ```
 
-桌面开发窗口与检查（本机已验证的 PowerShell / 引擎路径仍是开发依赖，尚非独立安装包）：
+桌面开发窗口与检查（开发窗口使用固定本机路径，发布版捆绑运行时）：
 
 ```powershell
 $env:electron_config_cache = 'D:\make-codex\.local\electron-cache'
@@ -50,5 +50,7 @@ npm run test:desktop
 ```
 
 桌面状态保存在 `.local/desktop`，自动化测试只使用 `.local/runs` 下的合成项目。不要清理未核对的任务记录；密钥、日志和运行数据不进入 Git。
+
+Windows 构建使用 `npm run package:win`；按[分发验证](docs/validation/P4_PACKAGING.md)准备固定构建输入。候选产物只保存在 `.local/releases`，不随源码上传。`npm run test:package` 检查真实打包程序，模型响应为模拟；`node tests/installer.mjs --install` 会在确认没有已有 lcodex 安装后临时安装并卸载本候选，属于显式安装验收。
 
 本地引擎握手另运行 `npm run validate:offline -- "<codex.exe 绝对路径>"`，需要 P1 环境文档中登记的引擎版本与哈希。此命令不调用模型、不开启编程任务、不验证实际沙箱权限。原始生成文件在 `.local/`，不提交到 GitHub。

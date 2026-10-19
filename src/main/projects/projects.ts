@@ -4,6 +4,15 @@ import path from "node:path";
 import { WindowsFileGuard } from "../../../validation/windows-file-guard.js";
 import type { Chat, Project } from "../../shared/contracts.js";
 
+export function assertProjectDataSeparation(root: string, dataRoot: string): void {
+  const project = realpathSync(root), data = realpathSync(dataRoot);
+  const within = (base: string, candidate: string) => {
+    const relative = path.relative(base, candidate);
+    return !relative || (!relative.startsWith(".." + path.sep) && relative !== ".." && !path.isAbsolute(relative));
+  };
+  if (within(project, data) || within(data, project)) throw new Error("PROJECT_OVERLAPS_APP_DATA");
+}
+
 export async function inspectProject(root: string, guard: WindowsFileGuard): Promise<Project> {
   const actual = realpathSync(root);
   const captured = await guard.capture(actual);

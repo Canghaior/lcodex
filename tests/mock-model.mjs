@@ -14,7 +14,7 @@ globalThis.fetch = async (url, init) => {
   const stopping = JSON.stringify(body.input).includes("STOP_TREE");
   const continuing = JSON.stringify(body.input).includes("CONTINUE_AFTER_RESTART");
   if (continuing && n === 1 && !body.input.some(item => ["function_call_output", "custom_tool_call_output"].includes(item.type))) throw new Error("TEST_HISTORY_MISSING");
-  const command = "& 'C:/nvm4w/nodejs/node.exe' --preserve-symlinks --preserve-symlinks-main --test; exit $LASTEXITCODE";
+  const command = globalThis.lcodexTestCommand ?? "& 'C:/nvm4w/nodejs/node.exe' --preserve-symlinks --preserve-symlinks-main --test; exit $LASTEXITCODE";
   const patch = "*** Begin Patch\n*** Update File: catalog.mjs\n@@\n-export function total(items) { return items.reduce((sum, item) => sum + item.unitCents, 0); }\n+export function total(items) { return items.reduce((sum, item) => sum + item.unitCents * item.quantity, 0); }\n*** End Patch";
   const message = connecting || (writeMode ? n >= 4 : n >= 2);
   const text = "模拟模型联测：已处理 catalog.mjs，实际工具结果见记录。原项目等待审阅后应用。";

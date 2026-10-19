@@ -40,7 +40,16 @@ export async function executeSession(options: EngineOptions): Promise<EngineResu
   for (const relative of ["home", "profile/roaming", "profile/local/Packages", "temp"]) mkdirSync(path.join(root, relative), { recursive: true });
   mkdirSync(historyHome, { recursive: true });
   const token = randomUUID(), trial = `desktop-${randomUUID()}`;
-  const env = { ...isolatedEnvironment(root, process.env), CODEX_HOME: historyHome, LCODEX_WORKFLOW_TOKEN: token };
+  const env: NodeJS.ProcessEnv = { ...isolatedEnvironment(root, process.env), CODEX_HOME: historyHome, LCODEX_WORKFLOW_TOKEN: token };
+  env.PATH = [path.dirname(node), path.dirname(shell), path.join(process.env.SystemRoot ?? "C:/Windows", "System32"), process.env.SystemRoot ?? "C:/Windows"].join(path.delimiter);
+  env.NODE_OPTIONS = "--preserve-symlinks --preserve-symlinks-main";
+  // npm 11 enables Node's disk compile cache on startup. In the fixed MXC
+  // profile that path can stall before any command output; no cache is needed
+  // for a bounded task. Do not broaden filesystem grants to accommodate it.
+  env.NODE_DISABLE_COMPILE_CACHE = "1";
+  env.NPM_CONFIG_CACHE = path.join(root, "profile/local/Packages/npm-cache");
+  env.NPM_CONFIG_UPDATE_NOTIFIER = "false";
+  env.NPM_CONFIG_FUND = "false";
   const limitsFile = path.join(root, "limits.jsonl"); TaskLimits.create(limitsFile);
   const limits = new TaskLimits(limitsFile), abort = new AbortController();
   let failure = "", ended = false, inFlight = false, requests = 0, threadId: string | null = null, turnId: string | null = null;

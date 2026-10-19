@@ -23,7 +23,7 @@ export class AppStore {
   private savedHashes = new Map<string, string>();
   private held = new Map<string, number>();
   private startupRecovery = new Set<string>();
-  constructor(private readonly directory: string) {
+  constructor(private readonly directory: string, private readonly appVersion = "development") {
     mkdirSync(directory, { recursive: true }); privatePath(directory, "workspace.json");
     mkdirSync(path.join(directory, "chats"), { recursive: true }); privatePath(directory, "chats/check.json");
     const file = path.join(directory, "workspace.json");
@@ -84,7 +84,7 @@ export class AppStore {
   }
   state(extra: Omit<AppState, keyof Stored | "version">): AppState {
     if (this.activeChatId) this.chat(this.activeChatId);
-    const result = structuredClone({ projects: this.projects, chats: this.chats.map(chat => chat.id === this.activeChatId ? chat : summary(chat)), activeChatId: this.activeChatId, version: "0.1.0-dev", ...extra });
+    const result = structuredClone({ projects: this.projects, chats: this.chats.map(chat => chat.id === this.activeChatId ? chat : summary(chat)), activeChatId: this.activeChatId, version: this.appVersion, ...extra });
     for (const chat of this.chats) if (chat.id !== this.activeChatId && this.loaded.has(chat.id) && this.known.has(chat.id) && !this.held.has(chat.id) &&
       !["running", "waiting", "stopping"].includes(chat.execution)) {
       Object.assign(chat, summary(chat)); this.loaded.delete(chat.id); this.savedHashes.delete(chat.id);
