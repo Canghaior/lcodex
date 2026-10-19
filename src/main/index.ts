@@ -106,7 +106,7 @@ async function main() {
         store.activeChatId = command.chatId; store.save();
       } else if (command.type === "set-mode") {
         const chat = store.chats.find(chat => chat.id === command.chatId);
-        if (!chat || chat.execution !== "idle") throw new Error("CHAT_MODE_LOCKED");
+        if (!chat || !["idle", "ended"].includes(chat.execution) || chat.changes.some(change => ["pending", "needs-reconcile"].includes(change.status))) throw new Error("CHAT_MODE_LOCKED");
         chat.mode = command.mode; store.save();
       } else if (command.type === "open-file") {
         const project = store.projects.find(project => project.id === command.projectId);

@@ -50,28 +50,38 @@ export class Tasks {
   private publish(save = true) { if (save) this.options.store.save(); this.options.notify(); }
   async start(chat: Chat, project: Project, prompt: string) {
     if (this.busy()) throw new Error("TASK_ALREADY_RUNNING");
-    if (chat.execution !== "idle") throw new Error("TASK_NEW_CHAT_REQUIRED");
+    const canStart = () => ["idle", "ended"].includes(chat.execution) && !chat.changes.some(change => change.status === "pending" || change.status === "needs-reconcile") && !this.reviews.has(chat.id);
+    if (!canStart()) throw new Error("TASK_REVIEW_OR_RECONCILE_REQUIRED");
     const key = await this.options.credentials.read();
     // The async credential lookup must not let two concurrent UI requests start.
-    if (this.busy() || chat.execution !== "idle") throw new Error("TASK_ALREADY_RUNNING");
+    if (this.busy() || !canStart()) throw new Error("TASK_ALREADY_RUNNING");
     assertNoKnownSecrets(prompt, [key]);
+    let resume: { threadId: string; turnId: string } | undefined;
+    if (chat.execution === "ended") {
+      const previous = JSON.parse(readFileSync(path.join(this.options.root, "tasks", chat.id, "outcome.json"), "utf8"));
+      if (previous.status !== "completed" || previous.cleanExit !== true || typeof previous.threadId !== "string" || typeof previous.turnId !== "string") throw new Error("ENGINE_HISTORY_MISMATCH");
+      resume = { threadId: previous.threadId, turnId: previous.turnId };
+    }
     this.ledger = new BudgetLedger(this.options.ledgerFile); this.budgetError = null;
     const abort = new AbortController();
     chat.messages.push({ id: randomUUID(), role: "user", text: prompt });
-    chat.title = prompt.trim().replace(/\s+/g, " ").slice(0, 28); chat.execution = "running"; chat.error = null;
+    if (!resume) chat.title = prompt.trim().replace(/\s+/g, " ").slice(0, 28);
+    chat.execution = "running"; chat.error = null; chat.verification = "unverified"; chat.changes = []; chat.reviewId = null;
+    delete chat.baselineExit; delete chat.verificationCommand;
     const entry = { chatId: chat.id, abort, done: Promise.resolve() };
     this.active = entry;
-    try { this.publish(); entry.done = this.run(chat, project, prompt, key, abort).finally(() => { this.active = undefined; this.publish(); }); }
+    try { this.publish(); entry.done = this.run(chat, project, prompt, key, abort, resume).finally(() => { this.active = undefined; this.publish(); }); }
     catch (error) { this.active = undefined; this.ledger.close(); this.ledger = undefined; throw error; }
     // Errors are rendered as state; never leave a rejected detached promise.
     void entry.done.catch(() => { chat.execution = "reconcile"; chat.error = "STORAGE_RECONCILE_REQUIRED"; this.options.notify(); });
   }
-  private async run(chat: Chat, project: Project, prompt: string, key: string, abort: AbortController) {
+  private async run(chat: Chat, project: Project, prompt: string, key: string, abort: AbortController, resume?: { threadId: string; turnId: string }) {
     let task: Workspace | undefined;
     let processKnownEnded = true;
     let finalExecution: Chat["execution"] = "failed";
     const plannedCommands = new Map<string, string>();
-    const root = path.join(this.options.root, "tasks", chat.id), state = path.join(this.options.root, "reviews");
+    const startToolIndex = chat.tools.length;
+    const chatRoot = path.join(this.options.root, "tasks", chat.id), root = path.join(chatRoot, "turns", randomUUID()), state = path.join(this.options.root, "reviews");
     const sanitize = (text: string) => text.replaceAll(key, "[已隐藏凭据]").slice(0, 65_536);
     try {
       mkdirSync(root, { recursive: true }); mkdirSync(state, { recursive: true });
@@ -82,12 +92,13 @@ export class Tasks {
         const manifest = captured.files.find((file: { relative: string }) => file.relative === "package.json");
         if (!manifest || JSON.parse(Buffer.from(manifest.base64, "base64").toString("utf8")).workspaces) throw new Error("PROJECT_SCOPE_UNSUPPORTED");
       }
-      writeFileSync(path.join(root, "task.json"), JSON.stringify({ chatId: chat.id, projectId: project.id, taskDirectory: task.taskDirectory, mode: chat.mode, state: "prepared" }), { flag: "wx" });
+      const taskRecord = JSON.stringify({ chatId: chat.id, projectId: project.id, taskDirectory: task.taskDirectory, runRoot: root, mode: chat.mode, state: "prepared" });
+      writeFileSync(path.join(root, "task.json"), taskRecord, { flag: "wx" }); writeFileSync(path.join(chatRoot, "task.json"), taskRecord);
       if (abort.signal.aborted) throw new Error("TASK_USER_STOP");
       processKnownEnded = false;
-      const result = await executeSession({ ...this.options, root, workspace: task.workspace, privateDir: path.join(task.taskDirectory, "private"), original: project.path,
+      const result = await executeSession({ ...this.options, root, historyHome: path.join(chatRoot, "home"), ...(resume ? { resume } : {}), workspace: task.workspace, privateDir: path.join(task.taskDirectory, "private"), original: project.path,
         rootMarker: task.rootMarker, readOnlyAssets: task.readOnlyAssets, readOnlyDirectories: task.readOnlyDirectories, mode: chat.mode, prompt, testCommand: project.testCommand ?? "", key, ledger: this.ledger!, signal: abort.signal,
-        onIdentity: (threadId, turnId) => writeFileSync(path.join(root, "identity.json"), JSON.stringify({ threadId, turnId }), { flag: "wx" }),
+        onIdentity: (threadId, turnId) => { const bytes = JSON.stringify({ threadId, turnId }); writeFileSync(path.join(root, "identity.json"), bytes, { flag: "wx" }); writeFileSync(path.join(chatRoot, "identity.json"), bytes); },
         onEvent: (method, params) => {
           if (!isObject(params)) return;
           if (method === "boundary/toolPlan" && typeof params.id === "string" && typeof params.command === "string") { plannedCommands.set(params.id, params.command); return; }
@@ -106,7 +117,7 @@ export class Tasks {
                 tool.exitCode = typeof item.exitCode === "number" ? item.exitCode : null;
                 tool.status = item.status === "completed" && (item.type === "fileChange" || item.exitCode === 0) ? "completed" : "failed";
                 if (project.testCommand && plannedCommands.get(item.id) === project.testCommand && Number.isInteger(item.exitCode)) {
-                  if (chat.tools.length === 1) chat.baselineExit = Number(item.exitCode);
+                  if (chat.tools.length === startToolIndex + 1) chat.baselineExit = Number(item.exitCode);
                   chat.verificationCommand = project.testCommand;
                   chat.verification = item.exitCode === 0 ? "passed" : "failed";
                 }
@@ -124,6 +135,7 @@ export class Tasks {
       });
       processKnownEnded = result.cleanExit;
       writeFileSync(path.join(root, "outcome.json"), JSON.stringify(result), { flag: "wx" });
+      writeFileSync(path.join(chatRoot, "outcome.json"), JSON.stringify(result));
       chat.error = result.code;
       finalExecution = result.status === "completed" ? "ended" : result.status === "reconcile" ? "reconcile" : result.status;
       if (result.status !== "completed") return;

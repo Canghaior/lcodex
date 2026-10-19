@@ -44,7 +44,7 @@ test("desktop Stop ends the process tree and keeps uncertain operations non-repl
     assert.equal(existsSync(path.join(original, "pid-parent.json")), false);
     const restart = await page.evaluate(chatId => window.lcodex.request({ type: "send", chatId, text: "retry" }), chatId);
     assert.equal(restart.ok, false);
-    assert.equal(restart.code, "TASK_NEW_CHAT_REQUIRED");
+    assert.equal(restart.code, "TASK_REVIEW_OR_RECONCILE_REQUIRED");
     clean = true;
   } finally { if (app) await app.close(); if (clean) run.cleanup(); else console.log("Retained generated stop run:", path.basename(run.root)); }
 });

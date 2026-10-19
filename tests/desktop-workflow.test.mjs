@@ -35,7 +35,7 @@ test("desktop real MXC tools: encrypted key, read-only mode, frozen review, appl
   let app, clean = false;
   try {
     app = await _electron.launch({ executablePath: electronPath, args: ["."], cwd: path.resolve("."), env });
-    const page = await app.firstWindow();
+    let page = await app.firstWindow();
     await page.getByRole("heading", { name: "从一个本地项目开始" }).waitFor();
     await app.evaluate((_electron, source) => { (0, eval)(source); }, readFileSync(path.resolve("tests/mock-model.mjs"), "utf8"));
     await app.evaluate(({ dialog }, directory) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [directory] }); }, project);
@@ -83,6 +83,28 @@ test("desktop real MXC tools: encrypted key, read-only mode, frozen review, appl
     assert.match(readFileSync(path.join(project, "catalog.mjs"), "utf8"), /item\.unitCents \* item\.quantity/);
     const independent = await import(pathToFileURL(path.join(project, "catalog.mjs")).href);
     assert.equal(independent.total([{ unitCents: 7, quantity: 3 }, { unitCents: 2, quantity: 0 }]), 21);
+    const firstManifest = JSON.parse(readFileSync(path.join(run.root, "desktop/tasks", chat.id, "task.json"), "utf8"));
+    const originalAfterApply = readFileSync(path.join(project, "catalog.mjs"), "utf8");
+    writeFileSync(path.join(project, "latest-note.txt"), "USER_LATEST_SNAPSHOT\n");
+    await app.close();
+    app = await _electron.launch({ executablePath: electronPath, args: ["."], cwd: path.resolve("."), env });
+    page = await app.firstWindow();
+    await page.getByRole("textbox", { name: "输入任务" }).waitFor();
+    await app.evaluate((_electron, source) => { (0, eval)(source); }, readFileSync(path.resolve("tests/mock-model.mjs"), "utf8"));
+    await page.getByRole("combobox", { name: "任务方式" }).selectOption("read");
+    await page.getByRole("textbox", { name: "输入任务" }).fill("CONTINUE_AFTER_RESTART：回顾上轮修复，并读取最新备注；只读，不再修改。");
+    await page.getByRole("button", { name: "发送任务", exact: true }).click();
+    await waitTask(page);
+    const continued = await page.evaluate(() => window.lcodex.request({ type: "snapshot" }));
+    const continuedChat = continued.state.chats.find(item => item.id === chat.id);
+    assert.equal(continuedChat.execution, "ended", continuedChat.error ?? "continuation failed");
+    assert.equal(continuedChat.messages.filter(message => message.role === "user").length, 2);
+    assert.match(continuedChat.tools.at(-1).output, /USER_LATEST_SNAPSHOT/);
+    assert.match(continuedChat.tools.at(-1).output, /READ_ONLY_DENIED/);
+    assert.equal(continuedChat.changes.length, 0);
+    assert.equal(readFileSync(path.join(project, "catalog.mjs"), "utf8"), originalAfterApply);
+    const nextManifest = JSON.parse(readFileSync(path.join(run.root, "desktop/tasks", chat.id, "task.json"), "utf8"));
+    assert.notEqual(nextManifest.taskDirectory, firstManifest.taskDirectory, "Every explicit new turn receives a fresh original-project snapshot");
     await app.evaluate(({ dialog }, directory) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [directory] }); }, conflictProject);
     await page.getByRole("button", { name: "添加项目", exact: true }).click();
     await page.getByRole("heading", { name: "一起构建 conflict project" }).waitFor();
@@ -94,6 +116,7 @@ test("desktop real MXC tools: encrypted key, read-only mode, frozen review, appl
     assert.equal(chat.execution, "ended", chat.error ?? "unexpected");
     assert.equal(chat.verification, "unverified", "Unconfigured command must not become a passed validation status");
     writeFileSync(path.join(conflictProject, "catalog.mjs"), source + "// concurrent user edit\n");
+    await page.getByRole("button", { name: /^改动/ }).click();
     await page.getByRole("button", { name: "应用全部", exact: true }).click();
     await page.getByText("冲突 · 未覆盖", { exact: true }).waitFor();
     assert.equal(readFileSync(path.join(conflictProject, "catalog.mjs"), "utf8"), source + "// concurrent user edit\n");

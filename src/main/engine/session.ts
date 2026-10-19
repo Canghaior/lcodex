@@ -20,7 +20,7 @@ import type { TaskMode } from "../../shared/contracts.js";
 export type EngineOptions = { engine: string; shell: string; node: string; root: string; workspace: string; privateDir: string; original: string; rootMarker: string;
   readOnlyAssets: string[]; readOnlyDirectories: string[]; mode: TaskMode; prompt: string; testCommand: string; key: string; ledger: BudgetLedger;
   signal: AbortSignal; onEvent: (method: string, params: unknown) => void; onIdentity: (threadId: string, turnId: string) => void;
-  fetchImpl?: typeof fetch };
+  fetchImpl?: typeof fetch; historyHome?: string; resume?: { threadId: string; turnId: string } };
 export type EngineResult = { status: "completed" | "stopped" | "failed" | "reconcile"; code: string | null; threadId: string | null; turnId: string | null; cleanExit: boolean; requests: number };
 export const safeCode = (error: unknown, fallback: string) => error instanceof Error && /^[A-Z][A-Z0-9_-]{2,80}$/.test(error.message) ? error.message : fallback;
 const quote = (value: string) => "'" + value.replaceAll("'", "''") + "'";
@@ -31,16 +31,19 @@ const wait = async <T>(promise: Promise<T>, ms: number): Promise<T | undefined> 
 // still owns the conversation/tool loop; this adapter only enforces its boundary.
 export async function executeSession(options: EngineOptions): Promise<EngineResult> {
   const { engine, shell, node, root, workspace, original, key, ledger, mode } = options;
+  const historyHome = options.historyHome ?? path.join(root, "home");
   const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
   requireValue(today === PRICE_REVIEW_DATE, "PRICE_REVIEW_REQUIRED");
   requireValue(!options.signal.aborted, "TASK_USER_STOP");
   assertNoKnownSecrets(options.prompt, [key]);
   for (const relative of ["home", "profile/roaming", "profile/local/Packages", "temp"]) mkdirSync(path.join(root, relative), { recursive: true });
+  mkdirSync(historyHome, { recursive: true });
   const token = randomUUID(), trial = `desktop-${randomUUID()}`;
-  const env = { ...isolatedEnvironment(root, process.env), LCODEX_WORKFLOW_TOKEN: token };
+  const env = { ...isolatedEnvironment(root, process.env), CODEX_HOME: historyHome, LCODEX_WORKFLOW_TOKEN: token };
   const limitsFile = path.join(root, "limits.jsonl"); TaskLimits.create(limitsFile);
   const limits = new TaskLimits(limitsFile), abort = new AbortController();
   let failure = "", ended = false, inFlight = false, requests = 0, threadId: string | null = null, turnId: string | null = null;
+  let dispatchAllowed = false;
   let rpc: JsonLineRpc | undefined, child: ChildProcessWithoutNullStreams | undefined, closed: Promise<number | null> | undefined;
   let resolveTerminal!: (value: unknown) => void;
   const terminal = new Promise<unknown>(resolve => { resolveTerminal = resolve; });
@@ -56,7 +59,7 @@ export async function executeSession(options: EngineOptions): Promise<EngineResu
       let owned = false;
       try {
         requireValue(req.headers.authorization === `Bearer ${token}` && req.method === "POST" && req.url === "/v1/responses", "GATEWAY_AUTH_REFUSED");
-        requireValue(!inFlight && !failure && !abort.signal.aborted, "GATEWAY_STOPPED"); owned = true; inFlight = true;
+        requireValue(dispatchAllowed && !inFlight && !failure && !abort.signal.aborted, "GATEWAY_STOPPED"); owned = true; inFlight = true;
         const chunks: Buffer[] = []; let size = 0;
         for await (const chunk of req) { const bytes = Buffer.from(chunk); size += bytes.length; requireValue(size <= 131_072, "GATEWAY_INPUT_LIMIT"); chunks.push(bytes); }
         const body = new TextDecoder("utf8", { fatal: true }).decode(Buffer.concat(chunks));
@@ -96,19 +99,19 @@ export async function executeSession(options: EngineOptions): Promise<EngineResu
     const catalog = validationCatalog(true, mode === "read", mode === "write", true);
     catalog.models[0]!.display_name = "DeepSeek Flash";
     catalog.models[0]!.base_instructions = `You are a coding assistant in an isolated project copy. ${mode === "read" ? "This task is read-only. Analyse and explain; do not modify files or install anything." : "Read relevant code, reproduce issues, implement the requested change, and verify."} Preserve unrelated files. Be concise. Report actual results and limitations, never claim tests you did not run. Reply in the user's language.`;
-    writeFileSync(path.join(root, "home/models.json"), JSON.stringify(catalog), { flag: "wx" });
-    writeFileSync(path.join(root, "home/config.toml"), [
-      'model="deepseek-flash"', 'model_provider="workflow"', 'model_reasoning_effort="none"', `model_catalog_json=${quote(path.join(root, "home/models.json"))}`,
+    writeFileSync(path.join(historyHome, "models.json"), JSON.stringify(catalog));
+    writeFileSync(path.join(historyHome, "config.toml"), [
+      'model="deepseek-flash"', 'model_provider="workflow"', 'model_reasoning_effort="none"', `model_catalog_json=${quote(path.join(historyHome, "models.json"))}`,
       `project_root_markers=[${quote(options.rootMarker)}]`, 'approval_policy="never"', 'default_permissions="scoped"', 'web_search="disabled"', 'allow_login_shell=false',
       '[windows]', 'sandbox="mxc"', '[permissions.scoped.filesystem]', '":minimal"="read"', `${quote(workspace)}="${mode === "read" ? "read" : "write"}"`,
-      `${quote(original)}="deny"`, `${quote(options.privateDir)}="deny"`, `${quote(path.join(root, "home"))}="deny"`, `${quote(path.join(workspace, options.rootMarker))}="read"`,
+      `${quote(original)}="deny"`, `${quote(options.privateDir)}="deny"`, `${quote(historyHome)}="deny"`, `${quote(path.join(workspace, options.rootMarker))}="read"`,
       ...options.readOnlyAssets.map(relative => `${quote(path.join(workspace, relative))}="read"`), ...options.readOnlyDirectories.map(relative => `${quote(path.join(workspace, relative))}="read"`),
       ...[".git", ".env", ".codex", ".agents"].map(relative => `${quote(path.join(workspace, relative))}="deny"`),
       `${quote(path.dirname(node))}="read"`, `${quote(path.dirname(shell))}="read"`, `${quote(path.dirname(process.env.COMSPEC ?? "C:/Windows/System32/cmd.exe"))}="read"`, `${quote(path.join(root, "profile/local/Packages"))}="write"`,
       '[permissions.scoped.network]', 'enabled=false', '[features]', 'multi_agent=false', 'apps=false', 'plugins=false', 'hooks=false', 'goals=false', 'shell_snapshot=false', 'browser_use=false', 'computer_use=false', 'image_generation=false',
       '[shell_environment_policy]', 'inherit="all"', 'ignore_default_excludes=false', '[shell_environment_policy.filters]', 'LCODEX_WORKFLOW_TOKEN="exclude"', 'DEEPSEEK_API_KEY="exclude"',
       '[analytics]', 'enabled=false', '[model_providers.workflow]', 'name="lcodex bounded DeepSeek"', `base_url="http://127.0.0.1:${address.port}/v1"`, 'wire_api="responses"', 'requires_openai_auth=false', 'env_key="LCODEX_WORKFLOW_TOKEN"', 'request_max_retries=0', 'stream_max_retries=0', '',
-    ].join("\n"), { flag: "wx" });
+    ].join("\n"));
     requireValue(!abort.signal.aborted, "TASK_USER_STOP");
     child = spawn(engine, ["app-server", "--listen", "stdio://", "--strict-config"], { cwd: workspace, env, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
     child.stderr.resume(); closed = new Promise(resolve => child!.once("close", code => { if (!ended) resolveTerminal(null); resolve(code); }));
@@ -116,16 +119,27 @@ export async function executeSession(options: EngineOptions): Promise<EngineResu
     rpc = new JsonLineRpc(child.stdout, child.stdin, 15_000, 1_048_576, (method, params) => {
       // Ignore events from other conversations; do not accept a fabricated UI state.
       if (isObject(params) && typeof params.threadId === "string" && threadId && params.threadId !== threadId) { fail("ENGINE_EVENT_MISMATCH"); return; }
+      if (!dispatchAllowed && ["turn/started", "item/started", "item/commandExecution/outputDelta"].includes(method)) { fail("ENGINE_HISTORY_REPLAY_REFUSED"); return; }
       gate.observe(method, params); if (!abort.signal.aborted) options.onEvent(method, params);
       if (method === "turn/completed") resolveTerminal(params);
     }, true);
     await rpc.request("initialize", { clientInfo: { name: "lcodex_desktop", version: "0.1.0" }, capabilities: { experimentalApi: true } }); rpc.notify("initialized", {});
-    const thread = await rpc.request("thread/start", { cwd: workspace, ephemeral: false, approvalPolicy: "never", approvalsReviewer: "user",
-      developerInstructions: `Work only in the isolated project copy. Mode=${mode}. For exec_command always supply shell=${JSON.stringify(shell)}, login=false, workdir=${JSON.stringify(workspace)}, yield_time_ms=10000, max_output_tokens<=4096. Run one tool at a time. Command limit 45 seconds, task limit 8 model requests. Node executable: ${node}; use --preserve-symlinks --preserve-symlinks-main before its arguments. No network, dependency installation or escalation. ${options.testCommand ? `The user-selected verification command is exactly: ${options.testCommand}. Run it before and after changes.` : "No verification command was configured. Inspect existing project instructions and report which checks you actually ran; missing tests must remain unverified."} Do not modify protected resources, dependencies, root marker, credentials or unrelated user work. Final response: changes, files, actual checks/results, unfinished work and next step. Changes are pending review, never claim the original project was modified.` });
+    const threadParameters = { cwd: workspace, approvalPolicy: "never", approvalsReviewer: "user",
+      developerInstructions: `Work only in the current isolated project copy. It is a fresh snapshot of the original project; previous tool paths and permissions are historical and no longer valid. Mode=${mode}. For exec_command always supply shell=${JSON.stringify(shell)}, login=false, workdir=${JSON.stringify(workspace)}, yield_time_ms=10000, max_output_tokens<=4096. Run one tool at a time. Command limit 45 seconds, task limit 8 model requests. Node executable: ${node}; use --preserve-symlinks --preserve-symlinks-main before its arguments. No network, dependency installation or escalation. ${options.testCommand ? `The user-selected verification command is exactly: ${options.testCommand}. Run it before and after changes.` : "No verification command was configured. Inspect existing project instructions and report which checks you actually ran; missing tests must remain unverified."} Do not modify protected resources, dependencies, root marker, credentials or unrelated user work. Final response: changes, files, actual checks/results, unfinished work and next step. Changes are pending review, never claim the original project was modified.` };
+    const thread = options.resume
+      ? await rpc.request("thread/resume", { ...threadParameters, threadId: options.resume.threadId, model: "deepseek-flash", modelProvider: "workflow", config: { default_permissions: "scoped" } })
+      : await rpc.request("thread/start", { ...threadParameters, ephemeral: false });
     if (!isObject(thread) || !isObject(thread.thread) || typeof thread.thread.id !== "string") throw new Error("ENGINE_THREAD_INVALID");
     threadId = thread.thread.id;
+    if (options.resume) {
+      requireValue(threadId === options.resume.threadId, "ENGINE_HISTORY_MISMATCH");
+      const previous = await rpc.request("thread/read", { threadId, includeTurns: true });
+      const last = isObject(previous) && isObject(previous.thread) && Array.isArray(previous.thread.turns) ? previous.thread.turns.at(-1) : undefined;
+      requireValue(isObject(last) && last.id === options.resume.turnId && last.status === "completed", "ENGINE_HISTORY_MISMATCH");
+    }
     requireValue(!abort.signal.aborted, "TASK_USER_STOP");
-    const started = await rpc.request("turn/start", { threadId, input: [{ type: "text", text: options.prompt, text_elements: [] }] });
+    dispatchAllowed = true;
+    const started = await rpc.request("turn/start", { threadId, cwd: workspace, input: [{ type: "text", text: options.prompt, text_elements: [] }] });
     if (!isObject(started) || !isObject(started.turn) || typeof started.turn.id !== "string") throw new Error("ENGINE_TURN_INVALID");
     turnId = started.turn.id; options.onIdentity(threadId, turnId);
     const done = await terminal;
