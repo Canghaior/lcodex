@@ -12,12 +12,12 @@ export const contentHash = (bytes: Buffer | string) => createHash("sha256").upda
 // Coordinator-only P1 adapter. The script and its native source are trusted code,
 // not available for model modification. Every process is bounded and reaped.
 export class WindowsFileGuard {
-  constructor(private readonly shell: string, private readonly environmentRoot: string) {
+  constructor(private readonly shell: string, private readonly environmentRoot: string, private readonly scriptDirectory = path.resolve("validation")) {
     if (process.platform !== "win32" || !path.isAbsolute(shell) ||
       contentHash(readFileSync(shell)) !== "362a356ce7f0940ec74f73a8fc2c990a2cc24a38a11c90bbd8eca947110ad139") throw new Error("GUARD_RUNTIME_MISMATCH");
   }
   private async invoke(request: object, onLocked?: () => void, dependencyCapture = false): Promise<unknown> {
-    const child = spawn(this.shell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", path.resolve("validation/windows-file-guard.ps1")],
+    const child = spawn(this.shell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", path.join(this.scriptDirectory, "windows-file-guard.ps1")],
       { env: isolatedEnvironment(this.environmentRoot, process.env), windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
     let output = "", size = 0, result: unknown, failure = "", locked = false;
     child.stdout.setEncoding("utf8"); child.stderr.resume();

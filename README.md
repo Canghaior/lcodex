@@ -2,7 +2,7 @@
 
 目标是开发一款接入 DeepSeek 的本地桌面编程助手：选择项目后，通过自然语言完成代码阅读、修改和测试，并能查看执行过程与文件差异。
 
-P1 已在用户确认的小型 JS/TS 项目范围内通过：真实 DeepSeek 任务、Windows 隔离修改与保护、停止/重启、资源依赖验证及 83 项回归已有证据。现在进入 P2 桌面开发；尚无可交付的桌面应用或安装包。
+P1 已在用户确认的小型 JS/TS 项目范围内通过。P2 已有可以启动的 Electron 窗口、项目/聊天导航与文件预览；真实任务正在接入，还不能把这个开发窗口当作可用编程助手或安装版。证据见 [桌面检查](docs/validation/P2_DESKTOP.md)。
 
 - [开发方案](docs/DEVELOPMENT_PLAN.md)：产品范围、技术路线、阶段任务和验收标准。
 - [编程执行计划](docs/IMPLEMENTATION_PLAN.md)：P0 至 P4 的开发工作包、执行顺序、检查条件和 GitHub 同步规则。
@@ -26,7 +26,7 @@ P1 已在用户确认的小型 JS/TS 项目范围内通过：真实 DeepSeek 任
 
 当前方案为 0.8，优先服务已有本地项目的个人开发者，围绕代码理解、bug 修复和小功能开发。用户已明确 Codex 风格的界面方向，以及 TypeScript、React、CSS、Electron 技术栈和应用分层，模型只接 DeepSeek。首个可用版本采用已验证的原生 Windows、固定 Codex 0.162.0 与 DeepSeek 官方 API；范围外能力继续扩展。
 
-初始方案已保存在本地 Git 的 `main` 分支根提交中；用户已授权同步到 [GitHub 仓库](https://github.com/Canghaior/lcodex)。每个完成并检查的小工作包或阶段提交并推送，不设定时任务；实际同步结果见执行记录。当前只有验证程序，桌面应用工程尚未创建。
+初始方案已保存在本地 Git 的 `main` 分支根提交中；用户已授权同步到 [GitHub 仓库](https://github.com/Canghaior/lcodex)。每个完成并检查的小工作包或阶段提交并推送，不设定时任务；实际同步结果见执行记录。
 
 下一步是 P2 桌面完整任务流程。D01 已确认隔离副本修改、审阅后应用；D02 已确认首版后置一键撤回，保留基线、差异与冲突保护。已验证的安全边界不能在接界面时省略。
 
@@ -39,5 +39,16 @@ npm ci --ignore-scripts --no-audit --no-fund
 npm run check
 npm test
 ```
+
+桌面开发窗口与检查（本机已验证的 PowerShell / 引擎路径仍是开发依赖，尚非独立安装包）：
+
+```powershell
+$env:electron_config_cache = 'D:\make-codex\.local\electron-cache'
+node node_modules/electron/install.js
+npm start
+npm run test:desktop
+```
+
+桌面状态保存在 `.local/desktop`，自动化测试只使用 `.local/runs` 下的合成项目。不要清理未核对的任务记录；密钥、日志和运行数据不进入 Git。
 
 本地引擎握手另运行 `npm run validate:offline -- "<codex.exe 绝对路径>"`，需要 P1 环境文档中登记的引擎版本与哈希。此命令不调用模型、不开启编程任务、不验证实际沙箱权限。原始生成文件在 `.local/`，不提交到 GitHub。

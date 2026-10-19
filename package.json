@@ -3,10 +3,16 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "description": "P1 validation for a local DeepSeek coding assistant",
-  "engines": { "node": ">=24.8.0 <25" },
+  "description": "A local DeepSeek coding desktop assistant",
+  "main": "dist/src/main/index.js",
+  "engines": {
+    "node": ">=24.8.0 <25"
+  },
   "scripts": {
-    "check": "tsc --noEmit",
+    "check": "tsc --noEmit && tsc -p tsconfig.desktop.json --noEmit && tsc -p tsconfig.renderer.json",
+    "build": "tsc -p tsconfig.desktop.json && tsc -p tsconfig.renderer.json && vite build",
+    "start": "npm run build && electron .",
+    "test:desktop": "npm run build:validation && npm run build && node --test tests/desktop.test.mjs",
     "build:validation": "tsc",
     "test": "npm run build:validation && node --test dist/validation/*.test.js",
     "validate:offline": "npm run build:validation && node dist/validation/offline-probe.js",
@@ -14,6 +20,18 @@
   },
   "devDependencies": {
     "@types/node": "24.8.1",
-    "typescript": "5.9.3"
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "electron": "44.9.0",
+    "playwright-core": "1.64.1",
+    "typescript": "5.9.3",
+    "vite": "8.3.4"
+  },
+  "dependencies": {
+    "lucide-react": "1.59.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "react-markdown": "10.1.0",
+    "remark-gfm": "4.0.1"
   }
 }
