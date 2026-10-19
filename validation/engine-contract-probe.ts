@@ -17,6 +17,8 @@ import { checkRestart } from "./resume-check.js";
 import { prepareEngineModelRequest } from "./engine-model-request.js";
 import { assertNoKnownSecrets } from "./outbound-data.js";
 import { sensitivePaths } from "./sensitive-paths.js";
+import { prepareReviewWorkspace } from "./review-workspace.js";
+import { WindowsFileGuard } from "./windows-file-guard.js";
 
 const expectedSha = "03e5cf467f4ef2c06360b00cdc9aef64bb79b2028e25e3e122dd0bd2152ace22";
 const candidateSha = "dce685d569526ef4712fa82d20ff20e1309baad5fcd34215e1126698f611242f";
@@ -44,7 +46,7 @@ export function syntheticTextStream(text: string, fault?: string): string {
 }
 
 async function main() {
-  check(process.argv.slice(3).every((arg) => ["--live", "--resume-check", "--read-task", "--edit-task", "--verify-edit", "--compact-check", "--diagnose-exit"].includes(arg) ||
+  check(process.argv.slice(3).every((arg) => ["--live", "--resume-check", "--read-task", "--edit-task", "--verify-edit", "--isolated-review", "--compact-check", "--diagnose-exit"].includes(arg) ||
     ["--price-reviewed=", "--tool-case=", "--fault-case=", "--shell="].some((prefix) => arg.startsWith(prefix))), "PROBE_UNKNOWN_OPTION");
   const binary = process.argv[2];
   check(binary && path.isAbsolute(binary), "PROBE_BINARY_REQUIRED");
@@ -59,6 +61,8 @@ async function main() {
   const readTask = process.argv.includes("--read-task");
   const editTask = process.argv.includes("--edit-task");
   const verifyEdit = process.argv.includes("--verify-edit");
+  const isolatedReview = process.argv.includes("--isolated-review");
+  check(!isolatedReview || verifyEdit && !restartCheck, "PROBE_ISOLATION_MODE_REFUSED");
   check(!verifyEdit || editTask, "PROBE_VERIFY_REQUIRES_EDIT");
   check(!editTask || (!readTask && engineVersion === "0.162.0"), "PROBE_EDIT_TASK_REFUSED");
   check(!readTask || engineVersion === "0.162.0", "PROBE_READ_TASK_REFUSED");
@@ -90,7 +94,8 @@ async function main() {
   const run = createRunDirectory("engine 中文契约");
   for (const dir of ["home", "profile/roaming", "profile/local", "temp", "workspace", "outside"]) mkdirSync(path.join(run.root, dir), { recursive: true });
   if (scopedTools) mkdirSync(path.join(run.root, "profile/local/Packages"));
-  const cwd = path.join(run.root, "workspace");
+  let cwd = path.join(run.root, "workspace");
+  const originalProject = cwd;
   const marker = path.join(cwd, "write-marker.txt");
   const pidMarker = path.join(cwd, "process-started.txt");
   const outside = path.join(run.root, "outside/sentinel.txt");
@@ -101,6 +106,15 @@ async function main() {
   const contextMarker = `context-${randomUUID()}`;
   if (readTask) writeFileSync(path.join(cwd, "invoice.mjs"), `// ${readMarker}\nexport function invoiceTotal(items) {\n  return items.reduce((sum, item) => sum + item.priceCents, 0);\n}\n`);
   if (editTask) writeFileSync(path.join(cwd, "invoice.mjs"), INVOICE_BASELINE);
+  const reviewState = path.join(run.root, "coordinator-state");
+  let reviewTask: Awaited<ReturnType<typeof prepareReviewWorkspace>> | undefined;
+  let isolatedResult: unknown = "not-tested";
+  const originalSnapshot = snapshot(originalProject);
+  if (isolatedReview) {
+    mkdirSync(reviewState);
+    reviewTask = await prepareReviewWorkspace(originalProject, reviewState, new WindowsFileGuard(shellPath!, run.root));
+    cwd = reviewTask.workspace;
+  }
   const baselineChecks = editTask ? evaluateInvoiceSource(INVOICE_BASELINE) : null;
   const quote = (value: string) => `'${value.replaceAll("'", "''")}'`;
   const evaluatorPath = path.join(run.root, "outside/independent-evaluator.mjs");
@@ -109,7 +123,20 @@ async function main() {
     check(createHash("sha256").update(readFileSync(nodePath)).digest("hex") === "3a9ac860c566b7aebf144be914f95e3ec36dc88040aa7acb5d9d1e6e0c7afd5e", "PROBE_NODE_HASH_MISMATCH");
     writeFileSync(evaluatorPath, evaluatorSource);
   }
-  const verificationCommand = `& ${quote(nodePath)} --preserve-symlinks --preserve-symlinks-main ${quote(evaluatorPath)} ${quote(path.join(cwd, "invoice.mjs"))}; exit $LASTEXITCODE`;
+  const isolationTargets = reviewTask ? {
+    originalRead: path.join(originalProject, "invoice.mjs"),
+    privateRead: path.join(reviewTask.taskDirectory, "private/baseline.json"),
+    originalWrite: path.join(originalProject, "inside.txt"),
+    privateWrite: path.join(reviewTask.taskDirectory, "private/baseline.json"),
+    rootMarkerWrite: path.join(cwd, reviewTask.rootMarker),
+  } : {};
+  const boundaryCommands = isolatedReview && !live ? ["$isolation=@{kind='isolation-boundary'}",
+    ...Object.entries(isolationTargets).map(([key, file]) => key.endsWith("Read")
+      ? `try {$isolation.${key}=((Get-Content -LiteralPath ${quote(file)} -Raw -ErrorAction Stop).Length -gt 0)} catch {$isolation.${key}=$false}`
+      : `try {Set-Content -LiteralPath ${quote(file)} -Value 'SYNTHETIC_TAMPER' -NoNewline -ErrorAction Stop; $isolation.${key}=$true} catch {$isolation.${key}=$false}`),
+    `$isolation.copyReadable=((Get-Content -LiteralPath ${quote(path.join(cwd, "invoice.mjs"))} -Raw).Length -gt 0)`,
+    "$isolation | ConvertTo-Json -Compress"].join("; ") + "; " : "";
+  const verificationCommand = boundaryCommands + `& ${quote(nodePath)} --preserve-symlinks --preserve-symlinks-main ${quote(evaluatorPath)} ${quote(path.join(cwd, "invoice.mjs"))}; exit $LASTEXITCODE`;
   let fixedCommand = toolCase === "interrupt"
     ? `Set-Content -LiteralPath ${quote(pidMarker)} -Value $PID -NoNewline -ErrorAction Stop; Start-Sleep -Seconds 8; Set-Content -LiteralPath ${quote(marker)} -Value FINISHED -NoNewline`
     : toolCase === "concurrent-edit"
@@ -124,7 +151,7 @@ async function main() {
   ].join("; ");
   const localToken = randomUUID();
   const env = { ...isolatedEnvironment(run.root, process.env), GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "NUL", LCODEX_LOCAL_PROBE_TOKEN: localToken };
-  check(spawnSync("git", ["init", "--quiet", cwd], { env, windowsHide: true, timeout: 10_000 }).status === 0, "PROBE_GIT_INIT_FAILED");
+  if (!isolatedReview) check(spawnSync("git", ["init", "--quiet", cwd], { env, windowsHide: true, timeout: 10_000 }).status === 0, "PROBE_GIT_INIT_FAILED");
   let inventoriedSensitivePaths: string[] = [];
   if (sensitiveCase) {
     mkdirSync(path.join(cwd, "nested")); mkdirSync(path.join(cwd, ".ssh"));
@@ -158,6 +185,7 @@ async function main() {
   let patchResultMatched = false;
   let verificationCallId: string | undefined;
   let verificationResultMatched = false;
+  let isolationBoundary: unknown = "not-tested";
   const upstreamAbort = new AbortController();
   let activeUpstream: ReturnType<typeof sendBoundedDeepSeek> | undefined;
   let networkHits = 0;
@@ -290,6 +318,11 @@ async function main() {
         const names = ["empty", "single", "quantity", "mixed", "discount", "rounding"];
         verificationResultMatched = isObject(parsedChecks) && Array.isArray(parsedChecks.checks) && parsedChecks.checks.length === 6 && parsedChecks.checks.every((item, index) => isObject(item) && item.name === names[index] && item.passed === true);
         check(verificationResultMatched, "PROBE_VERIFY_CHECKS_FAILED");
+        if (isolatedReview && !live) {
+          const boundaryLine = output.split(/\r?\n/).find(line => line.startsWith("{") && line.includes('"isolation-boundary"'));
+          isolationBoundary = boundaryLine ? JSON.parse(boundaryLine) : null;
+          check(isObject(isolationBoundary) && isolationBoundary.copyReadable === true && Object.keys(isolationTargets).every(field => isObject(isolationBoundary) && isolationBoundary[field] === false), "PROBE_ISOLATION_BOUNDARY_FAILED");
+        }
       }
       if (live && ledger) {
         check(!body.includes("本项目开发接入 DeepSeek"), "PROBE_ANCESTOR_INSTRUCTIONS");
@@ -344,11 +377,13 @@ async function main() {
   writeFileSync(path.join(run.root, "home/config.toml"), [
     'model = "deepseek-flash"', 'model_provider = "local_contract"', 'model_reasoning_effort = "none"',
     `model_catalog_json = '${catalogPath}'`,
+    ...(isolatedReview ? [`project_root_markers = [${quote(reviewTask!.rootMarker)}]`] : []),
     `approval_policy = "${toolCase === "deny" ? "on-request" : "never"}"`, ...(scopedTools ? ['default_permissions = "scoped"'] : ['sandbox_mode = "read-only"']),
     'web_search = "disabled"', 'allow_login_shell = false',
     ...(scopedTools ? ['[windows]', 'sandbox = "mxc"', '[permissions.scoped.filesystem]', '":minimal" = "read"',
       `${quote(cwd)} = "${editTask || toolCase && ["write", "deny", "interrupt", "concurrent-edit", "patch-write", "patch-sensitive", "patch-outside"].includes(toolCase) ? "write" : "read"}"`, `${quote(path.join(cwd, ".env"))} = "deny"`,
       `${quote(path.join(cwd, ".git"))} = "read"`,
+      ...(isolatedReview ? [`${quote(originalProject)} = "deny"`, `${quote(path.join(reviewTask!.taskDirectory, "private"))} = "deny"`, `${quote(path.join(cwd, reviewTask!.rootMarker))} = "read"`] : []),
       ...inventoriedSensitivePaths.filter((file) => file !== path.join(cwd, ".env")).map((file) => `${quote(file)} = "deny"`),
       `${quote(path.dirname(process.env.COMSPEC ?? "C:/Windows/System32/cmd.exe"))} = "read"`,
       `${quote(path.dirname(shellPath!))} = "read"`,
@@ -403,7 +438,7 @@ async function main() {
   let interruptedProcessEnded: unknown = "not-tested";
   let terminalCounts: unknown = null;
   try {
-    await rpc.request("initialize", { clientInfo: { name: "lcodex_contract", version: "0.0.1" }, capabilities: { experimentalApi: toolCase === "interrupt" } });
+    await rpc.request("initialize", { clientInfo: { name: "lcodex_contract", version: "0.0.1" }, capabilities: { experimentalApi: toolCase === "interrupt" || isolatedReview } });
     rpc.notify("initialized", {});
     const thread = await rpc.request("thread/start", { cwd, ephemeral: false, ...(!scopedTools ? { sandbox: "read-only" } : {}), approvalPolicy: toolCase === "deny" ? "on-request" : "never", approvalsReviewer: "user",
       developerInstructions: verifyEdit ? "SYNTHETIC_DEVELOPER_MARKER. Update invoice.mjs with one apply_patch, then run exactly the user's verification command once using exec_command. Summarize observed results. No other commands or files." : editTask ? "SYNTHETIC_DEVELOPER_MARKER. Only update invoice.mjs with one apply_patch call. No other tools or files. After the tool result, give a concise summary." : (readTask ? "SYNTHETIC_DEVELOPER_MARKER. Read-only code analysis. Execute only the exact read command given by the user, once, then answer from that result." : "SYNTHETIC_DEVELOPER_MARKER. This probe requires only a plain text answer; do not use tools.") });
@@ -500,6 +535,11 @@ async function main() {
       const afterFiles = snapshot(cwd);
       check(Object.keys(afterFiles).length === Object.keys(beforeFiles).length && Object.entries(beforeFiles).every(([file, hash]) => file === "invoice.mjs" || afterFiles[file] === hash), "PROBE_UNRELATED_FILES_CHANGED");
       if (verifyEdit) check(verificationResultMatched && commandExitCodes.length === 1 && commandExitCodes[0] === 0 && readFileSync(evaluatorPath, "utf8") === evaluatorSource, "PROBE_VERIFY_COMMAND_FAILED");
+      if (isolatedReview) {
+        check(JSON.stringify(snapshot(originalProject)) === JSON.stringify(originalSnapshot), "PROBE_ORIGINAL_CHANGED_BEFORE_REVIEW");
+        const background = await rpc.request("thread/backgroundTerminals/list", { threadId: thread.thread.id });
+        check(isObject(background) && Array.isArray(background.data) && background.data.length === 0, "PROBE_REVIEW_ACTIVE_TERMINALS");
+      }
     }
     if (faultCase) check(JSON.stringify(snapshot(cwd)) === JSON.stringify(beforeFiles) && !notifications.some((method) => method.startsWith("item/commandExecution/") || method === "turn/diff/updated"), "PROBE_FAULT_SIDE_EFFECT");
     if (faultCase === "oversized") check(gatewayFailure === "API_INPUT_SIZE_LIMIT" && oversizedHttpCalls === 0 && oversizedLedgerRequests === 0, "PROBE_OVERSIZED_HTTP_OCCURRED");
@@ -562,6 +602,19 @@ async function main() {
   const budget = ledger?.summary();
   ledger?.close();
   if (exitCode !== 0) result = { taskResult: result, status: "failed", errorCode: "PROBE_UNCLEAN_EXIT" };
+  if (reviewTask && exitCode === 0 && result.status === "passed") {
+    try {
+      check(JSON.stringify(snapshot(originalProject)) === JSON.stringify(originalSnapshot), "PROBE_ORIGINAL_CHANGED_BEFORE_REVIEW");
+      const review = await reviewTask.seal();
+      check(review.changes.length === 1 && review.changes[0]?.relative === "invoice.mjs", "PROBE_REVIEW_UNEXPECTED_CHANGE");
+      const applied = await reviewTask.apply(review.id, ["invoice.mjs"]);
+      check(applied.length === 1 && applied[0]?.status === "applied" && readFileSync(path.join(originalProject, "invoice.mjs"), "utf8") === expectedCandidate, "PROBE_REVIEW_APPLY_FAILED");
+      isolatedResult = { originalPreservedUntilReview: true, frozenChanges: 1, applied: true,
+        unchangedOtherFiles: Object.entries(originalSnapshot).every(([file, hash]) => file === "invoice.mjs" || snapshot(originalProject)[file] === hash),
+        verificationLocation: review.verificationLocation, syntheticReviewApproval: true };
+      reviewTask.close();
+    } catch { result = { status: "failed", errorCode: "PROBE_ISOLATED_REVIEW_FAILED" }; process.exitCode = 1; }
+  }
   const shutdownDiagnostics = diagnoseExit ? {
     processorExited: stderrTail.includes("processor task exited"), outboundRouterExited: stderrTail.includes("outbound router task exited"),
     remoteControlLoopExited: stderrTail.includes("remote control websocket loop exited"),
@@ -574,11 +627,11 @@ async function main() {
     upstreamOutputLimit: live ? MAX_OUTPUT_TOKENS : null, toolCase, faultCase, oversizedHttpCalls, oversizedLedgerRequests, observedTurnStatus, toolResult, markerExists: existsSync(marker),
     interruptedProcessEnded, terminalCounts, blockedAfterStop, networkHits, externalEditWritten, externalEditPreserved,
     readTask, readToolResultMatched, filesUnchanged: readTask || faultCase || guardCase || sensitiveCase ? JSON.stringify(snapshot(cwd)) === JSON.stringify(beforeFiles) : "not-tested",
-    editTask, verifyEdit, patchResultMatched, baselineChecks, independentChecks, commandExitCodes, verificationResultMatched,
+    editTask, verifyEdit, isolatedReview, isolatedResult, isolationBoundary, patchResultMatched, baselineChecks, independentChecks, commandExitCodes, verificationResultMatched,
     sensitivePathCount: inventoriedSensitivePaths.length, toolExecutionTested: scopedTools, sandboxEnforcement: scopedTools ? "MXC scoped; see bounded results" : "not-tested" };
   mkdirSync(path.resolve(".local/reports"), { recursive: true });
   writeFileSync(path.resolve(`.local/reports/engine-contract-${Date.now()}.json`), `${JSON.stringify(report, null, 2)}\n`, { flag: "wx" });
-  if (exitCode === 0 && (!restartCheck || restarted?.exitCode === 0)) run.cleanup();
+  if (exitCode === 0 && (!restartCheck || restarted?.exitCode === 0) && (!isolatedReview || result.status === "passed")) run.cleanup();
   else process.exitCode = 1;
   console.log(JSON.stringify(report, null, 2));
   } finally { key = ""; ledger?.close(); }

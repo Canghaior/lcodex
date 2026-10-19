@@ -6,7 +6,7 @@ import { isolatedEnvironment } from "./isolated-env.js";
 
 export type CapturedFile = { relative: string; sha256: string; base64: string };
 export type CapturedTree = { files: CapturedFile[]; excluded: string[] };
-export type ApplyResult = { status: "applied" | "conflict" | "refused"; code?: string };
+export type ApplyResult = { status: "applied" | "conflict" | "refused"; code?: string; mayHaveChanged?: boolean };
 export const contentHash = (bytes: Buffer | string) => createHash("sha256").update(bytes).digest("hex");
 
 // Coordinator-only P1 adapter. The script and its native source are trusted code,

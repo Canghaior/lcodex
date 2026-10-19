@@ -37,6 +37,7 @@ public sealed class WindowsFileGuard : IDisposable {
     FileStream target;
     SafeFileHandle targetHandle;
     public string status { get; private set; } = "ready";
+    public bool mayHaveChanged { get; private set; } = false;
     static Exception Error(string code) { return new IOException("GUARD_" + code); }
     public static string Hash(byte[] bytes) { return Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant(); }
     static void TextOnly(byte[] bytes) {
@@ -61,6 +62,7 @@ public sealed class WindowsFileGuard : IDisposable {
             if (code == 80 || code == 183) throw Error("EXISTS");
             throw Error("OPEN_REFUSED");
         }
+        if (creation == 1) mayHaveChanged = true;
         held.Add(handle);
         Info info;
         if (!GetFileInformationByHandle(handle, out info)) throw Error("INFO_FAILED");
@@ -108,7 +110,16 @@ public sealed class WindowsFileGuard : IDisposable {
     public void Prepare(string root, string relative, string expected, bool createNew) {
         string current = Root(root); string[] parts = relative.Split('/');
         foreach (string part in parts) { Segment(part); if (Excluded(part)) throw Error("EXCLUDED"); }
-        for (int i = 0; i < parts.Length - 1; i++) { current = Path.Combine(current, parts[i]); Open(current, 0x80, 1, 3, true); }
+        for (int i = 0; i < parts.Length - 1; i++) {
+            current = Path.Combine(current, parts[i]);
+            try { Open(current, 0x80, 1, 3, true); }
+            catch (IOException error) when (createNew && error.Message == "GUARD_MISSING") {
+                // Parents already held without delete/write sharing. A raced-in
+                // directory must still pass a no-follow handle check before use.
+                mayHaveChanged = true;
+                Directory.CreateDirectory(current); Open(current, 0x80, 1, 3, true);
+            }
+        }
         string file = Path.Combine(current, parts[parts.Length - 1]);
         // CREATE_NEW refuses an occupied path atomically; OPEN_EXISTING never truncates.
         targetHandle = Open(file, Read | Write | Delete, 0, createNew ? 1u : 3u, false);
@@ -117,6 +128,7 @@ public sealed class WindowsFileGuard : IDisposable {
     }
     public void Apply(byte[] bytes, bool deletion) {
         if (status != "ready" || target == null) throw Error("NOT_READY");
+        mayHaveChanged = true;
         if (deletion) {
             var disposition = new Disposition { DeleteFile = 1 };
             if (!SetFileInformationByHandle(targetHandle, 4, ref disposition, 4)) throw Error("DELETE_FAILED");

@@ -45,6 +45,9 @@ export async function prepareReviewWorkspace(project: string, state: string, gua
     for (const [relative, bytes] of before) {
       const destination = path.join(workspace, relative); mkdirSync(path.dirname(destination), { recursive: true }); persist(destination, bytes);
     }
+    const rootMarker = `.lcodex-root-${taskId}`;
+    const markerContent = taskId + "\n";
+    persist(path.join(workspace, rootMarker), markerContent);
     const journal = path.join(privateDir, "apply.jsonl");
     persist(journal, JSON.stringify({ type: "created", taskId, projectId: lock.projectId }) + "\n");
     function record(value: object) {
@@ -54,7 +57,7 @@ export async function prepareReviewWorkspace(project: string, state: string, gua
     }
     function requireActive() { if (!active || unresolved || sealing) throw new Error("REVIEW_RECONCILE_REQUIRED"); }
     return {
-      workspace, taskDirectory,
+      workspace, taskDirectory, rootMarker,
       async seal(): Promise<Review> {
         requireActive(); if (sealed) throw new Error("REVIEW_ALREADY_SEALED");
         sealing = true;
@@ -62,6 +65,8 @@ export async function prepareReviewWorkspace(project: string, state: string, gua
         const captured = await guard.capture(workspace);
         if (captured.excluded.length) throw new Error("REVIEW_EXCLUDED_CHANGE");
         frozen = contents(captured);
+        if (frozen.get(rootMarker)?.toString("utf8") !== markerContent) throw new Error("REVIEW_ROOT_MARKER_CHANGED");
+        frozen.delete(rootMarker);
         const changes: ReviewChange[] = [];
         for (const relative of [...new Set([...before.keys(), ...frozen.keys()])].sort()) {
           const oldBytes = before.get(relative), newBytes = frozen.get(relative);
@@ -70,7 +75,7 @@ export async function prepareReviewWorkspace(project: string, state: string, gua
         }
         const id = contentHash(JSON.stringify({ taskId, changes }));
         sealed = { id, changes, excluded: baseline.excluded, verificationLocation: "isolated-copy" };
-        persist(path.join(privateDir, "frozen.json"), JSON.stringify({ id, files: captured.files }));
+        persist(path.join(privateDir, "frozen.json"), JSON.stringify({ id, files: captured.files.filter(file => file.relative !== rootMarker) }));
         persist(path.join(privateDir, "review.json"), JSON.stringify(sealed));
         record({ type: "sealed", reviewId: id });
         return structuredClone(sealed);
@@ -93,7 +98,7 @@ export async function prepareReviewWorkspace(project: string, state: string, gua
             const outcome = await guard.apply(root, relative, change.before, frozen.get(relative) ?? null, onLocked);
             // Any refusal may follow a partially created file. Conservatively stop
             // and retain baseline/journal unless the result is a known no-write case.
-            const noWrite = outcome.status === "conflict" || outcome.status === "refused" &&
+            const noWrite = outcome.status === "conflict" || outcome.status === "refused" && outcome.mayHaveChanged === false &&
               ["GUARD_MISSING", "GUARD_EXISTS", "GUARD_OPEN_REFUSED", "GUARD_TYPE_REFUSED", "GUARD_EXCLUDED", "GUARD_PATH_REFUSED"].includes(outcome.code ?? "");
             const final: FileOutcome = { relative, status: outcome.status === "applied" ? "applied" : noWrite ? outcome.status : "needs-reconcile", ...(outcome.code ? { code: outcome.code } : {}) };
             record({ type: "result", reviewId, ...final }); outcomes.push(final);

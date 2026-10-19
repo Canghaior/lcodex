@@ -32,6 +32,7 @@ try {
         if ($exception.Message -match '^GUARD_[A-Z_]+$') {$code = $exception.Message; break}
         $exception = $exception.InnerException
     }
-    [Console]::WriteLine((@{status='refused'; code=$code} | ConvertTo-Json -Compress))
+    $changed = $null -ne $guard -and $guard.mayHaveChanged
+    [Console]::WriteLine((@{status='refused'; code=$code; mayHaveChanged=$changed} | ConvertTo-Json -Compress))
     exit 2
 } finally {if ($null -ne $guard) {$guard.Dispose()}}

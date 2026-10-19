@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { existsSync, linkSync, mkdirSync, readFileSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { createFixture, snapshot } from "./fixtures.js";
 import { prepareReviewWorkspace } from "./review-workspace.js";
 import { contentHash, WindowsFileGuard } from "./windows-file-guard.js";
+import { inspectApplyJournal } from "./apply-journal.js";
+import { isolatedEnvironment } from "./isolated-env.js";
 
 const shell = "C:/Users/lijin/.cache/codex-runtimes/codex-primary-runtime/dependencies/native/powershell/pwsh.exe";
 const options = { skip: process.platform !== "win32" || !existsSync(shell), timeout: 90_000 };
@@ -69,10 +72,10 @@ test("occupied additions, link redirection and hard links never overwrite other 
   const junction = path.join(fixture.project, "redirect"), hard = path.join(fixture.project, "hard.txt");
   try {
     const occupied = await guard.apply(fixture.project, "invoice.mjs", null, Buffer.from("overwrite"));
-    assert.deepEqual(occupied, { status: "refused", code: "GUARD_EXISTS" });
+    assert.deepEqual(occupied, { status: "refused", code: "GUARD_EXISTS", mayHaveChanged: false });
     symlinkSync(outside, junction, "junction");
     const redirect = await guard.apply(fixture.project, "redirect/sentinel.txt", contentHash("keep"), Buffer.from("lost"));
-    assert.deepEqual(redirect, { status: "refused", code: "GUARD_TYPE_REFUSED" });
+    assert.deepEqual(redirect, { status: "refused", code: "GUARD_TYPE_REFUSED", mayHaveChanged: false });
     await assert.rejects(guard.capture(fixture.project), /TYPE_REFUSED/);
     unlinkSync(junction);
     linkSync(sentinel, hard);
@@ -104,9 +107,48 @@ test("empty UTF-8 files are valid and unsafe relative paths are refused", option
     assert.equal(readFileSync(fixture.sourceFile).length, 0);
     assert.equal((await guard.apply(fixture.project, "empty new.txt", null, Buffer.alloc(0))).status, "applied");
     assert.equal(readFileSync(path.join(fixture.project, "empty new.txt")).length, 0);
+    assert.equal((await guard.apply(fixture.project, "new folder/子目录/source.txt", null, Buffer.from("new source"))).status, "applied");
+    assert.equal(readFileSync(path.join(fixture.project, "new folder/子目录/source.txt"), "utf8"), "new source");
     for (const relative of ["../outside.txt", "invoice.mjs:stream", ".git/config", "CON.txt"]) {
       const outcome = await guard.apply(fixture.project, relative, null, Buffer.from("refuse"));
       assert.equal(outcome.status, "refused"); assert.match(outcome.code!, /PATH_REFUSED|EXCLUDED/);
     }
   } finally { fixture.cleanup(); }
+});
+
+test("interrupted addition leaves durable evidence, blocks replay and retains the project lock after restart", options, async () => {
+  const fixture = createFixture(false), state = path.join(fixture.root, "state"); mkdirSync(state);
+  const script = `
+    import {prepareReviewWorkspace} from './dist/validation/review-workspace.js';
+    import {WindowsFileGuard} from './dist/validation/windows-file-guard.js';
+    import {writeFileSync} from 'node:fs';
+    import path from 'node:path';
+    const task=await prepareReviewWorkspace(${JSON.stringify(fixture.project)},${JSON.stringify(state)},new WindowsFileGuard(${JSON.stringify(shell)},${JSON.stringify(fixture.root)}));
+    writeFileSync(path.join(task.workspace,'interrupted.txt'),'complete candidate');
+    const review=await task.seal();
+    const result=await task.apply(review.id,['interrupted.txt'],()=>{throw new Error('synthetic cancellation after CREATE_NEW');});
+    if(result[0]?.status!=='needs-reconcile') process.exit(2);
+    let closeRefused=false; try {task.close();}catch{closeRefused=true;}
+    if(!closeRefused) process.exit(3);
+    console.log(JSON.stringify({taskDirectory:task.taskDirectory}));
+    process.exit(0);
+  `;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", script], { cwd: process.cwd(), env: isolatedEnvironment(fixture.root, process.env), windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+  let output = ""; child.stdout.setEncoding("utf8"); child.stdout.on("data", chunk => { output += String(chunk); }); child.stderr.resume();
+  const timer = setTimeout(() => child.kill(), 30_000);
+  try {
+    const code = await new Promise<number | null>((resolve, reject) => { child.once("close", resolve); child.once("error", reject); });
+    assert.equal(code, 0);
+    const result = JSON.parse(output.trim()) as { taskDirectory: string };
+    assert.equal(readFileSync(path.join(fixture.project, "interrupted.txt")).length, 0);
+    const journal = readFileSync(path.join(result.taskDirectory, "private/apply.jsonl"), "utf8");
+    const guard = new WindowsFileGuard(shell, fixture.root);
+    const tree = await guard.capture(fixture.project);
+    const pending = inspectApplyJournal(journal, new Map(tree.files.map(file => [file.relative, file.sha256])));
+    assert.equal(pending.length, 1); assert.equal(pending[0]?.observation, "diverged");
+    assert.equal(pending[0]?.action, "needs-reconcile");
+    assert.ok(readFileSync(path.join(result.taskDirectory, "private/frozen.json"), "utf8").includes(Buffer.from("complete candidate").toString("base64")));
+    await assert.rejects(prepareReviewWorkspace(fixture.project, state, guard), /PROJECT_LOCK_BUSY_RECONCILE/);
+    assert.equal(readFileSync(path.join(fixture.project, "interrupted.txt")).length, 0);
+  } finally { clearTimeout(timer); fixture.cleanup(); }
 });
