@@ -1,6 +1,25 @@
 import path from "node:path";
+import { isObject } from "./rpc.js";
 
 function requireValue(value: unknown, code = "PROJECT_TOOL_REFUSED"): asserts value { if (!value) throw new Error(code); }
+// The engine's generic schema makes these optional. Our fixed execution contract
+// requires them, so communicate that in the schema as well as checking outputs.
+// This does not fill in or rewrite a model call or weaken the execution boundary.
+export function projectModelTools(tools: Record<string, unknown>[], workspace: string, shell: string) {
+  return tools.flatMap(tool => {
+    if (tool.type === "custom" && tool.name === "apply_patch") return [structuredClone(tool)];
+    if (tool.type !== "function" || tool.name !== "exec_command") return [];
+    const result = structuredClone(tool);
+    requireValue(isObject(result.parameters) && isObject(result.parameters.properties), "PROJECT_TOOL_SCHEMA_REFUSED");
+    result.parameters.properties.shell = { type: "string", enum: [shell], description: "Required pinned shell executable." };
+    result.parameters.properties.login = { type: "boolean", enum: [false] };
+    result.parameters.properties.workdir = { type: "string", enum: [workspace] };
+    result.parameters.required = ["cmd", "shell", "login", "workdir"];
+    result.parameters.additionalProperties = false;
+    for (const key of Object.keys(result.parameters.properties)) if (!["cmd", "shell", "login", "workdir", "yield_time_ms", "max_output_tokens"].includes(key)) delete result.parameters.properties[key];
+    return [result];
+  });
+}
 export function projectToolPolicy(workspace: string, shell: string, rootMarker: string, readOnlyAssets: readonly string[] = []) {
   const root = path.resolve(workspace);
   const equal = (a: string, b: string) => process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;

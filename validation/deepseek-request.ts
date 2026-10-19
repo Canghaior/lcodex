@@ -3,7 +3,7 @@ import { isObject } from "./rpc.js";
 import { ResponsesStream } from "./responses-stream.js";
 import { assertNoKnownSecrets } from "./outbound-data.js";
 
-export const PRICE_REVIEW_DATE = "2026-10-19";
+export const PRICE_REVIEW_DATE = "2026-10-20";
 export const REQUEST_RESERVATION_MICROS = 250_000;
 export const MAX_OUTPUT_TOKENS = 1_024;
 // Reviewed official peak/no-cache rates: CNY 2/M input and 8/M output.

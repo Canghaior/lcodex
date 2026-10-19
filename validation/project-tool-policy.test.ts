@@ -1,9 +1,19 @@
 import assert from "node:assert/strict";
 import path from "node:path";
 import test from "node:test";
-import { projectToolPolicy } from "./project-tool-policy.js";
+import { projectModelTools, projectToolPolicy } from "./project-tool-policy.js";
 
 const root = path.resolve(".local/synthetic-workspace"), shell = "fixed-pwsh", policy = projectToolPolicy(root, shell, ".lcodex-root-test");
+test("model schema communicates the enforced envelope without granting extra tools or mutating engine metadata", () => {
+  const original = [{ type: "function", name: "exec_command", parameters: { type: "object", properties: { cmd: { type: "string" }, sandbox_permissions: { type: "string" } }, required: ["cmd"] } },
+    { type: "function", name: "write_stdin" }];
+  const before = structuredClone(original), tools = projectModelTools(original, root, shell);
+  assert.deepEqual(original, before); assert.equal(tools.length, 1);
+  const schema = tools[0]!.parameters as { required: string[]; properties: Record<string, unknown>; additionalProperties: boolean };
+  assert.deepEqual(schema.required, ["cmd", "shell", "login", "workdir"]);
+  assert.equal(schema.additionalProperties, false); assert.equal(schema.properties.sandbox_permissions, undefined);
+  assert.throws(() => policy.functionCall("exec_command", { cmd: "anything" }), /PROJECT_SHELL_REFUSED/);
+});
 test("binary resource paths cannot be admitted through relative, absolute or move patch headers", () => {
   const assets = projectToolPolicy(root, shell, ".lcodex-root-test", ["assets/logo.png"]);
   for (const file of ["assets/logo.png", path.join(root, "assets/logo.png"), ...(process.platform === "win32" ? ["assets/LOGO.png"] : [])]) {

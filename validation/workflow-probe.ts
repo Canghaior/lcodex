@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
-import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { BudgetLedger } from "./budget.js";
 import { MAX_OUTPUT_TOKENS, PRICE_REVIEW_DATE, sendBoundedDeepSeek } from "./deepseek-request.js";
@@ -9,10 +9,12 @@ import { prepareEngineModelRequest } from "./engine-model-request.js";
 import { isolatedEnvironment } from "./isolated-env.js";
 import { validationCatalog } from "./model-catalog.js";
 import { assertNoKnownSecrets } from "./outbound-data.js";
-import { projectToolPolicy } from "./project-tool-policy.js";
+import { projectModelTools, projectToolPolicy } from "./project-tool-policy.js";
 import { readKey } from "./read-key.js";
 import { prepareSerialResponse } from "./serial-response.js";
 import { ToolResponseGate } from "./tool-response-gate.js";
+import { createProcessTreeFixture, stopAndReadThread, verifyTreeStopped, waitForProcessTree } from "./workflow-lifecycle.js";
+import { checkRestart } from "./resume-check.js";
 import { prepareReviewWorkspace } from "./review-workspace.js";
 import { isObject, JsonLineRpc } from "./rpc.js";
 import { createRunDirectory } from "./run-directory.js";
@@ -55,15 +57,24 @@ function mockBatchWire(items: Record<string, unknown>[]) {
 
 async function main() {
   const [binary, shell, kind, ...flags] = process.argv.slice(2);
-  check(binary && shell && (kind === "bug" || kind === "feature") && flags.every(flag => ["--live", "--serial-batch", "--limit-case=requests", "--limit-case=failures", `--price-reviewed=${PRICE_REVIEW_DATE}`].includes(flag)), "WORKFLOW_ARGUMENTS");
+  check(binary && shell && (kind === "bug" || kind === "feature") && flags.every(flag => ["--live", "--serial-batch", "--long-command", "--stop-tree", "--deadline-tree", "--disconnect-after-write", "--resume-continue", "--limit-case=requests", "--limit-case=failures", `--price-reviewed=${PRICE_REVIEW_DATE}`].includes(flag)), "WORKFLOW_ARGUMENTS");
   check(contentHash(readFileSync(binary)) === "dce685d569526ef4712fa82d20ff20e1309baad5fcd34215e1126698f611242f", "WORKFLOW_ENGINE_VERSION");
   const node = realpathSync(process.execPath);
   check(contentHash(readFileSync(node)) === "3a9ac860c566b7aebf144be914f95e3ec36dc88040aa7acb5d9d1e6e0c7afd5e", "WORKFLOW_NODE_VERSION");
   const live = flags.includes("--live");
   const serialBatch = flags.includes("--serial-batch");
+  const longCommand = flags.includes("--long-command");
+  const treeMode = flags.includes("--stop-tree") ? "stop" : flags.includes("--deadline-tree") ? "deadline" : undefined;
+  const disconnected = flags.includes("--disconnect-after-write");
+  const resumeContinue = flags.includes("--resume-continue");
+  const treeDuration = treeMode === "deadline" ? 55_000 : 8_000;
   const limitCase = flags.find(flag => flag.startsWith("--limit-case="))?.slice("--limit-case=".length);
   check(!limitCase || !live, "WORKFLOW_LIMIT_MODE_REFUSED");
   check(!serialBatch || !live && !limitCase, "WORKFLOW_BATCH_MODE_REFUSED");
+  check(!longCommand || !live && !limitCase && !serialBatch, "WORKFLOW_LONG_MODE_REFUSED");
+  check(!treeMode && !disconnected || !live && !limitCase && !serialBatch && !longCommand && !(treeMode && disconnected), "WORKFLOW_LIFECYCLE_MODE_REFUSED");
+  check(!(flags.includes("--stop-tree") && flags.includes("--deadline-tree")), "WORKFLOW_LIFECYCLE_MODE_REFUSED");
+  check(!resumeContinue || !treeMode && !disconnected && !limitCase, "WORKFLOW_CONTINUE_MODE_REFUSED");
   if (live) {
     const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
     check(today === PRICE_REVIEW_DATE && flags.includes(`--price-reviewed=${PRICE_REVIEW_DATE}`), "WORKFLOW_PRICE_REVIEW_REQUIRED");
@@ -74,7 +85,9 @@ async function main() {
   const run = createRunDirectory("workflow 中文项目");
   for (const dir of ["home", "profile/roaming", "profile/local/Packages", "temp", "project", "state", "evaluator"]) mkdirSync(path.join(run.root, dir), { recursive: true });
   const original = path.join(run.root, "project"), state = path.join(run.root, "state"), token = randomUUID();
-  const prompt = createWorkflowSample(original, kind as SampleKind), originalBefore = snapshot(original);
+  const prompt = createWorkflowSample(original, kind as SampleKind);
+  if (treeMode) createProcessTreeFixture(original, treeDuration);
+  const originalBefore = snapshot(original);
   const guard = new WindowsFileGuard(shell, run.root), task = await prepareReviewWorkspace(original, state, guard);
   const cwd = task.workspace, policy = projectToolPolicy(cwd, shell, task.rootMarker, task.readOnlyAssets);
   const evaluator = createWorkflowEvaluator(path.join(run.root, "evaluator"), kind as SampleKind);
@@ -83,6 +96,8 @@ async function main() {
   const limits = new TaskLimits(limitsFile), trial = `workflow-${kind}-${randomUUID()}`;
   activeLimits = limits;
   const abort = new AbortController();
+  const continuationAbort = new AbortController();
+  let continuationMode = false, continuationHistoryMatched = false;
   let failure = "";
   let inFlight = false, requests = 0, activeUpstream: ReturnType<typeof sendBoundedDeepSeek> | undefined;
   const usage: unknown[] = [], toolResults: unknown[] = [], envelopes: unknown[] = [];
@@ -100,12 +115,16 @@ async function main() {
     let owned = false;
     try {
       check(req.headers.authorization === `Bearer ${token}` && req.method === "POST" && req.url?.endsWith("/responses"), "WORKFLOW_GATEWAY_AUTH");
-      check(!inFlight && !failure && !abort.signal.aborted, "WORKFLOW_GATEWAY_STOPPED"); inFlight = true; owned = true;
+      check(!inFlight && !failure && (continuationMode || !abort.signal.aborted), "WORKFLOW_GATEWAY_STOPPED"); inFlight = true; owned = true;
       const chunks: Buffer[] = []; let size = 0;
       for await (const chunk of req) { const bytes = Buffer.from(chunk); size += bytes.length; check(size <= 131_072, "WORKFLOW_RAW_INPUT_LIMIT"); chunks.push(bytes); }
       const body = new TextDecoder("utf8", { fatal: true }).decode(Buffer.concat(chunks));
       const parsed: unknown = JSON.parse(body); check(isObject(parsed) && Array.isArray(parsed.tools), "WORKFLOW_REQUEST_INVALID");
       assertNoKnownSecrets(body, [key, token].filter(Boolean));
+      if (continuationMode) {
+        continuationHistoryMatched = Array.isArray(parsed.input) && parsed.input.some(item => isObject(item) && ["function_call_output", "custom_tool_call_output"].includes(String(item.type)));
+        check(continuationHistoryMatched, "WORKFLOW_CONTINUATION_HISTORY_MISSING");
+      }
       if (serialBatch && requests === 1) {
         const input = parsed.input; check(Array.isArray(input), "WORKFLOW_BATCH_HISTORY_MISSING");
         batchHistoryMatched = ["mock-batch-one", "mock-batch-two"].every(id => input.filter(isObject).filter(item => item.type === "function_call_output" && item.call_id === id).length === 1);
@@ -114,14 +133,14 @@ async function main() {
       limits.request(); requests++;
       let response: Record<string, unknown>, wire: string;
       if (live && ledger) {
-        const tools = parsed.tools.filter(isObject).filter(tool => tool.type === "function" && tool.name === "exec_command" || tool.type === "custom" && tool.name === "apply_patch");
+        const tools = continuationMode ? [] : projectModelTools(parsed.tools.filter(isObject), cwd, shell);
         const request = prepareEngineModelRequest(parsed, tools);
-        activeUpstream = sendBoundedDeepSeek(ledger, trial, key, request, fetch, abort.signal, 49_152);
+        activeUpstream = sendBoundedDeepSeek(ledger, trial, key, request, fetch, continuationMode ? continuationAbort.signal : abort.signal, 49_152);
         const result = await activeUpstream; response = result.response; wire = result.wire; usage.push(result.usage);
       } else {
         const item = limitCase ? { id: `mock-item-${requests}`, type: "function_call", name: "exec_command", call_id: `mock-call-${requests}`, status: "completed", arguments: JSON.stringify({ cmd: limitCase === "failures" ? "exit 1" : "Get-Content -LiteralPath './src/catalog.mjs' -Raw", shell, workdir: cwd, login: false, yield_time_ms: 10000, max_output_tokens: 2048 }) }
           : requests === 2 ? { id: "mock-item-2", type: "custom_tool_call", name: "apply_patch", call_id: "mock-call-2", input: patch, status: "completed" }
-          : requests <= 3 ? { id: `mock-item-${requests}`, type: "function_call", name: "exec_command", call_id: `mock-call-${requests}`, status: "completed", arguments: JSON.stringify({ cmd: requests === 1 ? "Get-Content -LiteralPath './src/catalog.mjs' -Raw" : testCommand, shell, workdir: cwd, login: false, yield_time_ms: 10000, max_output_tokens: 2048 }) }
+          : requests <= 3 ? { id: `mock-item-${requests}`, type: "function_call", name: "exec_command", call_id: `mock-call-${requests}`, status: "completed", arguments: JSON.stringify({ cmd: requests === 1 ? (longCommand ? "Start-Sleep -Seconds 12; " : "") + "Get-Content -LiteralPath './src/catalog.mjs' -Raw" : testCommand, shell, workdir: cwd, login: false, yield_time_ms: 10000, max_output_tokens: 2048 }) }
           : { id: "mock-final", type: "message", role: "assistant", status: "completed" };
         ({ response, wire } = mockWire(item, requests));
         if (serialBatch && requests === 1) {
@@ -131,6 +150,13 @@ async function main() {
           ({ response, wire } = mockBatchWire(commands.map((cmd, index) => ({ type: "function_call", id: `batch-item-${index}`, call_id: index === 0 ? "mock-batch-one" : "mock-batch-two", name: "exec_command", status: "completed",
             arguments: JSON.stringify({ cmd, shell, workdir: cwd, login: false, yield_time_ms: 10000, max_output_tokens: 2048 }) }))));
         }
+        if (treeMode && requests === 1) {
+          const commands = [`& ${psQuote(node)} ${nodeFlags} './process-tree.mjs' parent; exit $LASTEXITCODE`, "Set-Content -LiteralPath './queued-must-not-run.txt' -Value 'UNEXPECTED'"];
+          ({ response, wire } = mockBatchWire(commands.map((cmd, index) => ({ type: "function_call", id: `tree-item-${index}`, call_id: `tree-call-${index}`, name: "exec_command", status: "completed",
+            arguments: JSON.stringify({ cmd, shell, workdir: cwd, login: false, yield_time_ms: 10000, max_output_tokens: 2048 }) }))));
+        }
+        if (disconnected && requests === 1) ({ response, wire } = mockWire({ type: "function_call", id: "effect-item", call_id: "effect-call", name: "exec_command", status: "completed",
+          arguments: JSON.stringify({ cmd: "[IO.File]::AppendAllText((Join-Path (Get-Location) 'effect.txt'), 'ONCE'); Get-Content -LiteralPath './src/catalog.mjs' -Raw", shell, workdir: cwd, login: false, yield_time_ms: 10000, max_output_tokens: 2048 }) }, requests));
       }
       limits.check();
       envelopes.push(Array.isArray(response.output) ? response.output.filter(isObject).filter(item => ["function_call", "custom_tool_call"].includes(String(item.type))).map(item => {
@@ -139,8 +165,16 @@ async function main() {
           ...(isObject(args) ? { shellMatches: args.shell === shell, login: args.login, cwdMatches: args.workdir === cwd, yieldMs: args.yield_time_ms, outputTokens: args.max_output_tokens } : {}) };
       }) : []);
       const batch = prepareSerialResponse(wire, response, policy);
+      if (continuationMode) check(batch.calls.length === 0, "WORKFLOW_CONTINUATION_TOOL_REFUSED");
       res.writeHead(200, { "content-type": "text/event-stream" });
-      await toolGate.deliver(batch, bytes => { res.write(bytes); }); res.end();
+      if (continuationMode) {
+        await batch.deliver({ signal: continuationAbort.signal, write: bytes => { res.write(bytes); }, beforeTool: () => { throw new Error("WORKFLOW_CONTINUATION_TOOL_REFUSED"); }, afterTool: async () => {} });
+        res.end(); return;
+      }
+      await toolGate.deliver(batch, bytes => {
+        if (disconnected && requests === 1 && bytes.startsWith("event: response.completed\n")) throw new Error("WORKFLOW_SIMULATED_DISCONNECT");
+        res.write(bytes);
+      }); res.end();
     } catch (error) {
       failure ||= error instanceof Error && /^(WORKFLOW_|TASK_|API_|SSE_|BUDGET_|PROJECT_|PROBE_|BATCH_)[A-Z0-9_]+$/.test(error.message) ? error.message : "WORKFLOW_GATEWAY_FAILED";
       if (res.headersSent) res.destroy();
@@ -167,7 +201,11 @@ async function main() {
     '[analytics]', 'enabled=false', '[model_providers.workflow]', 'name="P1 bounded workflow"', `base_url="http://127.0.0.1:${address.port}/v1"`, 'wire_api="responses"', 'requires_openai_auth=false', 'env_key="LCODEX_WORKFLOW_TOKEN"', 'request_max_retries=0', 'stream_max_retries=0', '',
   ].join("\n"));
   let baseline: ReturnType<typeof evaluator.run> | undefined, acceptance: ReturnType<typeof evaluator.run> | undefined;
-  let result: Record<string, unknown> = { status: "failed" }, threadId: string | undefined, exitCode: number | null | undefined;
+  let result: Record<string, unknown> = { status: "failed" }, threadId: string | undefined, turnId: string | undefined, exitCode: number | null | undefined;
+  let stopEvidence: Awaited<ReturnType<typeof stopAndReadThread>> | undefined;
+  let treeEvidence: Awaited<ReturnType<typeof verifyTreeStopped>> | undefined;
+  let restarted: Awaited<ReturnType<typeof checkRestart>> | undefined;
+  let recoveredLimits: unknown;
   let child: ReturnType<typeof spawn> | undefined, rpc: JsonLineRpc | undefined;
   let terminal!: (value: unknown) => void;
   const completed = new Promise<unknown>(resolve => { terminal = resolve; });
@@ -188,8 +226,26 @@ async function main() {
     const thread = await rpc.request("thread/start", { cwd, ephemeral: false, approvalPolicy: "never", approvalsReviewer: "user",
       developerInstructions: `Use exactly one tool call per response. For exec_command use shell=${JSON.stringify(shell)}, login=false, workdir=${JSON.stringify(cwd)}, yield_time_ms between 10000 and 30000, max_output_tokens at most 4096. Command execution is independently limited to 45 seconds. Use apply_patch for edits. No escalation, network or dependency installation. Node runtime is ${node}; include ${nodeFlags} before Node arguments in this sandbox. Project test command: ${testCommand}. Stop and summarize after testing. Do not modify the root marker, credentials or user notes.` });
     check(isObject(thread) && isObject(thread.thread) && typeof thread.thread.id === "string", "WORKFLOW_THREAD_INVALID"); threadId = thread.thread.id;
-    await rpc.request("turn/start", { threadId, input: [{ type: "text", text: prompt, text_elements: [] }] });
+    const started = await rpc.request("turn/start", { threadId, input: [{ type: "text", text: prompt, text_elements: [] }] });
+    check(isObject(started) && isObject(started.turn) && typeof started.turn.id === "string", "WORKFLOW_TURN_INVALID"); turnId = started.turn.id;
+    if (treeMode) {
+      const tree = await waitForProcessTree(cwd);
+      if (treeMode === "stop") { failure = "TASK_USER_STOP"; abort.abort(new Error(failure)); }
+      else { await completed; check(failure === "TASK_COMMAND_LIMIT", failure || "WORKFLOW_DEADLINE_NOT_REACHED"); }
+      stopEvidence = await stopAndReadThread(rpc, threadId, turnId);
+      treeEvidence = await verifyTreeStopped(cwd, tree, treeDuration);
+      check(!stopEvidence.needsReconcile && treeEvidence.allEnded && treeEvidence.noLateWrites && requests === 1 &&
+        !toolEvents.some(event => event.endsWith(":tree-call-1")) && !existsSync(path.join(cwd, "queued-must-not-run.txt")), "WORKFLOW_TREE_STOP_FAILED");
+      result = { status: "passed", expectedStop: failure, taskSucceeded: false, applicationOffered: false };
+    } else {
     const done = await completed;
+    if (disconnected) {
+      check(failure === "WORKFLOW_SIMULATED_DISCONNECT" && toolResults.length === 1 && requests === 1 &&
+        readFileSync(path.join(cwd, "effect.txt"), "utf8") === "ONCE", "WORKFLOW_DISCONNECT_EVIDENCE_MISSING");
+      stopEvidence = await stopAndReadThread(rpc, threadId, turnId);
+      check(!stopEvidence.needsReconcile, "WORKFLOW_DISCONNECT_UNRECONCILED");
+      result = { status: "passed", expectedStop: failure, taskSucceeded: false, applicationOffered: false };
+    } else {
     check(!failure && isObject(done) && isObject(done.turn) && done.turn.status === "completed", failure || "WORKFLOW_TURN_FAILED");
     limits.check(); check(limits.summary().pending === 0, "WORKFLOW_PENDING_TOOL");
     if (serialBatch) {
@@ -204,6 +260,8 @@ async function main() {
     check(JSON.stringify(snapshot(original)) === JSON.stringify(originalBefore), "WORKFLOW_ORIGINAL_CHANGED");
     check(contentHash(readFileSync(path.join(cwd, "user-notes.txt"))) === originalBefore["user-notes.txt"], "WORKFLOW_USER_NOTES_CHANGED");
     result = { status: "passed", turnStatus: done.turn.status };
+    }
+    }
   } catch (error) {
     if (error instanceof Error && error.message === "WORKFLOW_EVALUATOR_PROCESS_UNKNOWN") mayClean = false;
     result = { status: "failed", code: failure || (error instanceof Error && /^(WORKFLOW_|TASK_|RPC_)[A-Z0-9_-]+$/.test(error.message) ? error.message : "WORKFLOW_FAILED") };
@@ -224,14 +282,39 @@ async function main() {
       exitCode = await Promise.race([closed, new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), 25_000); })]); clearTimeout(timer);
       if (exitCode === undefined) { child?.kill(); exitCode = await Promise.race([closed, new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), 3_000); })]); clearTimeout(timer); result = { status: "failed", code: "WORKFLOW_UNCLEAN_EXIT" }; }
     }
-    server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+  if (resumeContinue && result.status === "passed" && exitCode === 0 && threadId && turnId) {
+    continuationMode = true;
+    const beforeRestart = snapshot(cwd), previousRequests = requests;
+    restarted = await checkRestart(binary, cwd, env, threadId, turnId, "completed", {
+      prompt: "Without using tools or making any changes, summarize from this conversation which source file you changed and what behavior you fixed or added. Mention the function name. Do not rerun anything.",
+      checkText: text => !live || text.includes("catalog.mjs") && text.includes(kind === "bug" ? "total" : "findByLabel"),
+    });
+    if (!restarted.passed || !continuationHistoryMatched || requests !== previousRequests + 1 || JSON.stringify(snapshot(cwd)) !== JSON.stringify(beforeRestart))
+      result = { status: "failed", code: "WORKFLOW_CONTINUATION_FAILED" };
+  }
+  continuationAbort.abort(); server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));
+  if ((treeMode || disconnected) && result.status === "passed" && exitCode === 0 && threadId && turnId && stopEvidence?.status) {
+    const beforeRestart = snapshot(cwd), previousRequests = requests;
+    restarted = await checkRestart(binary, cwd, env, threadId, turnId, stopEvidence.status);
+    if (treeMode) {
+      limits.close(); const reopened = new TaskLimits(limitsFile);
+      try { reopened.check(); result = { status: "failed", code: "WORKFLOW_LIMITS_REPLAY_ALLOWED" }; }
+      catch (error) { recoveredLimits = { code: error instanceof Error ? error.message : "unknown", ...reopened.summary() }; }
+      finally { reopened.close(); }
+    }
+    if (!restarted.passed || previousRequests !== requests || JSON.stringify(snapshot(cwd)) !== JSON.stringify(beforeRestart) ||
+        JSON.stringify(snapshot(original)) !== JSON.stringify(originalBefore)) result = { status: "failed", code: "WORKFLOW_RESTART_REPLAY" };
+    // Only dispose this generated fixture after actual process exit, history
+    // reconciliation and the durable no-replay check. A product task retains it.
+    if (result.status === "passed") mayClean = true;
   }
   let reviewedChanges: unknown = null;
   if (limitCase && exitCode === 0 && failure === (limitCase === "requests" ? "TASK_REQUEST_LIMIT" : "TASK_FAILURE_LIMIT") &&
       toolResults.length === (limitCase === "requests" ? TASK_LIMITS.requests : TASK_LIMITS.consecutiveFailures) && JSON.stringify(snapshot(original)) === JSON.stringify(originalBefore)) {
     result = { status: "passed", expectedStop: failure, taskSucceeded: false, applicationOffered: false }; process.exitCode = 0;
   }
-  if (result.status === "passed" && exitCode === 0 && !limitCase) {
+  if (result.status === "passed" && exitCode === 0 && !limitCase && !treeMode && !disconnected) {
     try {
       const review = await task.seal(); check(review.changes.length > 0, "WORKFLOW_NO_CHANGES");
       if (kind === "feature") check(review.changes.some(change => change.relative.startsWith("test/") && change.kind !== "delete"), "WORKFLOW_FEATURE_TESTS_MISSING");
@@ -241,7 +324,7 @@ async function main() {
       task.close();
     } catch { result = { status: "failed", code: "WORKFLOW_REVIEW_FAILED" }; }
   } else if (exitCode === 0 && mayClean) task.close();
-  const report = { kind: "multi-step-isolated-workflow", sample: kind, realModel: live, limitCase, serialBatch, batchHistoryMatched, toolEvents, ...result, baseline, acceptance, reviewedChanges, toolResults, envelopes, requests, usage,
+  const report = { kind: "multi-step-isolated-workflow", sample: kind, realModel: live, limitCase, serialBatch, longCommand, treeMode, disconnected, resumeContinue, continuationHistoryMatched, stopEvidence, treeEvidence, restarted, recoveredLimits, batchHistoryMatched, toolEvents, ...result, baseline, acceptance, reviewedChanges, toolResults, envelopes, requests, usage,
     limits: limits.summary(), budget: ledger?.summary(), billVerified: false, exitCode, suppliedFullSource: false, exactPatchRequired: false,
     humanContextAdditions: 0, humanRepairs: 0, humanTakeovers: 0, originalPreserved: JSON.stringify(snapshot(original)) === JSON.stringify(originalBefore) };
   limits.close(); ledger?.close(); key = "";
