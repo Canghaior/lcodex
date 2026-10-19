@@ -16,7 +16,7 @@ export class WindowsFileGuard {
     if (process.platform !== "win32" || !path.isAbsolute(shell) ||
       contentHash(readFileSync(shell)) !== "362a356ce7f0940ec74f73a8fc2c990a2cc24a38a11c90bbd8eca947110ad139") throw new Error("GUARD_RUNTIME_MISMATCH");
   }
-  private async invoke(request: object, onLocked?: () => void): Promise<unknown> {
+  private async invoke(request: object, onLocked?: () => void, dependencyCapture = false): Promise<unknown> {
     const child = spawn(this.shell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", path.resolve("validation/windows-file-guard.ps1")],
       { env: isolatedEnvironment(this.environmentRoot, process.env), windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
     let output = "", size = 0, result: unknown, failure = "", locked = false;
@@ -24,7 +24,7 @@ export class WindowsFileGuard {
     child.stdin.on("error", () => { failure ||= "GUARD_INPUT_FAILED"; });
     child.stdout.on("data", (chunk: string) => {
       size += Buffer.byteLength(chunk);
-      if (size > 24 * 1024 * 1024) { failure = "GUARD_OUTPUT_LIMIT"; child.kill(); return; }
+      if (size > (dependencyCapture ? 96 : 24) * 1024 * 1024) { failure = "GUARD_OUTPUT_LIMIT"; child.kill(); return; }
       output += chunk;
       let end: number;
       while ((end = output.indexOf("\n")) >= 0) {
@@ -38,7 +38,7 @@ export class WindowsFileGuard {
         } catch { failure = "GUARD_PROTOCOL_FAILED"; child.stdin.end("CANCEL\n"); }
       }
     });
-    const timer = setTimeout(() => { failure = "GUARD_TIMEOUT_RECONCILE"; child.kill(); }, 15_000);
+    const timer = setTimeout(() => { failure = "GUARD_TIMEOUT_RECONCILE"; child.kill(); }, dependencyCapture ? 30_000 : 15_000);
     child.stdin.write(JSON.stringify(request) + "\n");
     const exitCode = await new Promise<number | null>((resolve, reject) => {
       child.once("close", resolve); child.once("error", () => reject(new Error("GUARD_SPAWN_FAILED")));
@@ -47,7 +47,13 @@ export class WindowsFileGuard {
     return result;
   }
   async capture(root: string): Promise<CapturedTree> {
-    const value = await this.invoke({ mode: "capture", root: path.resolve(root) }) as Partial<CapturedTree> & Partial<ApplyResult>;
+    return this.captureTree(root, false);
+  }
+  async captureDependencies(root: string): Promise<CapturedTree> {
+    return this.captureTree(root, true);
+  }
+  private async captureTree(root: string, dependencies: boolean): Promise<CapturedTree> {
+    const value = await this.invoke({ mode: dependencies ? "dependencies" : "capture", root: path.resolve(root) }, undefined, dependencies) as Partial<CapturedTree> & Partial<ApplyResult>;
     if (value.status === "refused") throw new Error(value.code || "GUARD_CAPTURE_REFUSED");
     if (!Array.isArray(value.files) || !Array.isArray(value.excluded) || value.files.some(file =>
       typeof file.relative !== "string" || !/^[a-f0-9]{64}$/.test(file.sha256) || !["text", "binary"].includes(file.kind) || typeof file.base64 !== "string" || contentHash(Buffer.from(file.base64, "base64")) !== file.sha256)) throw new Error("GUARD_CAPTURE_INVALID");

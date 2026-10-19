@@ -1,12 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, statfsSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, statfsSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { acquireProjectWriteLock } from "./project-write-lock.js";
 import { CapturedTree, contentHash, WindowsFileGuard } from "./windows-file-guard.js";
 
 export type ReviewChange = { relative: string; before: string | null; after: string | null; kind: "add" | "modify" | "delete" };
 export type FileOutcome = { relative: string; status: "applied" | "conflict" | "refused" | "needs-reconcile"; code?: string };
-export type Review = { id: string; changes: ReviewChange[]; excluded: string[]; readOnlyAssets: string[]; verificationLocation: "isolated-copy" };
+export type Review = { id: string; changes: ReviewChange[]; excluded: string[]; readOnlyAssets: string[]; readOnlyDirectories: string[]; verificationLocation: "isolated-copy" };
 
 function persist(file: string, bytes: string | Buffer) {
   const fd = openSync(file, "wx", 0o600);
@@ -39,12 +39,26 @@ export async function prepareReviewWorkspace(project: string, state: string, gua
   try {
     const baseline = await guard.capture(root), before = contents(baseline);
     const assets = new Set(baseline.files.filter(file => file.kind === "binary").map(file => file.relative));
+    const dependencyRoot = path.join(root, "node_modules");
+    const dependencies = existsSync(dependencyRoot) ? await guard.captureDependencies(dependencyRoot) : undefined;
+    if (dependencies?.excluded.length) throw new Error("REVIEW_DEPENDENCY_SENSITIVE_CONTENT");
+    const dependencyFiles = dependencies ? contents(dependencies) : undefined;
+    const dependencyFingerprint = (tree: CapturedTree) => contentHash(JSON.stringify(tree.files.map(file => [file.relative, file.sha256]).sort()));
+    const dependencyHash = dependencies ? dependencyFingerprint(dependencies) : undefined;
+    const readOnlyDirectories = dependencies ? ["node_modules"] : [];
     mkdirSync(taskDirectory);
     const workspace = path.join(taskDirectory, "workspace"), privateDir = path.join(taskDirectory, "private");
     mkdirSync(workspace); mkdirSync(privateDir);
     persist(path.join(privateDir, "baseline.json"), JSON.stringify({ taskId, projectId: lock.projectId, files: baseline.files, excluded: baseline.excluded }));
     for (const [relative, bytes] of before) {
       const destination = path.join(workspace, relative); mkdirSync(path.dirname(destination), { recursive: true }); persist(destination, bytes);
+    }
+    if (dependencyFiles) {
+      mkdirSync(path.join(workspace, "node_modules"));
+      persist(path.join(privateDir, "dependencies.json"), JSON.stringify({ sha256: dependencyHash, files: dependencies!.files.map(({ relative, sha256 }) => ({ relative, sha256 })) }));
+      for (const [relative, bytes] of dependencyFiles) {
+        const destination = path.join(workspace, "node_modules", relative); mkdirSync(path.dirname(destination), { recursive: true }); persist(destination, bytes);
+      }
     }
     const rootMarker = `.lcodex-root-${taskId}`;
     const markerContent = taskId + "\n";
@@ -58,13 +72,17 @@ export async function prepareReviewWorkspace(project: string, state: string, gua
     }
     function requireActive() { if (!active || unresolved || sealing) throw new Error("REVIEW_RECONCILE_REQUIRED"); }
     return {
-      workspace, taskDirectory, rootMarker, readOnlyAssets: [...assets],
+      workspace, taskDirectory, rootMarker, readOnlyAssets: [...assets], readOnlyDirectories,
       async seal(): Promise<Review> {
         requireActive(); if (sealed) throw new Error("REVIEW_ALREADY_SEALED");
         sealing = true;
         try {
         const captured = await guard.capture(workspace);
-        if (captured.excluded.length) throw new Error("REVIEW_EXCLUDED_CHANGE");
+        if (captured.excluded.some(relative => !(dependencies && relative.toLowerCase() === "node_modules"))) throw new Error("REVIEW_EXCLUDED_CHANGE");
+        if (dependencies) {
+          const currentDependencies = await guard.captureDependencies(path.join(workspace, "node_modules"));
+          if (currentDependencies.excluded.length || dependencyFingerprint(currentDependencies) !== dependencyHash) throw new Error("REVIEW_DEPENDENCY_CHANGED");
+        }
         frozen = contents(captured);
         if (captured.files.some(file => file.kind === "binary" && !assets.has(file.relative)) || [...assets].some(relative =>
           !frozen.has(relative) || contentHash(frozen.get(relative)!) !== contentHash(before.get(relative)!))) throw new Error("REVIEW_BINARY_CHANGE");
@@ -77,7 +95,7 @@ export async function prepareReviewWorkspace(project: string, state: string, gua
           if (oldHash !== newHash) changes.push({ relative, before: oldHash, after: newHash, kind: oldHash === null ? "add" : newHash === null ? "delete" : "modify" });
         }
         const id = contentHash(JSON.stringify({ taskId, changes }));
-        sealed = { id, changes, excluded: baseline.excluded, readOnlyAssets: [...assets], verificationLocation: "isolated-copy" };
+        sealed = { id, changes, excluded: baseline.excluded, readOnlyAssets: [...assets], readOnlyDirectories, verificationLocation: "isolated-copy" };
         persist(path.join(privateDir, "frozen.json"), JSON.stringify({ id, files: captured.files.filter(file => file.relative !== rootMarker) }));
         persist(path.join(privateDir, "review.json"), JSON.stringify(sealed));
         record({ type: "sealed", reviewId: id });

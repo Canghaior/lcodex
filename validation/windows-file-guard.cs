@@ -95,26 +95,32 @@ public sealed class WindowsFileGuard : IDisposable {
         }
         return normalized;
     }
-    byte[] ReadAll(FileStream stream, bool textOnly = true) {
-        if (stream.Length > SingleLimit) throw Error("TEXT_LIMIT");
+    byte[] ReadAll(FileStream stream, bool textOnly = true, int limit = SingleLimit) {
+        if (stream.Length > limit) throw Error("TEXT_LIMIT");
         byte[] bytes = new byte[(int)stream.Length]; stream.Position = 0; stream.ReadExactly(bytes); if (textOnly) TextOnly(bytes); return bytes;
     }
     public GuardCapture Capture(string root) {
+        return CaptureCore(root, FileLimit, ByteLimit, SingleLimit, false);
+    }
+    public GuardCapture CaptureDependencies(string root) {
+        return CaptureCore(root, 8192, 64 * 1024 * 1024, 16 * 1024 * 1024, true);
+    }
+    GuardCapture CaptureCore(string root, int fileLimit, int byteLimit, int singleLimit, bool dependencies) {
         string canonical = Root(root); var result = new GuardCapture(); int total = 0, entries = 0;
         Action<string, string> walk = null;
         walk = (dir, prefix) => {
             foreach (string file in Directory.GetFileSystemEntries(dir).OrderBy(p => p, StringComparer.OrdinalIgnoreCase)) {
-                if (++entries > FileLimit) throw Error("ENTRY_LIMIT");
+                if (++entries > fileLimit) throw Error("ENTRY_LIMIT");
                 string name = Path.GetFileName(file); Segment(name); string relative = prefix + name;
-                if (Excluded(name)) { result.excluded.Add(relative); continue; }
+                if (Excluded(name) && !(dependencies && String.Equals(name, "node_modules", StringComparison.OrdinalIgnoreCase))) { result.excluded.Add(relative); continue; }
                 // Attributes are used only to select the expected handle type; the handle is authoritative.
                 bool directory = (File.GetAttributes(file) & FileAttributes.Directory) != 0;
                 var handle = Open(file, directory ? 0x80 : Read, 1, 3, directory);
                 if (directory) walk(file, relative + "/");
                 else {
                     var stream = new FileStream(handle, FileAccess.Read); held.Add(stream);
-                    byte[] bytes = ReadAll(stream, false); total += bytes.Length;
-                    if (total > ByteLimit) throw Error("TOTAL_LIMIT");
+                    byte[] bytes = ReadAll(stream, false, singleLimit); total += bytes.Length;
+                    if (total > byteLimit) throw Error("TOTAL_LIMIT");
                     result.files.Add(new GuardEntry { relative = relative, sha256 = Hash(bytes), base64 = Convert.ToBase64String(bytes), kind = IsText(bytes) ? "text" : "binary" });
                 }
             }

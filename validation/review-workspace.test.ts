@@ -12,6 +12,44 @@ import { isolatedEnvironment } from "./isolated-env.js";
 const shell = "C:/Users/lijin/.cache/codex-runtimes/codex-primary-runtime/dependencies/native/powershell/pwsh.exe";
 const options = { skip: process.platform !== "win32" || !existsSync(shell), timeout: 90_000 };
 
+test("installed dependencies are copied independently, excluded from proposals and checked for mutation", options, async () => {
+  const fixture = createFixture(false), state = path.join(fixture.root, "state"); mkdirSync(state);
+  const folder = path.join(fixture.project, "node_modules/example"); mkdirSync(folder, { recursive: true });
+  const bytes = Buffer.alloc(2 * 1024 * 1024, 65); writeFileSync(path.join(folder, "large-runtime.js"), bytes);
+  const guard = new WindowsFileGuard(shell, fixture.root);
+  const task = await prepareReviewWorkspace(fixture.project, state, guard);
+  try {
+    assert.deepEqual(task.readOnlyDirectories, ["node_modules"]);
+    const copy = path.join(task.workspace, "node_modules/example/large-runtime.js");
+    assert.equal(contentHash(readFileSync(copy)), contentHash(bytes));
+    writeFileSync(path.join(task.workspace, "invoice.mjs"), "// changed source\n");
+    const review = await task.seal(); assert.equal(review.changes.length, 1);
+    assert.deepEqual(review.readOnlyDirectories, ["node_modules"]);
+    assert.equal((await task.apply(review.id, ["invoice.mjs"]))[0]?.status, "applied");
+    assert.equal(contentHash(readFileSync(path.join(folder, "large-runtime.js"))), contentHash(bytes));
+  } finally { task.close(); }
+  const changed = await prepareReviewWorkspace(fixture.project, state, guard);
+  try {
+    writeFileSync(path.join(changed.workspace, "node_modules/example/large-runtime.js"), "mutated");
+    await assert.rejects(changed.seal(), /REVIEW_DEPENDENCY_CHANGED/);
+    assert.equal(contentHash(readFileSync(path.join(folder, "large-runtime.js"))), contentHash(bytes));
+  } finally { changed.close(); fixture.cleanup(); }
+});
+
+test("source and dependency capacity limits refuse before creating an applicable review", options, async () => {
+  const fixture = createFixture(false), state = path.join(fixture.root, "state"); mkdirSync(state);
+  const guard = new WindowsFileGuard(shell, fixture.root), file = path.join(fixture.project, "oversized.txt");
+  try {
+    writeFileSync(file, Buffer.alloc(1024 * 1024 + 1, 65));
+    await assert.rejects(prepareReviewWorkspace(fixture.project, state, guard), /GUARD_TEXT_LIMIT/); unlinkSync(file);
+    const deps = path.join(fixture.project, "node_modules/example"); mkdirSync(deps, { recursive: true });
+    writeFileSync(path.join(deps, "oversized.bin"), Buffer.alloc(16 * 1024 * 1024 + 1));
+    await assert.rejects(prepareReviewWorkspace(fixture.project, state, guard), /GUARD_TEXT_LIMIT/); unlinkSync(path.join(deps, "oversized.bin"));
+    writeFileSync(path.join(deps, ".env"), "SYNTHETIC_DEPENDENCY_SECRET");
+    await assert.rejects(prepareReviewWorkspace(fixture.project, state, guard), /REVIEW_DEPENDENCY_SENSITIVE_CONTENT/);
+  } finally { fixture.cleanup(); }
+});
+
 for (const git of [false, true]) test(`isolated review: original preserved, frozen review applied, conflicts retained (git=${git})`, options, async () => {
   const fixture = createFixture(git), state = path.join(fixture.root, "state"); mkdirSync(state);
   mkdirSync(path.join(fixture.project, ".codex")); writeFileSync(path.join(fixture.project, ".codex/config.toml"), "# synthetic local engine configuration\n");

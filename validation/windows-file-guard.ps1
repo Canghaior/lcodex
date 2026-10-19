@@ -9,6 +9,9 @@ try {
     if ($request.mode -eq 'capture') {
         $value = $guard.Capture([string]$request.root)
         [Console]::WriteLine(($value | ConvertTo-Json -Depth 6 -Compress))
+    } elseif ($request.mode -eq 'dependencies') {
+        $value = $guard.CaptureDependencies([string]$request.root)
+        [Console]::WriteLine(($value | ConvertTo-Json -Depth 6 -Compress))
     } elseif ($request.mode -eq 'apply') {
         $expected = if ($null -eq $request.expected) {$null} else {[string]$request.expected}
         $guard.Prepare([string]$request.root, [string]$request.relative, $expected, $null -eq $request.expected)

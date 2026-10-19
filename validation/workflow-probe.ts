@@ -15,6 +15,7 @@ import { prepareSerialResponse } from "./serial-response.js";
 import { ToolResponseGate } from "./tool-response-gate.js";
 import { createProcessTreeFixture, stopAndReadThread, verifyTreeStopped, waitForProcessTree } from "./workflow-lifecycle.js";
 import { checkRestart } from "./resume-check.js";
+import { prepareResourceFixture, resourceBoundaryCommand } from "./workflow-resources.js";
 import { prepareReviewWorkspace } from "./review-workspace.js";
 import { isObject, JsonLineRpc } from "./rpc.js";
 import { createRunDirectory } from "./run-directory.js";
@@ -57,7 +58,7 @@ function mockBatchWire(items: Record<string, unknown>[]) {
 
 async function main() {
   const [binary, shell, kind, ...flags] = process.argv.slice(2);
-  check(binary && shell && (kind === "bug" || kind === "feature") && flags.every(flag => ["--live", "--serial-batch", "--long-command", "--stop-tree", "--deadline-tree", "--disconnect-after-write", "--resume-continue", "--limit-case=requests", "--limit-case=failures", `--price-reviewed=${PRICE_REVIEW_DATE}`].includes(flag)), "WORKFLOW_ARGUMENTS");
+  check(binary && shell && (kind === "bug" || kind === "feature") && flags.every(flag => ["--live", "--serial-batch", "--long-command", "--stop-tree", "--deadline-tree", "--disconnect-after-write", "--resume-continue", "--resources", "--limit-case=requests", "--limit-case=failures", `--price-reviewed=${PRICE_REVIEW_DATE}`].includes(flag)), "WORKFLOW_ARGUMENTS");
   check(contentHash(readFileSync(binary)) === "dce685d569526ef4712fa82d20ff20e1309baad5fcd34215e1126698f611242f", "WORKFLOW_ENGINE_VERSION");
   const node = realpathSync(process.execPath);
   check(contentHash(readFileSync(node)) === "3a9ac860c566b7aebf144be914f95e3ec36dc88040aa7acb5d9d1e6e0c7afd5e", "WORKFLOW_NODE_VERSION");
@@ -67,6 +68,7 @@ async function main() {
   const treeMode = flags.includes("--stop-tree") ? "stop" : flags.includes("--deadline-tree") ? "deadline" : undefined;
   const disconnected = flags.includes("--disconnect-after-write");
   const resumeContinue = flags.includes("--resume-continue");
+  const resources = flags.includes("--resources");
   const treeDuration = treeMode === "deadline" ? 55_000 : 8_000;
   const limitCase = flags.find(flag => flag.startsWith("--limit-case="))?.slice("--limit-case=".length);
   check(!limitCase || !live, "WORKFLOW_LIMIT_MODE_REFUSED");
@@ -75,6 +77,7 @@ async function main() {
   check(!treeMode && !disconnected || !live && !limitCase && !serialBatch && !longCommand && !(treeMode && disconnected), "WORKFLOW_LIFECYCLE_MODE_REFUSED");
   check(!(flags.includes("--stop-tree") && flags.includes("--deadline-tree")), "WORKFLOW_LIFECYCLE_MODE_REFUSED");
   check(!resumeContinue || !treeMode && !disconnected && !limitCase, "WORKFLOW_CONTINUE_MODE_REFUSED");
+  check(!resources || !live && !treeMode && !disconnected && !limitCase && !serialBatch && !longCommand, "WORKFLOW_RESOURCE_MODE_REFUSED");
   if (live) {
     const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
     check(today === PRICE_REVIEW_DATE && flags.includes(`--price-reviewed=${PRICE_REVIEW_DATE}`), "WORKFLOW_PRICE_REVIEW_REQUIRED");
@@ -86,9 +89,11 @@ async function main() {
   for (const dir of ["home", "profile/roaming", "profile/local/Packages", "temp", "project", "state", "evaluator"]) mkdirSync(path.join(run.root, dir), { recursive: true });
   const original = path.join(run.root, "project"), state = path.join(run.root, "state"), token = randomUUID();
   const prompt = createWorkflowSample(original, kind as SampleKind);
+  const guard = new WindowsFileGuard(shell, run.root);
+  const resourceEvidence = resources ? await prepareResourceFixture(original, guard) : undefined;
   if (treeMode) createProcessTreeFixture(original, treeDuration);
   const originalBefore = snapshot(original);
-  const guard = new WindowsFileGuard(shell, run.root), task = await prepareReviewWorkspace(original, state, guard);
+  const task = await prepareReviewWorkspace(original, state, guard);
   const cwd = task.workspace, policy = projectToolPolicy(cwd, shell, task.rootMarker, task.readOnlyAssets);
   const evaluator = createWorkflowEvaluator(path.join(run.root, "evaluator"), kind as SampleKind);
   const env = { ...isolatedEnvironment(run.root, process.env), LCODEX_WORKFLOW_TOKEN: token };
@@ -102,10 +107,12 @@ async function main() {
   let inFlight = false, requests = 0, activeUpstream: ReturnType<typeof sendBoundedDeepSeek> | undefined;
   const usage: unknown[] = [], toolResults: unknown[] = [], envelopes: unknown[] = [];
   const toolEvents: string[] = [];
+  const itemEvents: { method: string; type: string; id: string; status: unknown; exitCode: unknown }[] = [];
   let batchHistoryMatched = false;
   const toolGate = new ToolResponseGate(limits, abort, { failure: code => { failure = code; terminal(null); },
     completed: result => { toolResults.push(result); }, event: (kind, id) => { toolEvents.push(`${kind}:${id}`); } });
-  const testCommand = `& ${psQuote(node)} ${nodeFlags} --test; exit $LASTEXITCODE`;
+  const testCommand = (resources ? `& ${psQuote(node)} ${nodeFlags} './node_modules/typescript/bin/tsc' --strict --noEmit --skipLibCheck --target ES2022 --module NodeNext --moduleResolution NodeNext './src/dependency-check.ts'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; ` : "") +
+    `& ${psQuote(node)} ${nodeFlags} --test; exit $LASTEXITCODE`;
   const source = readFileSync(path.join(cwd, "src/catalog.mjs"), "utf8");
   const mockCandidate = kind === "bug" ? "export function total(items) { return items.reduce((sum, item) => sum + item.unitCents * item.quantity, 0); }\n"
     : source + "export function findByLabel(items, query) { return items.find(item => normalizeLabel(item.label) === normalizeLabel(query)) ?? null; }\n";
@@ -140,7 +147,7 @@ async function main() {
       } else {
         const item = limitCase ? { id: `mock-item-${requests}`, type: "function_call", name: "exec_command", call_id: `mock-call-${requests}`, status: "completed", arguments: JSON.stringify({ cmd: limitCase === "failures" ? "exit 1" : "Get-Content -LiteralPath './src/catalog.mjs' -Raw", shell, workdir: cwd, login: false, yield_time_ms: 10000, max_output_tokens: 2048 }) }
           : requests === 2 ? { id: "mock-item-2", type: "custom_tool_call", name: "apply_patch", call_id: "mock-call-2", input: patch, status: "completed" }
-          : requests <= 3 ? { id: `mock-item-${requests}`, type: "function_call", name: "exec_command", call_id: `mock-call-${requests}`, status: "completed", arguments: JSON.stringify({ cmd: requests === 1 ? (longCommand ? "Start-Sleep -Seconds 12; " : "") + "Get-Content -LiteralPath './src/catalog.mjs' -Raw" : testCommand, shell, workdir: cwd, login: false, yield_time_ms: 10000, max_output_tokens: 2048 }) }
+          : requests <= 3 ? { id: `mock-item-${requests}`, type: "function_call", name: "exec_command", call_id: `mock-call-${requests}`, status: "completed", arguments: JSON.stringify({ cmd: requests === 1 ? (resourceEvidence ? resourceBoundaryCommand(cwd, resourceEvidence.assetHash) : (longCommand ? "Start-Sleep -Seconds 12; " : "") + "Get-Content -LiteralPath './src/catalog.mjs' -Raw") : testCommand, shell, workdir: cwd, login: false, yield_time_ms: 10000, max_output_tokens: 2048 }) }
           : { id: "mock-final", type: "message", role: "assistant", status: "completed" };
         ({ response, wire } = mockWire(item, requests));
         if (serialBatch && requests === 1) {
@@ -192,6 +199,7 @@ async function main() {
     '[windows]', 'sandbox="mxc"', '[permissions.scoped.filesystem]', '":minimal"="read"', `${psQuote(cwd)}="write"`,
     `${psQuote(original)}="deny"`, `${psQuote(path.join(task.taskDirectory, "private"))}="deny"`, `${psQuote(path.join(cwd, task.rootMarker))}="read"`,
     ...task.readOnlyAssets.map(relative => `${psQuote(path.join(cwd, relative))}="read"`),
+    ...task.readOnlyDirectories.map(relative => `${psQuote(path.join(cwd, relative))}="read"`),
     `${psQuote(path.join(cwd, ".git"))}="deny"`, `${psQuote(path.join(cwd, ".env"))}="deny"`,
     ...[".codex", ".agents"].map(name => `${psQuote(path.join(cwd, name))}="deny"`),
     `${psQuote(evaluator.file)}="read"`, `${psQuote(path.dirname(node))}="read"`, `${psQuote(path.dirname(shell))}="read"`,
@@ -219,6 +227,9 @@ async function main() {
     child.stderr!.resume(); closed = new Promise(resolve => child!.once("close", resolve));
     rpc = new JsonLineRpc(child.stdout!, child.stdin!, 15_000, 1_048_576, (method, params) => {
       if (method === "turn/completed") terminal(params);
+      if (["item/started", "item/completed"].includes(method) && isObject(params) && isObject(params.item)) {
+        const item = params.item; if (itemEvents.length < 64) itemEvents.push({ method, type: String(item.type), id: String(item.id), status: item.status, exitCode: item.exitCode });
+      }
       toolGate.observe(method, params);
     });
     child.on("error", () => { failure = "WORKFLOW_ENGINE_SPAWN"; terminal(null); });
@@ -259,6 +270,7 @@ async function main() {
     check(acceptance.passed === acceptance.total && acceptance.protocolValid, "WORKFLOW_ACCEPTANCE_FAILED");
     check(JSON.stringify(snapshot(original)) === JSON.stringify(originalBefore), "WORKFLOW_ORIGINAL_CHANGED");
     check(contentHash(readFileSync(path.join(cwd, "user-notes.txt"))) === originalBefore["user-notes.txt"], "WORKFLOW_USER_NOTES_CHANGED");
+    if (resources) check(toolResults.length === 3 && toolResults.every(item => isObject(item) && item.passed === true), "WORKFLOW_RESOURCE_BOUNDARY_FAILED");
     result = { status: "passed", turnStatus: done.turn.status };
     }
     }
@@ -324,7 +336,7 @@ async function main() {
       task.close();
     } catch { result = { status: "failed", code: "WORKFLOW_REVIEW_FAILED" }; }
   } else if (exitCode === 0 && mayClean) task.close();
-  const report = { kind: "multi-step-isolated-workflow", sample: kind, realModel: live, limitCase, serialBatch, longCommand, treeMode, disconnected, resumeContinue, continuationHistoryMatched, stopEvidence, treeEvidence, restarted, recoveredLimits, batchHistoryMatched, toolEvents, ...result, baseline, acceptance, reviewedChanges, toolResults, envelopes, requests, usage,
+  const report = { kind: "multi-step-isolated-workflow", sample: kind, realModel: live, limitCase, serialBatch, longCommand, treeMode, disconnected, resumeContinue, resources, resourceEvidence, continuationHistoryMatched, stopEvidence, treeEvidence, restarted, recoveredLimits, batchHistoryMatched, toolEvents, itemEvents, ...result, baseline, acceptance, reviewedChanges, toolResults, envelopes, requests, usage,
     limits: limits.summary(), budget: ledger?.summary(), billVerified: false, exitCode, suppliedFullSource: false, exactPatchRequired: false,
     humanContextAdditions: 0, humanRepairs: 0, humanTakeovers: 0, originalPreserved: JSON.stringify(snapshot(original)) === JSON.stringify(originalBefore) };
   limits.close(); ledger?.close(); key = "";

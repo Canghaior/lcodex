@@ -4,7 +4,7 @@
 
 本项目开发接入 DeepSeek 的本地桌面编程助手。开始工作前阅读 `docs/DEVELOPMENT_PLAN.md` 和 `docs/PROGRESS.md`，按当前阶段执行。用户最新明确指示优先；必要时同步更新方案和执行记录。
 
-用户已确认 TypeScript、React、CSS、Electron 技术栈与应用分层，遵守 `docs/ARCHITECTURE.md`。Codex app-server 仍需 P1 验证，不把技术栈确认当作兼容性通过。
+用户已确认 TypeScript、React、CSS、Electron 技术栈与应用分层，遵守 `docs/ARCHITECTURE.md`。P1 已在用户确认的 D05 小型单包 JS/TS 范围内通过，依据见 `docs/validation/P1_GATE_REVIEW.md`；进入 P2 后仍须验证集成行为，不把技术栈确认或界面可启动当作功能通过。
 
 ## 控制范围
 
