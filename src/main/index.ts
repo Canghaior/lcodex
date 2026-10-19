@@ -7,6 +7,9 @@ import { validCommand, type AppState, type Reply } from "../shared/contracts.js"
 import { AppStore } from "./storage/store.js";
 import { inspectProject, newChat, previewFile } from "./projects/projects.js";
 import { WindowsFileGuard } from "../../validation/windows-file-guard.js";
+import { BudgetLedger } from "../../validation/budget.js";
+import { Credentials } from "./storage/credentials.js";
+import { Tasks } from "./engine/tasks.js";
 
 const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 const testRoot = !app.isPackaged ? process.env.LCODEX_DESKTOP_TEST_ROOT : undefined;
@@ -30,9 +33,16 @@ async function main() {
   const store = new AppStore(dataRoot);
   const runtime = { engine: matches(engine, "dce685d569526ef4712fa82d20ff20e1309baad5fcd34215e1126698f611242f"),
     shell: matches(shell, "362a356ce7f0940ec74f73a8fc2c990a2cc24a38a11c90bbd8eca947110ad139"),
-    node: matches(node, "3a9ac860c566b7aeb144be914f95e3ec36dc88040aa7acb5d9d1e6e0c7afd5e"), key: false, ready: false, platform: "Windows · MXC" };
+    node: matches(node, "3a9ac860c566b7aebf144be914f95e3ec36dc88040aa7acb5d9d1e6e0c7afd5e"), key: false, ready: false, platform: "Windows · MXC" };
   const guard = runtime.shell ? new WindowsFileGuard(shell, dataRoot, path.join(sourceRoot, "validation")) : undefined;
-  const state = (): AppState => store.state({ runtime, budget: { committed: 0, unknown: 0, limit: 10 }, executionAvailable: false });
+  const credentials = new Credentials(dataRoot);
+  const ledgerFile = testRoot && process.env.LCODEX_LIVE_TEST !== "1" ? path.join(testRoot, "test-budget.jsonl") : path.join(sourceRoot, ".local/state/p1-budget.jsonl");
+  if (testRoot && process.env.LCODEX_LIVE_TEST !== "1" && !existsSync(ledgerFile)) BudgetLedger.initialize(ledgerFile);
+  let tasks: Tasks | undefined;
+  const state = (): AppState => {
+    runtime.key = credentials.present(); runtime.ready = runtime.engine && runtime.shell && runtime.node && runtime.key && !tasks?.budgetError;
+    return store.state({ runtime, budget: tasks?.budget() ?? { committed: 0, unknown: 0, limit: 10 }, executionAvailable: !!tasks });
+  };
   const rendererRoot = realpathSync(path.join(sourceRoot, "dist/renderer"));
   protocol.handle("lcodex", request => {
     const url = new URL(request.url);
@@ -56,6 +66,19 @@ async function main() {
   win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   win.webContents.on("will-navigate", event => event.preventDefault());
   win.webContents.on("will-attach-webview", event => event.preventDefault());
+  if (guard && runtime.engine && runtime.node) tasks = new Tasks({ root: dataRoot, engine, shell, node, ledgerFile, guard, credentials, store,
+    notify: () => { if (!win.isDestroyed()) win.webContents.send("lcodex:state", state()); } });
+  let closePending = false;
+  win.on("close", event => {
+    if (tasks?.busy()) {
+      event.preventDefault();
+      if (!closePending) { closePending = true; void tasks.stopAll().then(() => {
+        closePending = false;
+        if (store.chats.some(chat => chat.execution === "reconcile")) dialog.showMessageBox(win, { type: "warning", title: "任务需要核对", message: "未能确认最后一次操作的完整结果。记录已保留，请查看任务状态后再关闭。", buttons: ["保留窗口"] });
+        else win.close();
+      }).catch(() => { closePending = false; }); }
+    }
+  });
   let choosing = false;
   ipcMain.handle("lcodex:request", async (event, command: unknown): Promise<Reply> => {
     if (event.sender !== win.webContents || event.senderFrame !== win.webContents.mainFrame || event.senderFrame?.url !== "lcodex://app/index.html" || !validCommand(command)) return { ok: false, code: "IPC_REFUSED" };
@@ -89,6 +112,21 @@ async function main() {
         const project = store.projects.find(project => project.id === command.projectId);
         if (!project || !guard) throw new Error("PROJECT_UNAVAILABLE");
         return { ok: true, state: state(), file: await previewFile(project, command.relative, guard) };
+      } else if (command.type === "set-key" || command.type === "delete-key") {
+        if (tasks?.busy()) throw new Error("TASK_ALREADY_RUNNING");
+        if (command.type === "set-key") await credentials.save(command.key); else credentials.remove();
+      } else if (command.type === "set-test-command") {
+        if (tasks?.busy()) throw new Error("TASK_ALREADY_RUNNING");
+        const project = store.projects.find(project => project.id === command.projectId); if (!project) throw new Error("PROJECT_NOT_FOUND");
+        project.testCommand = command.command.trim(); store.save();
+      } else if (["send", "stop", "apply", "discard"].includes(command.type)) {
+        if (!("chatId" in command) || !tasks) throw new Error("RUNTIME_UNAVAILABLE");
+        const chat = store.chats.find(chat => chat.id === command.chatId); if (!chat) throw new Error("CHAT_NOT_FOUND");
+        const project = store.projects.find(project => project.id === chat.projectId); if (!project) throw new Error("PROJECT_NOT_FOUND");
+        if (command.type === "send") await tasks.start(chat, project, command.text);
+        if (command.type === "stop") tasks.stop(chat.id);
+        if (command.type === "apply") await tasks.apply(chat, command.reviewId, command.files);
+        if (command.type === "discard") tasks.discard(chat, command.reviewId);
       } else if (command.type === "window") {
         if (command.action === "minimize") win.minimize();
         if (command.action === "maximize") win.isMaximized() ? win.unmaximize() : win.maximize();

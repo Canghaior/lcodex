@@ -15,7 +15,7 @@ export class AppStore {
       const data = JSON.parse(readFileSync(file, "utf8")) as Stored;
       if (data.version !== 1 || !Array.isArray(data.projects) || !Array.isArray(data.chats)) throw new Error("STORAGE_INVALID");
       this.value = data;
-      for (const chat of data.chats) if (["running", "waiting", "stopping"].includes(chat.execution)) { chat.execution = "reconcile"; chat.error = "TASK_RECONCILE_REQUIRED"; }
+      for (const chat of data.chats) if (["running", "waiting", "stopping"].includes(chat.execution) || chat.changes.some(change => change.status === "pending")) { chat.execution = "reconcile"; chat.error = "TASK_RECONCILE_REQUIRED"; }
     }
   }
   get projects() { return this.value.projects; }

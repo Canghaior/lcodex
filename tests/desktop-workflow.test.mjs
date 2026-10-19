@@ -1,0 +1,104 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+import { _electron } from "playwright-core";
+import electronPath from "electron";
+import { createRunDirectory } from "../dist/validation/run-directory.js";
+
+const key = "sk-synthetic-desktop-not-a-real-credential";
+const source = "export function total(items) { return items.reduce((sum, item) => sum + item.unitCents, 0); }\n";
+const command = "& 'C:/nvm4w/nodejs/node.exe' --preserve-symlinks --preserve-symlinks-main --test; exit $LASTEXITCODE";
+async function waitTask(page) {
+  const deadline = Date.now() + 90_000;
+  while (Date.now() < deadline) {
+    const reply = await page.evaluate(() => window.lcodex.request({ type: "snapshot" }));
+    const chat = reply.state.chats.find(chat => chat.id === reply.state.activeChatId);
+    if (["ended", "failed", "stopped", "reconcile"].includes(chat.execution)) return;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  throw new Error("DESKTOP_TASK_TIMEOUT");
+}
+function fixture(directory) {
+  mkdirSync(directory); mkdirSync(path.join(directory, "test"));
+  writeFileSync(path.join(directory, "catalog.mjs"), source);
+  writeFileSync(path.join(directory, "package.json"), '{"name":"desktop-fixture","type":"module","private":true}');
+  writeFileSync(path.join(directory, "test/catalog.test.mjs"), "import test from 'node:test'; import assert from 'node:assert/strict'; import {total} from '../catalog.mjs'; test('quantity',()=>assert.equal(total([{unitCents:25,quantity:4}]),100));\n");
+  writeFileSync(path.join(directory, ".env"), "SYNTHETIC_PRIVATE_FIXTURE\n");
+}
+test("desktop real MXC tools: encrypted key, read-only mode, frozen review, application and conflict protection", { timeout: 240_000 }, async () => {
+  const run = createRunDirectory("desktop workflow 中文"), project = path.join(run.root, "catalog project"), conflictProject = path.join(run.root, "conflict project");
+  fixture(project); fixture(conflictProject); mkdirSync(path.join(run.root, "temp"));
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => ["PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "APPDATA", "LOCALAPPDATA"].includes(key.toUpperCase())));
+  Object.assign(env, { LCODEX_DESKTOP_TEST_ROOT: run.root, TEMP: path.join(run.root, "temp"), TMP: path.join(run.root, "temp") });
+  let app, clean = false;
+  try {
+    app = await _electron.launch({ executablePath: electronPath, args: ["."], cwd: path.resolve("."), env });
+    const page = await app.firstWindow();
+    await page.getByRole("heading", { name: "从一个本地项目开始" }).waitFor();
+    await app.evaluate((_electron, source) => { (0, eval)(source); }, readFileSync(path.resolve("tests/mock-model.mjs"), "utf8"));
+    await app.evaluate(({ dialog }, directory) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [directory] }); }, project);
+    await page.getByRole("button", { name: "选择项目", exact: true }).click();
+    await page.getByRole("heading", { name: "一起构建 catalog project" }).waitFor();
+    await page.getByRole("button", { name: "设置", exact: true }).click();
+    await page.getByLabel("DeepSeek API Key", { exact: true }).fill(key);
+    await page.getByRole("button", { name: "保存密钥", exact: true }).click();
+    await page.getByText("密钥已加密保存", { exact: true }).waitFor();
+    assert.equal(await page.getByLabel("DeepSeek API Key", { exact: true }).inputValue(), "");
+    assert.equal(readFileSync(path.join(run.root, "desktop/deepseek.bin")).includes(Buffer.from(key)), false);
+    const snapshot = await page.evaluate(() => window.lcodex.request({ type: "snapshot" }));
+    assert.equal(JSON.stringify(snapshot).includes(key), false);
+    assert.equal(snapshot.state.runtime.ready, true, JSON.stringify(snapshot.state.runtime));
+    await page.getByRole("button", { name: "关闭设置", exact: true }).click();
+    await page.getByRole("textbox", { name: "输入任务" }).fill("只读分析这个项目（模拟模型联测）");
+    await page.getByRole("button", { name: "发送任务", exact: true }).click();
+    await waitTask(page);
+    let current = await page.evaluate(() => { return window.lcodex.request({ type: "snapshot" }); });
+    let chat = current.state.chats.find(chat => chat.id === current.state.activeChatId);
+    assert.equal(chat.execution, "ended", JSON.stringify({ execution: chat.execution, code: chat.error, tools: chat.tools.map(tool => ({ status: tool.status, output: tool.output })) }));
+    assert.match(chat.tools[0].output, /READ_ONLY_DENIED/); assert.equal(chat.changes.length, 0);
+    assert.equal(readFileSync(path.join(project, "catalog.mjs"), "utf8"), source);
+    assert.equal(existsSync(path.join(project, "read-only-marker.txt")), false);
+    await page.getByRole("button", { name: "在 catalog project 中新建聊天" }).click();
+    await page.getByRole("combobox", { name: "任务方式" }).selectOption("write");
+    await page.getByRole("button", { name: "设置", exact: true }).click();
+    await page.getByLabel("验证命令（可选）", { exact: true }).fill(command);
+    await page.getByRole("button", { name: "保存验证命令", exact: true }).click();
+    await page.getByRole("button", { name: "关闭设置", exact: true }).click();
+    await page.getByRole("textbox", { name: "输入任务" }).fill("修复 total 的数量计算，并运行验证（模拟模型联测）");
+    await page.getByRole("button", { name: "发送任务", exact: true }).click();
+    await waitTask(page);
+    current = await page.evaluate(() => window.lcodex.request({ type: "snapshot" })); chat = current.state.chats.find(chat => chat.id === current.state.activeChatId);
+    assert.equal(chat.execution, "ended", JSON.stringify({ execution: chat.execution, error: chat.error, tools: chat.tools }));
+    assert.equal(chat.changes.length, 1); assert.equal(chat.baselineExit, 1); assert.equal(chat.verification, "passed");
+    assert.equal(readFileSync(path.join(project, "catalog.mjs"), "utf8"), source);
+    await page.getByRole("button", { name: /^改动/ }).click();
+    await page.getByText("1 个待应用文件", { exact: true }).waitFor();
+    await page.screenshot({ path: path.resolve(".local/reports/desktop-review.png") });
+    await page.getByRole("button", { name: "应用全部", exact: true }).click();
+    await page.getByText("已应用", { exact: true }).waitFor();
+    assert.match(readFileSync(path.join(project, "catalog.mjs"), "utf8"), /item\.unitCents \* item\.quantity/);
+    const independent = await import(pathToFileURL(path.join(project, "catalog.mjs")).href);
+    assert.equal(independent.total([{ unitCents: 7, quantity: 3 }, { unitCents: 2, quantity: 0 }]), 21);
+    await app.evaluate(({ dialog }, directory) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [directory] }); }, conflictProject);
+    await page.getByRole("button", { name: "添加项目", exact: true }).click();
+    await page.getByRole("heading", { name: "一起构建 conflict project" }).waitFor();
+    await page.getByRole("combobox", { name: "任务方式" }).selectOption("write");
+    await page.getByRole("textbox", { name: "输入任务" }).fill("修复 total（冲突保护联测）");
+    await page.getByRole("button", { name: "发送任务", exact: true }).click();
+    await waitTask(page);
+    current = await page.evaluate(() => window.lcodex.request({ type: "snapshot" })); chat = current.state.chats.find(chat => chat.id === current.state.activeChatId);
+    assert.equal(chat.execution, "ended", chat.error ?? "unexpected");
+    assert.equal(chat.verification, "unverified", "Unconfigured command must not become a passed validation status");
+    writeFileSync(path.join(conflictProject, "catalog.mjs"), source + "// concurrent user edit\n");
+    await page.getByRole("button", { name: "应用全部", exact: true }).click();
+    await page.getByText("冲突 · 未覆盖", { exact: true }).waitFor();
+    assert.equal(readFileSync(path.join(conflictProject, "catalog.mjs"), "utf8"), source + "// concurrent user edit\n");
+    clean = true;
+  } finally {
+    if (app) await app.close();
+    // Failed native runs retain the minimum evidence until inspected and stopped.
+    if (clean) run.cleanup(); else console.log("Retained generated desktop workflow for diagnosis:", path.basename(run.root));
+  }
+});

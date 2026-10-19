@@ -49,7 +49,7 @@ test("Electron project selection, protected preview, layout, IPC isolation and p
     await page.locator(".chat-row").first().click();
     assert.equal(await page.getByRole("textbox", { name: "输入任务" }).inputValue(), "解释这个项目的结构，先不要修改文件。");
     assert.equal(await page.getByRole("combobox", { name: "任务方式" }).inputValue(), "write");
-    assert.equal(await page.getByRole("button", { name: "发送任务", exact: true }).isDisabled(), true);
+    assert.equal(reply.state.runtime.key, false);
     const beforeWidth = (await page.locator(".chat-panel").boundingBox()).width;
     await page.getByRole("separator").focus(); await page.keyboard.press("ArrowRight");
     assert.ok((await page.locator(".chat-panel").boundingBox()).width > beforeWidth);
