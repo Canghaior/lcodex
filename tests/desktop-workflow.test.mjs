@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url";
 import { _electron } from "playwright-core";
 import electronPath from "electron";
 import { createRunDirectory } from "../dist/validation/run-directory.js";
+import { stopAndCloseDesktop } from "./desktop-helpers.mjs";
 
 const key = "sk-synthetic-desktop-not-a-real-credential";
 const source = "export function total(items) { return items.reduce((sum, item) => sum + item.unitCents, 0); }\n";
@@ -147,9 +148,25 @@ test("desktop real MXC tools: encrypted key, read-only mode, frozen review, appl
     await page.getByRole("button", { name: "应用全部", exact: true }).click();
     await page.getByText("冲突 · 未覆盖", { exact: true }).waitFor();
     assert.equal(readFileSync(path.join(conflictProject, "catalog.mjs"), "utf8"), source + "// concurrent user edit\n");
+    const plainProject = path.join(run.root, "unsupported plain project"); mkdirSync(plainProject); writeFileSync(path.join(plainProject, "README.md"), "Preserve this original file\n");
+    const budgetBeforePreflight = readFileSync(path.join(run.root, "test-budget.jsonl"), "utf8");
+    await app.evaluate(({ dialog }, directory) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [directory] }); }, plainProject);
+    await page.getByRole("button", { name: "添加项目", exact: true }).click();
+    await page.getByRole("heading", { name: "一起构建 unsupported plain project" }).waitFor();
+    await page.getByRole("combobox", { name: "任务方式" }).selectOption("write");
+    await page.getByRole("textbox", { name: "输入任务" }).fill("验证不支持的项目在启动引擎前被拒绝。");
+    await page.getByRole("button", { name: "发送任务", exact: true }).click(); await waitTask(page);
+    const refused = await page.evaluate(() => window.lcodex.request({ type: "snapshot" })), refusedChat = refused.state.chats.find(item => item.id === refused.state.activeChatId);
+    assert.equal(refusedChat.execution, "failed"); assert.equal(refusedChat.error, "PROJECT_SCOPE_UNSUPPORTED");
+    assert.equal(JSON.parse(readFileSync(path.join(run.root, "desktop/tasks", refusedChat.id, "outcome.json"), "utf8")).started, false);
+    assert.equal(readFileSync(path.join(run.root, "test-budget.jsonl"), "utf8"), budgetBeforePreflight);
+    await page.getByRole("button", { name: "删除聊天", exact: true }).click();
+    await page.getByRole("button", { name: "删除聊天和副本", exact: true }).click();
+    await page.getByRole("dialog", { name: "删除聊天", exact: true }).waitFor({ state: "hidden" });
+    assert.equal(readFileSync(path.join(plainProject, "README.md"), "utf8"), "Preserve this original file\n");
     clean = true;
   } finally {
-    if (app) await app.close();
+    await stopAndCloseDesktop(app);
     // Failed native runs retain the minimum evidence until inspected and stopped.
     if (clean) run.cleanup(); else console.log("Retained generated desktop workflow for diagnosis:", path.basename(run.root));
   }

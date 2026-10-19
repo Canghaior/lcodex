@@ -124,7 +124,7 @@ export function restoreReviewWorkspace(project: string, state: string, taskDirec
     }
     if (record.type === "result") { completed.add(record.relative); outcomes.push({ relative: record.relative, status: record.status }); }
   }
-  const lock = acquireProjectWriteLock(storage, root);
+  const lock = acquireProjectWriteLock(storage, root, taskId);
   try {
     if (lock.projectId !== baseline.projectId) throw new Error("REVIEW_PROJECT_CHANGED");
     // Consume handoff only after exclusively acquiring the project. If this
@@ -147,8 +147,7 @@ export async function prepareReviewWorkspace(project: string, state: string, gua
   if (!relativeStorage.startsWith(".." + path.sep) && relativeStorage !== ".." && !path.isAbsolute(relativeStorage)) throw new Error("REVIEW_STORAGE_INSIDE_PROJECT");
   const disk = statfsSync(storage);
   if (disk.bavail * disk.bsize < 5 * 1024 ** 3) throw new Error("REVIEW_DISK_LOW");
-  const lock = acquireProjectWriteLock(storage, root);
-  const taskId = randomUUID(), taskDirectory = path.join(storage, taskId);
+  const taskId = randomUUID(), lock = acquireProjectWriteLock(storage, root, taskId), taskDirectory = path.join(storage, taskId);
   const lifecycle: Lifecycle = { active: true, unresolved: false, sealing: false };
   let sealed: Review | undefined;
   let frozen = new Map<string, Buffer>();

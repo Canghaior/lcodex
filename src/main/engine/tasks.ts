@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { BudgetLedger } from "../../../validation/budget.js";
@@ -14,6 +14,7 @@ import { PRICE_REVIEW_DATE, sendBoundedDeepSeek } from "../../../validation/deep
 import { readPrivate, writePrivate } from "../../../validation/private-files.js";
 import { verifyCompletedHistory } from "./history.js";
 import { finishChatDeletion, performChatDeletion, prepareChatDeletion } from "../storage/deletion.js";
+import { abandonStoppedIsolatedWorkspace, assertNeverApplied } from "../../../validation/abandon-isolated.js";
 
 type Workspace = Awaited<ReturnType<typeof prepareReviewWorkspace>>;
 type ReviewEntry = { task: Workspace; review: Review; applying: boolean };
@@ -21,6 +22,7 @@ type Options = { engine: string; shell: string; node: string; root: string; ledg
 export class Tasks {
   private active: { chatId: string; abort: AbortController; done: Promise<void> } | undefined;
   private reviews = new Map<string, ReviewEntry>();
+  private unapplied = new Map<string, Workspace>();
   private ledger: BudgetLedger | undefined;
   private connectionAbort: AbortController | undefined;
   private reconciling = false;
@@ -92,17 +94,17 @@ export class Tasks {
       mkdirSync(root, { recursive: true }); mkdirSync(state, { recursive: true });
       task = await prepareReviewWorkspace(project.path, state, this.options.guard);
       const prepared = task;
+      const taskRecord = JSON.stringify({ chatId: chat.id, projectId: project.id, taskDirectory: task.taskDirectory, runRoot: root, previousTurnId: resume?.turnId ?? null, mode: chat.mode, state: "prepared" });
+      writeFileSync(path.join(root, "task.json"), taskRecord, { flag: "wx" }); writePrivate(chatRoot, "task.json", taskRecord);
       if (chat.mode === "write") {
         const captured = JSON.parse(readFileSync(path.join(task.taskDirectory, "private/baseline.json"), "utf8"));
         const manifest = captured.files.find((file: { relative: string }) => file.relative === "package.json");
         if (!manifest || JSON.parse(Buffer.from(manifest.base64, "base64").toString("utf8")).workspaces) throw new Error("PROJECT_SCOPE_UNSUPPORTED");
       }
-      const taskRecord = JSON.stringify({ chatId: chat.id, projectId: project.id, taskDirectory: task.taskDirectory, runRoot: root, mode: chat.mode, state: "prepared" });
-      writeFileSync(path.join(root, "task.json"), taskRecord, { flag: "wx" }); writePrivate(chatRoot, "task.json", taskRecord);
       if (abort.signal.aborted) throw new Error("TASK_USER_STOP");
-      processKnownEnded = false;
       const result = await executeSession({ ...this.options, root, historyHome: path.join(chatRoot, "home"), ...(resume ? { resume } : {}), workspace: task.workspace, privateDir: path.join(task.taskDirectory, "private"), original: project.path,
         rootMarker: task.rootMarker, readOnlyAssets: task.readOnlyAssets, readOnlyDirectories: task.readOnlyDirectories, mode: chat.mode, prompt, testCommand: project.testCommand ?? "", key, ledger: this.ledger!, signal: abort.signal,
+        onProcessStarted: () => { processKnownEnded = false; },
         onIdentity: (threadId, turnId) => { const bytes = JSON.stringify({ threadId, turnId }); writeFileSync(path.join(root, "identity.json"), bytes, { flag: "wx" }); writePrivate(chatRoot, "identity.json", bytes); },
         onEvent: (method, params) => {
           if (!isObject(params)) return;
@@ -164,8 +166,15 @@ export class Tasks {
       // A normal, fully ended failure may release its lock; any unknown process or
       // operation deliberately retains the lock and its durable baseline.
       if (task && processKnownEnded && finalExecution !== "reconcile" && !this.reviews.has(chat.id)) {
-        try { task.close(); } catch { finalExecution = "reconcile"; chat.error = "REVIEW_RECONCILE_REQUIRED"; }
+        try {
+          if (!existsSync(path.join(root, "outcome.json"))) {
+            const stoppedBeforeLaunch = JSON.stringify({ status: "failed", code: chat.error, threadId: null, turnId: null, cleanExit: true, requests: 0, started: false });
+            writePrivate(root, "outcome.json", stoppedBeforeLaunch); writePrivate(chatRoot, "outcome.json", stoppedBeforeLaunch);
+          }
+          task.close();
+        } catch { finalExecution = "reconcile"; chat.error = "REVIEW_RECONCILE_REQUIRED"; }
       }
+      if (task && processKnownEnded && finalExecution === "reconcile" && !this.reviews.has(chat.id)) this.unapplied.set(chat.id, task);
       if (this.ledger) { this.recordBudget(this.ledger); this.ledger.close(); this.ledger = undefined; }
       key = "";
       chat.execution = finalExecution;
@@ -219,6 +228,34 @@ export class Tasks {
       await performChatDeletion(this.options.root, chat.id);
       this.options.store.forget(chat.id); finishChatDeletion(this.options.root, chat.id);
       this.options.notify();
+    } finally { this.reconciling = false; }
+  }
+  async abandonIsolated(chat: Chat, project: Project) {
+    if (this.busy() || this.reviews.has(chat.id) || chat.execution !== "reconcile" || chat.reviewId || chat.changes.length) throw new Error("TASK_ABANDON_RECONCILE_REQUIRED");
+    this.reconciling = true;
+    try {
+      const chatRoot = path.join(this.options.root, "tasks", chat.id);
+      const task = JSON.parse(readPrivate(chatRoot, "task.json")), outcome = JSON.parse(readPrivate(chatRoot, "outcome.json"));
+      if (task.chatId !== chat.id || task.projectId !== project.id || outcome.cleanExit !== true ||
+        typeof outcome.threadId !== "string" || !(typeof outcome.turnId === "string" || outcome.turnId === null && outcome.requests === 0) ||
+        path.dirname(task.runRoot).toLowerCase() !== path.join(chatRoot, "turns").toLowerCase()) throw new Error("TASK_ABANDON_RECONCILE_REQUIRED");
+      if (outcome.turnId !== null) {
+        const identity = JSON.parse(readPrivate(task.runRoot, "identity.json"));
+        if (identity.threadId !== outcome.threadId || identity.turnId !== outcome.turnId) throw new Error("TASK_ABANDON_RECONCILE_REQUIRED");
+      }
+      const taskId = path.basename(task.taskDirectory);
+      if (!/^[a-f0-9-]{36}$/.test(taskId) || path.resolve(task.taskDirectory).toLowerCase() !== path.join(this.options.root, "reviews", taskId).toLowerCase()) throw new Error("REVIEW_STORAGE_INVALID");
+      const evidence = assertNeverApplied(task.taskDirectory);
+      const expectedTurn = outcome.turnId ?? (typeof task.previousTurnId === "string" ? task.previousTurnId : null);
+      const terminal = await verifyCompletedHistory(this.options.engine, task.runRoot, path.join(chatRoot, "home"), outcome.threadId, expectedTurn, true);
+      writePrivate(task.runRoot, "abandoned.json", JSON.stringify({ taskId, threadId: outcome.threadId, turnId: outcome.turnId, terminal, reason: "explicit-user-abandonment" }));
+      const held = this.unapplied.get(chat.id);
+      if (held) {
+        const baseline = JSON.parse(readPrivate(task.taskDirectory, "private/baseline.json", 24 * 1024 * 1024));
+        writePrivate(task.taskDirectory, "private/abandoned.json", JSON.stringify({ taskId, projectId: baseline.projectId, journalHash: contentHash(evidence.journal), reason: "explicit-user-abandonment" }));
+        held.close(); this.unapplied.delete(chat.id);
+      } else await abandonStoppedIsolatedWorkspace(project.path, path.join(this.options.root, "reviews"), task.taskDirectory, this.options.guard);
+      chat.execution = "stopped"; chat.verification = "unverified"; chat.error = "TASK_ISOLATED_ABANDONED"; this.publish();
     } finally { this.reconciling = false; }
   }
   async stopAll() {

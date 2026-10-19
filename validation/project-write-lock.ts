@@ -4,7 +4,8 @@ import path from "node:path";
 
 // Coordinates trusted clients. It does not prevent an editor or arbitrary shell
 // from changing project files and is not a replacement for filesystem isolation.
-export function acquireProjectWriteLock(stateDirectory: string, projectDirectory: string) {
+export function acquireProjectWriteLock(stateDirectory: string, projectDirectory: string, ownerTaskId?: string) {
+  if (ownerTaskId !== undefined && !/^[a-f0-9-]{36}$/.test(ownerTaskId)) throw new Error("PROJECT_LOCK_OWNER_INVALID");
   const state = path.resolve(stateDirectory);
   const parsed = path.parse(state);
   let ancestor = parsed.root;
@@ -18,7 +19,7 @@ export function acquireProjectWriteLock(stateDirectory: string, projectDirectory
   const normalized = process.platform === "win32" ? canonical.toLowerCase() : canonical;
   const projectId = createHash("sha256").update(normalized).digest("hex");
   const lockFile = path.join(state, projectId + ".lock");
-  const contents = JSON.stringify({ version: 1, projectId, pid: process.pid, token: randomUUID(), createdAt: new Date().toISOString() });
+  const contents = JSON.stringify({ version: 1, projectId, pid: process.pid, token: randomUUID(), createdAt: new Date().toISOString(), ...(ownerTaskId ? { ownerTaskId } : {}) });
   let fd: number;
   try { fd = openSync(lockFile, "wx", 0o600); }
   catch (error) {

@@ -6,7 +6,7 @@ import { isolatedEnvironment } from "../../../validation/isolated-env.js";
 
 // Read the engine's own persisted state. No model credential, turn/start, shell
 // API or original-project write is available in this reconciliation operation.
-export async function verifyCompletedHistory(engine: string, root: string, home: string, threadId: string, turnId: string) {
+export async function verifyCompletedHistory(engine: string, root: string, home: string, threadId: string, turnId: string | null, allowInterrupted = false) {
   let requests = 0, replay = false;
   const gateway = createServer((_request, response) => { requests++; response.writeHead(403); response.end(); });
   await new Promise<void>((resolve, reject) => { gateway.once("error", reject); gateway.listen(0, "127.0.0.1", resolve); });
@@ -20,13 +20,17 @@ export async function verifyCompletedHistory(engine: string, root: string, home:
     if (["turn/started", "item/started", "item/commandExecution/outputDelta"].includes(method)) replay = true;
   }, true);
   child.once("error", () => rpc.abort(new Error("ENGINE_HISTORY_START_FAILED")));
-  let matched = false, exit: number | null | undefined;
+  let matched = false, exit: number | null | undefined, lastStatus = "";
   try {
     await rpc.request("initialize", { clientInfo: { name: "lcodex_history", version: "0.1.0" } }); rpc.notify("initialized", {});
     const history = await rpc.request("thread/read", { threadId, includeTurns: true });
     const thread = isObject(history) && isObject(history.thread) ? history.thread : undefined;
     const last = thread && Array.isArray(thread.turns) ? thread.turns.at(-1) : undefined;
-    matched = thread?.id === threadId && isObject(last) && last.id === turnId && last.status === "completed";
+    lastStatus = isObject(last) && typeof last.status === "string" ? last.status : "";
+    if (turnId === null && allowInterrupted && thread?.id === threadId && Array.isArray(thread.turns) && thread.turns.length === 0) { matched = true; lastStatus = "not-started"; }
+    else matched = thread?.id === threadId && isObject(last) && last.id === turnId && (lastStatus === "completed" || allowInterrupted && ["interrupted", "failed"].includes(lastStatus));
+  } catch {
+    throw new Error("ENGINE_HISTORY_UNAVAILABLE");
   } finally {
     rpc.abort(new Error("ENGINE_HISTORY_CLOSED")); child.stdin.end();
     const wait = async (ms: number) => {
@@ -39,4 +43,5 @@ export async function verifyCompletedHistory(engine: string, root: string, home:
     gateway.closeAllConnections(); await new Promise<void>(resolve => gateway.close(() => resolve()));
   }
   if (!matched || requests || replay || exit !== 0 || rpc.deniedServerRequests) throw new Error("ENGINE_HISTORY_MISMATCH");
+  return lastStatus;
 }

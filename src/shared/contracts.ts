@@ -24,6 +24,7 @@ export type Command =
   | { type: "stop"; chatId: string }
   | { type: "reopen-review"; chatId: string }
   | { type: "delete-chat"; chatId: string }
+  | { type: "abandon-isolated"; chatId: string }
   | { type: "apply"; chatId: string; reviewId: string; files: string[] }
   | { type: "discard"; chatId: string; reviewId: string }
   | { type: "window"; action: "minimize" | "maximize" | "close" };
@@ -40,7 +41,7 @@ export function validCommand(value: unknown): value is Command {
     case "set-key": return exact("type", "key") && typeof data.key === "string" && /^sk-[A-Za-z0-9_-]{16,200}$/.test(data.key);
     case "set-test-command": return exact("type", "projectId", "command") && id(data.projectId) && typeof data.command === "string" && data.command.length <= 2048 && !data.command.includes("\0");
     case "send": return exact("type", "chatId", "text") && id(data.chatId) && typeof data.text === "string" && data.text.trim().length > 0 && data.text.length <= 8000 && !data.text.includes("\0");
-    case "stop": case "reopen-review": case "delete-chat": return exact("type", "chatId") && id(data.chatId);
+    case "stop": case "reopen-review": case "delete-chat": case "abandon-isolated": return exact("type", "chatId") && id(data.chatId);
     case "apply": return exact("type", "chatId", "reviewId", "files") && id(data.chatId) && typeof data.reviewId === "string" && /^[a-f0-9]{64}$/.test(data.reviewId) && Array.isArray(data.files) && data.files.length > 0 && data.files.length <= 1024 && data.files.every(file => typeof file === "string" && file.length < 512);
     case "discard": return exact("type", "chatId", "reviewId") && id(data.chatId) && typeof data.reviewId === "string" && /^[a-f0-9]{64}$/.test(data.reviewId);
     case "new-chat": return exact("type", "projectId") && id(data.projectId);

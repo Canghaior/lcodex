@@ -32,7 +32,7 @@ export function prepareChatDeletion(root: string, chat: Chat): string {
   if (!uuid.test(chat.id) || !uuid.test(chat.projectId)) throw new Error("CHAT_DELETE_REFUSED");
   const record = `deletions/${chat.id}.json`;
   if (existsSync(path.join(root, record))) { if (readDeletion(root, chat.id).projectId !== chat.projectId) throw new Error("CHAT_DELETE_OWNERSHIP_CHANGED"); return record; }
-  if (!["idle", "ended"].includes(chat.execution) || chat.changes.some(change => ["pending", "needs-reconcile"].includes(change.status))) throw new Error("CHAT_DELETE_REFUSED");
+  if (!["idle", "ended", "stopped", "failed"].includes(chat.execution) || chat.changes.some(change => ["pending", "needs-reconcile"].includes(change.status))) throw new Error("CHAT_DELETE_REFUSED");
   const relatives = new Set<string>(), taskRoot = directory(root, `tasks/${chat.id}`);
   if (existsSync(taskRoot)) {
     inspectTree(taskRoot);
@@ -43,9 +43,14 @@ export function prepareChatDeletion(root: string, chat: Chat): string {
     for (const prefix of records) {
       const location = prefix ? turnsRoot : taskRoot;
       const task = JSON.parse(readPrivate(location, `${prefix}task.json`)), outcome = JSON.parse(readPrivate(location, `${prefix}outcome.json`));
-      if (task.chatId !== chat.id || task.projectId !== chat.projectId || outcome.cleanExit !== true || outcome.status !== "completed") throw new Error("CHAT_DELETE_REFUSED");
+      if (task.chatId !== chat.id || task.projectId !== chat.projectId || outcome.cleanExit !== true) throw new Error("CHAT_DELETE_REFUSED");
       const taskId = path.basename(task.taskDirectory), relative = `reviews/${taskId}`;
       if (!uuid.test(taskId) || !same(path.resolve(task.taskDirectory), path.join(root, relative))) throw new Error("CHAT_DELETE_PATH_REFUSED");
+      if (!["completed", "stopped", "failed"].includes(outcome.status)) {
+        const abandoned = JSON.parse(readPrivate(location, `${prefix}abandoned.json`));
+        if (abandoned.taskId !== taskId || abandoned.threadId !== outcome.threadId || abandoned.turnId !== outcome.turnId ||
+          abandoned.reason !== "explicit-user-abandonment" || !["completed", "failed", "interrupted", "not-started"].includes(abandoned.terminal)) throw new Error("CHAT_DELETE_REFUSED");
+      }
       const reviewRoot = directory(root, relative); inspectTree(reviewRoot);
       const journal = readPrivate(reviewRoot, "private/apply.jsonl");
       if (inspectApplyJournal(journal, new Map()).length || JSON.parse(journal.trimEnd().split("\n").at(-1)!).type !== "closed") throw new Error("CHAT_DELETE_REFUSED");

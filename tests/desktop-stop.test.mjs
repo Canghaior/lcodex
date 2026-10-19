@@ -6,8 +6,9 @@ import { _electron } from "playwright-core";
 import electronPath from "electron";
 import { createRunDirectory } from "../dist/validation/run-directory.js";
 import { createProcessTreeFixture, waitForProcessTree, verifyTreeStopped } from "../dist/validation/workflow-lifecycle.js";
+import { stopAndCloseDesktop } from "./desktop-helpers.mjs";
 
-test("desktop Stop ends the process tree and keeps uncertain operations non-replayable", { timeout: 90_000 }, async () => {
+for (const restartApplication of [false, true]) test(`desktop Stop preserves unknown outcomes until explicit isolated abandonment (restart=${restartApplication})`, { timeout: 90_000 }, async () => {
   const run = createRunDirectory("desktop stop 中文"), original = path.join(run.root, "process project");
   mkdirSync(original); mkdirSync(path.join(run.root, "temp"));
   writeFileSync(path.join(original, "package.json"), '{"private":true,"type":"module"}');
@@ -17,7 +18,7 @@ test("desktop Stop ends the process tree and keeps uncertain operations non-repl
   let app, clean = false;
   try {
     app = await _electron.launch({ executablePath: electronPath, args: ["."], cwd: path.resolve("."), env });
-    const page = await app.firstWindow(); await page.getByRole("heading", { name: "从一个本地项目开始" }).waitFor();
+    let page = await app.firstWindow(); await page.getByRole("heading", { name: "从一个本地项目开始" }).waitFor();
     await app.evaluate((_electron, source) => { (0, eval)(source); }, readFileSync(path.resolve("tests/mock-model.mjs"), "utf8"));
     await app.evaluate(({ dialog }, directory) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [directory] }); }, original);
     await page.getByRole("button", { name: "选择项目", exact: true }).click();
@@ -33,6 +34,13 @@ test("desktop Stop ends the process tree and keeps uncertain operations non-repl
     while (!existsSync(manifestFile) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
     const manifest = JSON.parse(readFileSync(manifestFile, "utf8"));
     const workspace = path.join(manifest.taskDirectory, "workspace");
+    const readinessDeadline = Date.now() + 35_000;
+    while (!["parent", "child", "grandchild"].every(role => existsSync(path.join(workspace, `pid-${role}.json`))) && Date.now() < readinessDeadline) {
+      const state = await page.evaluate(() => window.lcodex.request({ type: "snapshot" }));
+      const current = state.state.chats.find(chat => chat.id === chatId);
+      if (["ended", "failed", "stopped", "reconcile"].includes(current.execution)) throw new Error(current.error ?? "PROCESS_FIXTURE_NOT_STARTED");
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
     const tree = await waitForProcessTree(workspace);
     await page.getByRole("button", { name: "停止任务", exact: true }).click();
     await page.getByText("需要核对", { exact: true }).waitFor({ timeout: 40_000 });
@@ -45,6 +53,27 @@ test("desktop Stop ends the process tree and keeps uncertain operations non-repl
     const restart = await page.evaluate(chatId => window.lcodex.request({ type: "send", chatId, text: "retry" }), chatId);
     assert.equal(restart.ok, false);
     assert.equal(restart.code, "TASK_REVIEW_OR_RECONCILE_REQUIRED");
+    const removeUnknown = await page.evaluate(chatId => window.lcodex.request({ type: "delete-chat", chatId }), chatId);
+    assert.equal(removeUnknown.ok, false); assert.equal(removeUnknown.code, "CHAT_DELETE_REFUSED");
+    const budgetBefore = readFileSync(path.join(run.root, "test-budget.jsonl"), "utf8");
+    if (restartApplication) {
+      await app.close();
+      app = await _electron.launch({ executablePath: electronPath, args: ["."], cwd: path.resolve("."), env }); page = await app.firstWindow();
+    }
+    await page.getByRole("button", { name: "核对并放弃本次隔离尝试", exact: true }).click();
+    await page.getByRole("button", { name: "新建聊天继续工作", exact: true }).waitFor();
+    const ended = await page.evaluate(() => window.lcodex.request({ type: "snapshot" }));
+    const endedChat = ended.state.chats.find(item => item.id === chatId);
+    assert.equal(endedChat.execution, "stopped"); assert.equal(endedChat.verification, "unverified");
+    assert.equal(endedChat.error, "TASK_ISOLATED_ABANDONED");
+    assert.equal(readFileSync(path.join(run.root, "test-budget.jsonl"), "utf8"), budgetBefore);
+    assert.equal(existsSync(workspace), true, "Explicit abandonment retains evidence until separate deletion");
+    assert.equal(existsSync(path.join(original, "pid-parent.json")), false);
+    await page.getByRole("button", { name: "删除聊天", exact: true }).click();
+    await page.getByRole("button", { name: "删除聊天和副本", exact: true }).click();
+    await page.getByRole("dialog", { name: "删除聊天", exact: true }).waitFor({ state: "hidden" });
+    assert.equal(existsSync(manifest.taskDirectory), false);
+    assert.equal(existsSync(original), true);
     clean = true;
-  } finally { if (app) await app.close(); if (clean) run.cleanup(); else console.log("Retained generated stop run:", path.basename(run.root)); }
+  } finally { await stopAndCloseDesktop(app); if (clean) run.cleanup(); else console.log("Retained generated stop run:", path.basename(run.root)); }
 });

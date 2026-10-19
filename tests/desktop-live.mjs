@@ -11,6 +11,7 @@ import { createWorkflowSample, createWorkflowEvaluator } from "../dist/validatio
 import { isolatedEnvironment } from "../dist/validation/isolated-env.js";
 import { snapshot } from "../dist/validation/fixtures.js";
 import { BudgetLedger } from "../dist/validation/budget.js";
+import { stopAndCloseDesktop } from "./desktop-helpers.mjs";
 
 if (!process.argv.includes("--live")) throw new Error("LIVE_OPT_IN_REQUIRED");
 let key = await readKey();
@@ -113,7 +114,7 @@ try {
 } catch (error) { report.failure = error instanceof assert.AssertionError ? "ACCEPTANCE_FAILED" : error instanceof Error && /^[A-Z_]+$/.test(error.message) ? error.message : "DESKTOP_LIVE_FAILED"; process.exitCode = 1; }
 finally {
   key = "";
-  if (application) await application.close();
+  await stopAndCloseDesktop(application);
   const ledger = new BudgetLedger(path.resolve(".local/state/p1-budget.jsonl"));
   try { report.budget = ledger.summary(); } finally { ledger.close(); }
   mkdirSync(path.resolve(".local/reports"), { recursive: true });

@@ -8,6 +8,7 @@ import { prepareReviewWorkspace, restoreReviewWorkspace } from "./review-workspa
 import { contentHash, WindowsFileGuard } from "./windows-file-guard.js";
 import { inspectApplyJournal } from "./apply-journal.js";
 import { isolatedEnvironment } from "./isolated-env.js";
+import { abandonStoppedIsolatedWorkspace } from "./abandon-isolated.js";
 
 const shell = "C:/Users/lijin/.cache/codex-runtimes/codex-primary-runtime/dependencies/native/powershell/pwsh.exe";
 const options = { skip: process.platform !== "win32" || !existsSync(shell), timeout: 90_000 };
@@ -251,6 +252,7 @@ test("interrupted addition leaves durable evidence, blocks replay and retains th
     const pending = inspectApplyJournal(journal, new Map(tree.files.map(file => [file.relative, file.sha256])));
     assert.equal(pending.length, 1); assert.equal(pending[0]?.observation, "diverged");
     assert.equal(pending[0]?.action, "needs-reconcile");
+    await assert.rejects(abandonStoppedIsolatedWorkspace(fixture.project, state, result.taskDirectory, guard), /TASK_ORIGINAL_WRITE_REQUIRES_RECONCILIATION/);
     assert.ok(readFileSync(path.join(result.taskDirectory, "private/frozen.json"), "utf8").includes(Buffer.from("complete candidate").toString("base64")));
     await assert.rejects(prepareReviewWorkspace(fixture.project, state, guard), /PROJECT_LOCK_BUSY_RECONCILE/);
     assert.equal(readFileSync(path.join(fixture.project, "interrupted.txt")).length, 0);

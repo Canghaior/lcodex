@@ -128,7 +128,7 @@ async function main() {
         if (!tasks) throw new Error("RUNTIME_UNAVAILABLE");
         await tasks.checkConnection();
         return { ok: true, state: state(), connectionVerified: true };
-      } else if (["send", "stop", "apply", "discard", "reopen-review", "delete-chat"].includes(command.type)) {
+      } else if (["send", "stop", "apply", "discard", "reopen-review", "delete-chat", "abandon-isolated"].includes(command.type)) {
         if (!("chatId" in command) || !tasks) throw new Error("RUNTIME_UNAVAILABLE");
         const chat = store.chat(command.chatId); if (!chat) throw new Error("CHAT_NOT_FOUND");
         const project = store.projects.find(project => project.id === chat.projectId); if (!project) throw new Error("PROJECT_NOT_FOUND");
@@ -139,6 +139,7 @@ async function main() {
           if (command.type === "discard") tasks.discard(chat, command.reviewId);
           if (command.type === "reopen-review") await tasks.reopenReview(chat, project);
           if (command.type === "delete-chat") await tasks.deleteChat(chat);
+          if (command.type === "abandon-isolated") await tasks.abandonIsolated(chat, project);
         });
       } else if (command.type === "window") {
         if (command.action === "minimize") win.minimize();

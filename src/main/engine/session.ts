@@ -21,7 +21,7 @@ import { writePrivate } from "../../../validation/private-files.js";
 export type EngineOptions = { engine: string; shell: string; node: string; root: string; workspace: string; privateDir: string; original: string; rootMarker: string;
   readOnlyAssets: string[]; readOnlyDirectories: string[]; mode: TaskMode; prompt: string; testCommand: string; key: string; ledger: BudgetLedger;
   signal: AbortSignal; onEvent: (method: string, params: unknown) => void; onIdentity: (threadId: string, turnId: string) => void;
-  fetchImpl?: typeof fetch; historyHome?: string; resume?: { threadId: string; turnId: string } };
+  fetchImpl?: typeof fetch; historyHome?: string; resume?: { threadId: string; turnId: string }; onProcessStarted?: () => void };
 export type EngineResult = { status: "completed" | "stopped" | "failed" | "reconcile"; code: string | null; threadId: string | null; turnId: string | null; cleanExit: boolean; requests: number };
 export const safeCode = (error: unknown, fallback: string) => error instanceof Error && /^[A-Z][A-Z0-9_-]{2,80}$/.test(error.message) ? error.message : fallback;
 const quote = (value: string) => "'" + value.replaceAll("'", "''") + "'";
@@ -115,6 +115,7 @@ export async function executeSession(options: EngineOptions): Promise<EngineResu
     ].join("\n"));
     requireValue(!abort.signal.aborted, "TASK_USER_STOP");
     child = spawn(engine, ["app-server", "--listen", "stdio://", "--strict-config"], { cwd: workspace, env, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+    options.onProcessStarted?.();
     child.stderr.resume(); closed = new Promise(resolve => child!.once("close", code => { if (!ended) resolveTerminal(null); resolve(code); }));
     child.on("error", () => fail("ENGINE_START_FAILED"));
     rpc = new JsonLineRpc(child.stdout, child.stdin, 15_000, 1_048_576, (method, params) => {
