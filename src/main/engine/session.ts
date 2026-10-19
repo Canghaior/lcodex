@@ -4,7 +4,8 @@ import { createServer } from "node:http";
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { BudgetLedger } from "../../../validation/budget.js";
-import { sendBoundedDeepSeek, PRICE_REVIEW_DATE } from "../../../validation/deepseek-request.js";
+import { sendBoundedDeepSeek } from "../../../validation/deepseek-request.js";
+import { localDay } from "../storage/pricing.js";
 import { prepareEngineModelRequest } from "../../../validation/engine-model-request.js";
 import { isolatedEnvironment } from "../../../validation/isolated-env.js";
 import { validationCatalog } from "../../../validation/model-catalog.js";
@@ -21,7 +22,7 @@ import { writePrivate } from "../../../validation/private-files.js";
 export type EngineOptions = { engine: string; shell: string; node: string; root: string; workspace: string; privateDir: string; original: string; rootMarker: string;
   readOnlyAssets: string[]; readOnlyDirectories: string[]; mode: TaskMode; prompt: string; testCommand: string; key: string; ledger: BudgetLedger;
   signal: AbortSignal; onEvent: (method: string, params: unknown) => void; onIdentity: (threadId: string, turnId: string) => void;
-  fetchImpl?: typeof fetch; historyHome?: string; resume?: { threadId: string; turnId: string }; onProcessStarted?: () => void };
+  fetchImpl?: typeof fetch; historyHome?: string; resume?: { threadId: string; turnId: string }; onProcessStarted?: () => void; priceConfirmedOn: string };
 export type EngineResult = { status: "completed" | "stopped" | "failed" | "reconcile"; code: string | null; threadId: string | null; turnId: string | null; cleanExit: boolean; requests: number };
 export const safeCode = (error: unknown, fallback: string) => error instanceof Error && /^[A-Z][A-Z0-9_-]{2,80}$/.test(error.message) ? error.message : fallback;
 const quote = (value: string) => "'" + value.replaceAll("'", "''") + "'";
@@ -33,8 +34,7 @@ const wait = async <T>(promise: Promise<T>, ms: number): Promise<T | undefined> 
 export async function executeSession(options: EngineOptions): Promise<EngineResult> {
   const { engine, shell, node, root, workspace, original, key, ledger, mode } = options;
   const historyHome = options.historyHome ?? path.join(root, "home");
-  const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
-  requireValue(today === PRICE_REVIEW_DATE, "PRICE_REVIEW_REQUIRED");
+  requireValue(localDay() === options.priceConfirmedOn, "PRICE_REVIEW_REQUIRED");
   requireValue(!options.signal.aborted, "TASK_USER_STOP");
   assertNoKnownSecrets(options.prompt, [key]);
   for (const relative of ["home", "profile/roaming", "profile/local/Packages", "temp"]) mkdirSync(path.join(root, relative), { recursive: true });

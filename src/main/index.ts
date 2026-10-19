@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, net, protocol, session } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, net, protocol, session, shell as desktopShell } from "electron";
 import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -10,6 +10,7 @@ import { WindowsFileGuard } from "../../validation/windows-file-guard.js";
 import { BudgetLedger } from "../../validation/budget.js";
 import { Credentials } from "./storage/credentials.js";
 import { Tasks } from "./engine/tasks.js";
+import { Pricing, PRICE_SOURCE } from "./storage/pricing.js";
 
 const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 const testRoot = !app.isPackaged ? process.env.LCODEX_DESKTOP_TEST_ROOT : undefined;
@@ -37,12 +38,13 @@ async function main() {
     node: matches(node, "3a9ac860c566b7aebf144be914f95e3ec36dc88040aa7acb5d9d1e6e0c7afd5e"), key: false, ready: false, platform: "Windows · MXC" };
   const guard = runtime.shell ? new WindowsFileGuard(shell, dataRoot, path.join(sourceRoot, "validation")) : undefined;
   const credentials = new Credentials(dataRoot);
-  const ledgerFile = testRoot && process.env.LCODEX_LIVE_TEST !== "1" ? path.join(testRoot, "test-budget.jsonl") : path.join(sourceRoot, ".local/state/p1-budget.jsonl");
+  const pricing = new Pricing(dataRoot, !app.isPackaged), budgetScope = app.isPackaged ? "personal" : "development";
+  const ledgerFile = app.isPackaged ? path.join(dataRoot, "usage.jsonl") : testRoot && process.env.LCODEX_LIVE_TEST !== "1" ? path.join(testRoot, "test-budget.jsonl") : path.join(sourceRoot, ".local/state/p1-budget.jsonl");
   if (testRoot && process.env.LCODEX_LIVE_TEST !== "1" && !existsSync(ledgerFile)) BudgetLedger.initialize(ledgerFile);
   let tasks: Tasks | undefined;
   const state = (): AppState => {
-    runtime.key = credentials.present(); runtime.ready = runtime.engine && runtime.shell && runtime.node && runtime.key && !tasks?.budgetError;
-    return store.state({ runtime, budget: tasks?.budget() ?? { committed: 0, unknown: 0, limit: 10 }, executionAvailable: !!tasks });
+    runtime.key = credentials.present(); runtime.ready = runtime.engine && runtime.shell && runtime.node && runtime.key && !tasks?.budgetError && tasks?.budget().pending === 0 && pricing.status().current;
+    return store.state({ runtime, budget: tasks?.budget() ?? { committed: 0, unknown: 0, estimated: 0, limit: 10, perTask: 1, pending: 0, pendingCost: 0, revision: "", configured: false, scope: budgetScope, error: "RUNTIME_UNAVAILABLE" }, pricing: pricing.status(), executionAvailable: !!tasks });
   };
   const rendererRoot = realpathSync(path.join(sourceRoot, "dist/renderer"));
   protocol.handle("lcodex", request => {
@@ -68,7 +70,7 @@ async function main() {
   win.webContents.on("will-navigate", event => event.preventDefault());
   win.webContents.on("will-attach-webview", event => event.preventDefault());
   app.on("second-instance", () => { if (win.isMinimized()) win.restore(); win.show(); win.focus(); });
-  if (guard && runtime.engine && runtime.node) tasks = new Tasks({ root: dataRoot, engine, shell, node, ledgerFile, guard, credentials, store,
+  if (guard && runtime.engine && runtime.node) tasks = new Tasks({ root: dataRoot, engine, shell, node, ledgerFile, budgetScope, pricing, guard, credentials, store,
     notify: () => { if (!win.isDestroyed()) win.webContents.send("lcodex:state", state()); } });
   let closePending = false;
   win.on("close", event => {
@@ -124,6 +126,14 @@ async function main() {
         if (tasks?.busy()) throw new Error("TASK_ALREADY_RUNNING");
         const project = store.projects.find(project => project.id === command.projectId); if (!project) throw new Error("PROJECT_NOT_FOUND");
         project.testCommand = command.command.trim(); store.save();
+      } else if (["confirm-price", "open-pricing", "configure-budget", "account-unknown", "recover-budget-lock"].includes(command.type)) {
+        if (!tasks) throw new Error("RUNTIME_UNAVAILABLE");
+        if (tasks.busy()) throw new Error("TASK_ALREADY_RUNNING");
+        if (command.type === "open-pricing") await desktopShell.openExternal(PRICE_SOURCE);
+        if (command.type === "confirm-price") pricing.confirm();
+        if (command.type === "configure-budget") tasks.configureBudget(command.totalMicros, command.trialMicros);
+        if (command.type === "account-unknown") tasks.accountUnknown(command.revision);
+        if (command.type === "recover-budget-lock") await tasks.recoverBudget();
       } else if (command.type === "check-connection") {
         if (!tasks) throw new Error("RUNTIME_UNAVAILABLE");
         await tasks.checkConnection();

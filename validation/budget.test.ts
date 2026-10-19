@@ -122,3 +122,22 @@ test("explicit unknown reconciliation consumes the full reservation and survives
     recovered.settle(recovered.reserve("trial", 750_000), 750_000);
   } finally { recovered.close(); }
 });
+
+test("personal budget changes preserve prior consumption while development limits remain fixed", () => {
+  const { file, ledger } = sample();
+  assert.throws(() => ledger.configure({ totalMicros: 20_000_000, trialMicros: 1_000_000, requestsPerTrial: 8 }), /CONFIGURATION_REFUSED/);
+  ledger.close();
+  const personalFile = file + ".personal";
+  BudgetLedger.initialize(personalFile, { totalMicros: 500_000, trialMicros: 250_000, requestsPerTrial: 8 }, "personal");
+  assert.throws(() => new BudgetLedger(personalFile), /CORRUPT/);
+  const personal = new BudgetLedger(personalFile, "personal");
+  personal.accountUnknown(personal.reserve("first", 250_000));
+  assert.throws(() => personal.configure({ totalMicros: 200_000, trialMicros: 200_000, requestsPerTrial: 8 }), /WRONG_LIMITS/);
+  personal.configure({ totalMicros: 1_000_000, trialMicros: 500_000, requestsPerTrial: 8 });
+  personal.accountUnknown(personal.reserve("first", 250_000));
+  assert.throws(() => personal.reserve("first", 1), /TRIAL_LIMIT/);
+  personal.close();
+  const resumed = new BudgetLedger(personalFile, "personal");
+  try { assert.equal(resumed.summary().committedMicros, 500_000); assert.equal(resumed.limits().totalMicros, 1_000_000); }
+  finally { resumed.close(); }
+});

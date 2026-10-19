@@ -1,10 +1,15 @@
 import { appendFileSync, closeSync, constants, existsSync, fsyncSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import path from "node:path";
+import { privatePath, readPrivate } from "./private-files.js";
 
 // Integer micro-yuan avoids floating-point accumulation. These limits are user-authorized.
 export const P1_LIMITS = { totalMicros: 10_000_000, trialMicros: 1_000_000, requestsPerTrial: 8 } as const;
+export type BudgetLimits = { totalMicros: number; trialMicros: number; requestsPerTrial: number };
+export type BudgetScope = "development" | "personal";
 type Entry =
-  | { type: "init"; version: 1; limits: typeof P1_LIMITS }
+  | { type: "init"; version: 1 | 2; limits: BudgetLimits; scope?: BudgetScope }
+  | { type: "limits"; limits: BudgetLimits }
   | { type: "reserve"; id: string; trial: string; maxMicros: number }
   | { type: "settle"; id: string; actualMicros: number }
   | { type: "account-unknown"; id: string };
@@ -20,28 +25,43 @@ function check(condition: unknown, code: string): asserts condition {
 
 export class BudgetLedger {
   private lockFd: number;
+  private lockContents: string;
   private closed = false;
   private poisoned = false;
   private requests = new Map<string, Request>();
+  private currentLimits: BudgetLimits = { ...P1_LIMITS };
+
+  static validLimits(limits: BudgetLimits): boolean {
+    return natural(limits.totalMicros) && limits.totalMicros >= 250_000 && limits.totalMicros <= 1_000_000_000 &&
+      natural(limits.trialMicros) && limits.trialMicros >= 250_000 && limits.trialMicros <= limits.totalMicros && limits.requestsPerTrial === 8;
+  }
 
   // Explicit one-time initialization. Opening or retrying never creates a missing ledger.
-  static initialize(file: string): void {
+  static initialize(file: string, limits: BudgetLimits = P1_LIMITS, scope: BudgetScope = "development"): void {
+    check(BudgetLedger.validLimits(limits) && (scope === "personal" || JSON.stringify(limits) === JSON.stringify(P1_LIMITS)), "BUDGET_WRONG_LIMITS");
+    privatePath(path.dirname(file), path.basename(file));
     const fd = openSync(file, "wx", 0o600);
     try {
-      writeFileSync(fd, `${JSON.stringify({ type: "init", version: 1, limits: P1_LIMITS })}\n`);
+      writeFileSync(fd, `${JSON.stringify(scope === "development" ? { type: "init", version: 1, limits } : { type: "init", version: 2, scope, limits })}\n`);
       fsyncSync(fd);
     } finally { closeSync(fd); }
   }
 
-  constructor(private file: string) {
+  constructor(private file: string, private scope: BudgetScope = "development") {
     check(existsSync(file), "BUDGET_LEDGER_MISSING");
+    privatePath(path.dirname(file), path.basename(file));
+    privatePath(path.dirname(file), path.basename(file) + ".lock");
     this.lockFd = openSync(`${file}.lock`, "wx", 0o600);
+    this.lockContents = JSON.stringify({ version: 1, pid: process.pid, token: randomUUID() });
     try {
-      const contents = readFileSync(file, "utf8");
+      writeFileSync(this.lockFd, this.lockContents); fsyncSync(this.lockFd);
+      const contents = readPrivate(path.dirname(file), path.basename(file), 32 * 1024 * 1024);
       check(contents.endsWith("\n"), "BUDGET_CORRUPT");
       const lines = contents.trimEnd().split("\n");
       const init = JSON.parse(lines.shift() ?? "null") as Record<string, unknown> | null;
-      check(init?.type === "init" && init.version === 1 && JSON.stringify(init.limits) === JSON.stringify(P1_LIMITS), "BUDGET_WRONG_LIMITS");
+      check(init?.type === "init" && (scope === "development" ? init.version === 1 && JSON.stringify(init.limits) === JSON.stringify(P1_LIMITS) : init.version === 2 && init.scope === "personal"), "BUDGET_WRONG_LIMITS");
+      check(init.limits && BudgetLedger.validLimits(init.limits as BudgetLimits), "BUDGET_WRONG_LIMITS");
+      this.currentLimits = { ...(init.limits as BudgetLimits) };
       for (const line of lines) this.replay(JSON.parse(line));
     } catch {
       this.close();
@@ -51,7 +71,10 @@ export class BudgetLedger {
 
   private replay(entry: Entry): void {
     check(entry && typeof entry === "object" && typeof entry.type === "string", "BUDGET_CORRUPT");
-    if (entry.type === "reserve") {
+    if (entry.type === "limits") {
+      check(this.scope === "personal" && BudgetLedger.validLimits(entry.limits) && entry.limits.totalMicros >= this.summary().committedMicros, "BUDGET_WRONG_LIMITS");
+      this.currentLimits = { ...entry.limits };
+    } else if (entry.type === "reserve") {
       check(typeof entry.id === "string" && !this.requests.has(entry.id) && typeof entry.trial === "string" &&
         /^[a-z0-9-]{1,64}$/.test(entry.trial) && natural(entry.maxMicros) && entry.maxMicros > 0, "BUDGET_CORRUPT");
       // A persisted reservation must have satisfied the limits at its point in history.
@@ -83,6 +106,13 @@ export class BudgetLedger {
     }
     return { committedMicros, estimatedMicros, unknownMicros, pending, overrun, requests: this.requests.size };
   }
+  limits() { return { ...this.currentLimits }; }
+  pendingRequests() { return [...this.requests.entries()].filter(([, request]) => request.actualMicros === undefined && !request.unknownAccounted).map(([id, request]) => ({ id, maxMicros: request.maxMicros })); }
+  configure(limits: BudgetLimits) {
+    check(!this.closed && !this.poisoned && this.scope === "personal", "BUDGET_CONFIGURATION_REFUSED");
+    check(BudgetLedger.validLimits(limits) && limits.totalMicros >= this.summary().committedMicros, "BUDGET_WRONG_LIMITS");
+    this.append({ type: "limits", limits }); this.currentLimits = { ...limits };
+  }
 
   private checkReservation(trial: string, maxMicros: number): void {
     check(!this.closed && !this.poisoned, "BUDGET_CLOSED");
@@ -91,10 +121,10 @@ export class BudgetLedger {
     check(!state.overrun, "BUDGET_ESTIMATE_OVERRUN");
     check(state.pending === 0, "BUDGET_PENDING_RECONCILIATION");
     const trialRequests = [...this.requests.values()].filter((item) => item.trial === trial);
-    check(trialRequests.length < P1_LIMITS.requestsPerTrial, "BUDGET_REQUEST_LIMIT");
+    check(trialRequests.length < this.currentLimits.requestsPerTrial, "BUDGET_REQUEST_LIMIT");
     const trialCost = trialRequests.reduce((sum, item) => sum + (item.actualMicros ?? item.maxMicros), 0);
-    check(state.committedMicros + maxMicros <= P1_LIMITS.totalMicros, "BUDGET_TOTAL_LIMIT");
-    check(trialCost + maxMicros <= P1_LIMITS.trialMicros, "BUDGET_TRIAL_LIMIT");
+    check(state.committedMicros + maxMicros <= this.currentLimits.totalMicros, "BUDGET_TOTAL_LIMIT");
+    check(trialCost + maxMicros <= this.currentLimits.trialMicros, "BUDGET_TRIAL_LIMIT");
   }
 
   reserve(trial: string, maxMicros: number): string {
@@ -125,7 +155,7 @@ export class BudgetLedger {
   }
 
   private append(entry: Entry): void {
-    const fd = openSync(this.file, constants.O_WRONLY | constants.O_APPEND);
+    const fd = openSync(privatePath(path.dirname(this.file), path.basename(this.file)), constants.O_WRONLY | constants.O_APPEND);
     try {
       appendFileSync(fd, `${JSON.stringify(entry)}\n`);
       fsyncSync(fd); // Reservation must be durable before the caller sends any HTTP request.
@@ -138,7 +168,9 @@ export class BudgetLedger {
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    closeSync(this.lockFd);
-    unlinkSync(`${this.file}.lock`);
+    try {
+      check(readPrivate(path.dirname(this.file), path.basename(this.file) + ".lock") === this.lockContents, "BUDGET_LOCK_OWNERSHIP_CHANGED");
+      unlinkSync(`${this.file}.lock`);
+    } finally { closeSync(this.lockFd); }
   }
 }
