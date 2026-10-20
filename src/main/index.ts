@@ -74,7 +74,7 @@ async function main() {
   win.webContents.on("will-navigate", event => event.preventDefault());
   win.webContents.on("will-attach-webview", event => event.preventDefault());
   app.on("second-instance", () => { if (win.isMinimized()) win.restore(); win.show(); win.focus(); });
-  if (guard && runtime.engine && runtime.node) tasks = new Tasks({ root: dataRoot, engine, shell, node, ledgerFile, budgetScope, pricing, guard, credentials, store,
+  if (guard && runtime.engine && runtime.node) tasks = new Tasks({ root: dataRoot, engine, shell, node, scriptDirectory: paths.guard, ledgerFile, budgetScope, pricing, guard, credentials, store,
     notify: () => { if (!win.isDestroyed()) win.webContents.send("lcodex:state", state()); } });
   let closePending = false;
   win.on("close", event => {

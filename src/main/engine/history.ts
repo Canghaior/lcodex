@@ -1,19 +1,22 @@
-import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import { JsonLineRpc, isObject } from "../../../validation/rpc.js";
 import { isolatedEnvironment } from "../../../validation/isolated-env.js";
+import { spawnOwnedEngine } from "../../../validation/owned-engine.js";
+import { terminateOwnedProcessTree } from "../../../validation/process-tree-stop.js";
 
 // Read the engine's own persisted state. No model credential, turn/start, shell
 // API or original-project write is available in this reconciliation operation.
-export async function verifyCompletedHistory(engine: string, root: string, home: string, threadId: string, turnId: string | null, allowInterrupted = false) {
+export async function verifyCompletedHistory(engine: string, root: string, home: string, threadId: string, turnId: string | null, allowInterrupted: boolean, shell: string, scriptDirectory?: string) {
   let requests = 0, replay = false;
   const gateway = createServer((_request, response) => { requests++; response.writeHead(403); response.end(); });
   await new Promise<void>((resolve, reject) => { gateway.once("error", reject); gateway.listen(0, "127.0.0.1", resolve); });
   const address = gateway.address(); if (!address || typeof address === "string") throw new Error("ENGINE_HISTORY_GATEWAY_FAILED");
-  const child = spawn(engine, ["app-server", "--listen", "stdio://", "--strict-config", "-c", `model_providers.workflow.base_url="http://127.0.0.1:${address.port}/v1"`], {
-    cwd: root, env: { ...isolatedEnvironment(root, process.env), CODEX_HOME: home, LCODEX_WORKFLOW_TOKEN: randomUUID() }, windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
+  const owner = spawnOwnedEngine({ engine, shell, root, cwd: root, ...(scriptDirectory ? { scriptDirectory } : {}),
+    args: ["app-server", "--listen", "stdio://", "--strict-config", "-c", `model_providers.workflow.base_url="http://127.0.0.1:${address.port}/v1"`],
+    env: { ...isolatedEnvironment(root, process.env), CODEX_HOME: home, LCODEX_WORKFLOW_TOKEN: randomUUID() },
   });
+  const child = owner.child;
   child.stderr.resume();
   const closed = new Promise<number | null>(resolve => child.once("close", resolve));
   const rpc = new JsonLineRpc(child.stdout, child.stdin, 15_000, 1_048_576, method => {
@@ -39,9 +42,12 @@ export async function verifyCompletedHistory(engine: string, root: string, home:
       finally { clearTimeout(timer); }
     };
     exit = await wait(25_000);
-    if (exit === undefined) { child.kill(); await wait(3000); }
+    if (exit === undefined) { owner.stop(); exit = await wait(8000); }
+    if (exit === undefined) { await terminateOwnedProcessTree(child); await wait(3000); }
     gateway.closeAllConnections(); await new Promise<void>(resolve => gateway.close(() => resolve()));
   }
-  if (!matched || requests || replay || exit !== 0 || rpc.deniedServerRequests) throw new Error("ENGINE_HISTORY_MISMATCH");
+  // The only operation was an acknowledged read. Both a graceful exit and a
+  // controlled reap must prove the complete job is empty; neither replays work.
+  if (!matched || requests || replay || exit !== 0 || !owner.result()?.processesEnded || rpc.deniedServerRequests) throw new Error("ENGINE_HISTORY_MISMATCH");
   return lastStatus;
 }

@@ -1,15 +1,14 @@
 // Test-only model transport. The real app-server, MXC, edits and UI remain in use.
 // Imported into the application's main process only by this test runner.
-const counts = new Map();
-const quote = text => "'" + text.replaceAll("'", "''") + "'";
 globalThis.fetch = async (url, init) => {
   if (url !== "https://api.deepseek.com/responses") throw new Error("TEST_UNEXPECTED_NETWORK");
   const body = JSON.parse(init.body);
   if (body.model !== "deepseek-v4-pro" || body.reasoning?.effort !== "high" || body.max_output_tokens !== 8192) throw new Error("TEST_MODEL_CONFIGURATION_MISMATCH");
   const tool = body.tools.find(tool => tool.name === "exec_command");
   const connecting = !tool;
-  const cwd = tool?.parameters.properties.workdir.enum[0] ?? "connection", shell = tool?.parameters.properties.shell.enum[0] ?? "";
-  const n = (counts.get(cwd) ?? 0) + 1; counts.set(cwd, n);
+  if (tool && JSON.stringify(Object.keys(tool.parameters.properties)) !== '["cmd"]') throw new Error("TEST_COMMAND_CONTRACT_MISMATCH");
+  const currentInput = body.input.slice(body.input.findLastIndex(item => item.role === "user") + 1);
+  const n = currentInput.filter(item => ["function_call_output", "custom_tool_call_output"].includes(item.type)).length + 1;
   const callSuffix = crypto.randomUUID();
   const writeMode = body.tools.some(tool => tool.name === "apply_patch");
   const readBeforeChecks = writeMode && globalThis.lcodexTestReadBeforeChecks === true;
@@ -21,10 +20,10 @@ globalThis.fetch = async (url, init) => {
   const patch = "*** Begin Patch\n*** Update File: catalog.mjs\n@@\n-export function total(items) { return items.reduce((sum, item) => sum + item.unitCents, 0); }\n+export function total(items) { return items.reduce((sum, item) => sum + item.unitCents * item.quantity, 0); }\n*** End Patch";
   const message = connecting || (writeMode ? step >= 4 : n >= 2);
   const text = "模拟模型联测：已处理 catalog.mjs，实际工具结果见记录。原项目等待审阅后应用。";
-  const item = stopping ? { id: `item-${n}`, type: "function_call", name: "exec_command", call_id: `call-${n}`, status: "completed", arguments: JSON.stringify({ cmd: "& 'C:/nvm4w/nodejs/node.exe' --preserve-symlinks --preserve-symlinks-main './process-tree.mjs' parent; exit $LASTEXITCODE", shell, login: false, workdir: cwd, yield_time_ms: 10000, max_output_tokens: 2048 }) }
+  const item = stopping ? { id: `item-${n}`, type: "function_call", name: "exec_command", call_id: `call-${n}`, status: "completed", arguments: JSON.stringify({ cmd: "& 'C:/nvm4w/nodejs/node.exe' --preserve-symlinks --preserve-symlinks-main './process-tree.mjs' parent; exit $LASTEXITCODE" }) }
     : message ? { id: `message-${n}`, type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text, annotations: [] }] }
     : writeMode && step === 2 ? { id: `item-${n}`, type: "custom_tool_call", name: "apply_patch", call_id: `call-${n}`, status: "completed", input: patch }
-    : { id: `item-${n}`, type: "function_call", name: "exec_command", call_id: `call-${n}`, status: "completed", arguments: JSON.stringify({ cmd: readBeforeChecks && step === 0 ? "Get-Content -LiteralPath './catalog.mjs' -Raw" : writeMode ? command : `try { [IO.File]::WriteAllText(${quote(cwd + "/read-only-marker.txt")}, 'unexpected'); Write-Output 'UNEXPECTED_WRITE' } catch { Write-Output 'READ_ONLY_DENIED' }; Get-Content -LiteralPath './catalog.mjs' -Raw`, shell, login: false, workdir: cwd, yield_time_ms: 10000, max_output_tokens: 2048 }) };
+    : { id: `item-${n}`, type: "function_call", name: "exec_command", call_id: `call-${n}`, status: "completed", arguments: JSON.stringify({ cmd: readBeforeChecks && step === 0 ? "Get-Content -LiteralPath './catalog.mjs' -Raw" : writeMode ? command : "try { [IO.File]::WriteAllText((Join-Path (Get-Location).Path 'read-only-marker.txt'), 'unexpected'); Write-Output 'UNEXPECTED_WRITE' } catch { Write-Output 'READ_ONLY_DENIED' }; Get-Content -LiteralPath './catalog.mjs' -Raw" }) };
   item.id += "-" + callSuffix;
   if (item.call_id) item.call_id += "-" + callSuffix;
   if (continuing && item.type === "function_call") { const args = JSON.parse(item.arguments); args.cmd += "; Get-Content -LiteralPath './latest-note.txt' -Raw"; item.arguments = JSON.stringify(args); }

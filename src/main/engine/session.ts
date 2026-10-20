@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -11,21 +11,25 @@ import { isolatedEnvironment } from "../../../validation/isolated-env.js";
 import { validationCatalog } from "../../../validation/model-catalog.js";
 import { DESKTOP_MODEL } from "../../../validation/deepseek-model.js";
 import { assertNoKnownSecrets } from "../../../validation/outbound-data.js";
-import { projectModelTools, projectToolPolicy } from "../../../validation/project-tool-policy.js";
+import { desktopCommandContract, desktopCommandHistory } from "../../../validation/desktop-command-contract.js";
+import { SessionProgress, assertFinalAnswer } from "../../../validation/session-progress.js";
 import { terminateOwnedProcessTree } from "../../../validation/process-tree-stop.js";
 import { isObject, JsonLineRpc } from "../../../validation/rpc.js";
-import { prepareSerialResponse } from "../../../validation/serial-response.js";
 import { TaskLimits, TASK_LIMITS } from "../../../validation/task-limits.js";
 import { ToolResponseGate } from "../../../validation/tool-response-gate.js";
 import { stopAndReadThread } from "../../../validation/workflow-lifecycle.js";
 import type { TaskMode } from "../../shared/contracts.js";
 import { writePrivate } from "../../../validation/private-files.js";
+import { spawnOwnedEngine } from "../../../validation/owned-engine.js";
+import { verifyCompletedHistory } from "./history.js";
 
 export type EngineOptions = { engine: string; shell: string; node: string; root: string; workspace: string; privateDir: string; original: string; rootMarker: string;
   readOnlyAssets: string[]; readOnlyDirectories: string[]; mode: TaskMode; prompt: string; testCommand: string; key: string; ledger: BudgetLedger;
   signal: AbortSignal; onEvent: (method: string, params: unknown) => void; onIdentity: (threadId: string, turnId: string) => void;
-  fetchImpl?: typeof fetch; historyHome?: string; resume?: { threadId: string; turnId: string }; onProcessStarted?: () => void; priceConfirmedOn: string };
-export type EngineResult = { status: "completed" | "stopped" | "failed" | "reconcile"; code: string | null; threadId: string | null; turnId: string | null; cleanExit: boolean; requests: number };
+  fetchImpl?: typeof fetch; historyHome?: string; resume?: { threadId: string; turnId: string }; onProcessStarted?: () => void; priceConfirmedOn: string; projectFiles?: string[]; scriptDirectory?: string;
+  spawnImpl?: typeof spawnOwnedEngine };
+export type EngineResult = { status: "completed" | "stopped" | "failed" | "reconcile"; code: string | null; threadId: string | null; turnId: string | null; cleanExit: boolean; processesEnded: boolean; reconciledExit: boolean; requests: number };
+export const confirmedSessionExit = (value: Record<string, unknown>) => value.cleanExit === true || value.processesEnded === true && value.reconciledExit === true;
 export const safeCode = (error: unknown, fallback: string) => error instanceof Error && /^[A-Z][A-Z0-9_-]{2,80}$/.test(error.message) ? error.message : fallback;
 const quote = (value: string) => "'" + value.replaceAll("'", "''") + "'";
 const requireValue = (value: unknown, code: string): void => { if (!value) throw new Error(code); };
@@ -52,18 +56,22 @@ export async function executeSession(options: EngineOptions): Promise<EngineResu
   env.NPM_CONFIG_CACHE = path.join(root, "profile/local/Packages/npm-cache");
   env.NPM_CONFIG_UPDATE_NOTIFIER = "false";
   env.NPM_CONFIG_FUND = "false";
+  // Retain only fixed lifecycle flags, never engine stderr text or tool data.
+  env.RUST_LOG = "error,codex_app_server=info";
+  const shutdownTrace = { processorExited: false, outboundExited: false, stdioClosed: false, backgroundTimeout: false, threadTimeout: false };
   const limitsFile = path.join(root, "limits.jsonl"); TaskLimits.create(limitsFile);
   const limits = new TaskLimits(limitsFile), abort = new AbortController();
   let failure = "", ended = false, inFlight = false, requests = 0, threadId: string | null = null, turnId: string | null = null;
   let dispatchAllowed = false;
   let rpc: JsonLineRpc | undefined, child: ChildProcessWithoutNullStreams | undefined, closed: Promise<number | null> | undefined;
+  let owner: ReturnType<typeof spawnOwnedEngine> | undefined;
   let resolveTerminal!: (value: unknown) => void;
   const terminal = new Promise<unknown>(resolve => { resolveTerminal = resolve; });
   const fail = (code: string) => { failure ||= code; abort.abort(new Error(code)); resolveTerminal(null); };
   const userStop = () => fail("TASK_USER_STOP"); options.signal.addEventListener("abort", userStop, { once: true });
-  const gate = new ToolResponseGate(limits, abort, { failure: fail, completed: () => {} });
-  const writePolicy = projectToolPolicy(workspace, shell, options.rootMarker, options.readOnlyAssets);
-  const policy = { functionCall: writePolicy.functionCall, patch: mode === "write" ? writePolicy.patch : () => { throw new Error("TASK_READ_ONLY"); } };
+  const progress = new SessionProgress(options.testCommand, mode === "write");
+  const gate = new ToolResponseGate(limits, abort, { failure: fail,
+    completed: result => progress.completed(result), event: kind => { if (kind === "started") progress.started(); } });
   let activeUpstream: ReturnType<typeof sendBoundedDeepSeek> | undefined;
   let activeRequest: Promise<void> | undefined;
   const server = createServer((req, res) => {
@@ -79,24 +87,29 @@ export async function executeSession(options: EngineOptions): Promise<EngineResu
         const parsed: unknown = JSON.parse(body);
         if (!isObject(parsed) || !Array.isArray(parsed.tools)) throw new Error("GATEWAY_REQUEST_INVALID");
         limits.request(); requests++;
-        const tools = projectModelTools(parsed.tools.filter(isObject), workspace, shell).filter(tool => mode === "write" || tool.name !== "apply_patch");
+        const contract = desktopCommandContract({ workspace, shell, rootMarker: options.rootMarker, readOnlyAssets: options.readOnlyAssets,
+          readOnly: mode === "read", ...(progress.verificationOnly(requests) ? { verifyCommand: options.testCommand } : {}) });
+        const tools = contract.tools(parsed.tools.filter(isObject));
         // Reserve the existing last request for a useful summary. Keep the cap,
         // full history and usage accounting; do not add a ninth request.
         const finalResponseOnly = requests === TASK_LIMITS.requests;
-        const request = prepareEngineModelRequest(parsed, tools, { finalResponseOnly });
+        const request = prepareEngineModelRequest({ ...parsed, input: desktopCommandHistory(parsed.input) }, tools,
+          { finalResponseOnly, progressInstruction: progress.instruction(requests) });
         activeUpstream = sendBoundedDeepSeek(ledger, trial, key, request, options.fetchImpl ?? fetch, abort.signal, PROJECT_MAX_INPUT_BYTES);
         const result = await activeUpstream;
         limits.check();
         requireValue(result.terminalType === "response.completed", result.terminalType === "response.incomplete" ? "API_RESPONSE_INCOMPLETE" : "API_RESPONSE_FAILED");
-        const batch = prepareSerialResponse(result.wire, result.response, policy);
+        const adapted = contract.response(result.wire, result.response), batch = adapted.batch;
         // tool_choice and instructions are not enforcement. Refuse all tool
         // events before exposing any bytes if the model ignores the final call.
         requireValue(!finalResponseOnly || batch.calls.length === 0, "TASK_FINAL_RESPONSE_TOOL_REFUSED");
+        if (finalResponseOnly) assertFinalAnswer(adapted.response.output);
         // Preserve the validated request command by call ID. The engine's display
         // command includes shell quoting and is not an exact command identity.
-        if (Array.isArray(result.response.output)) for (const item of result.response.output) {
+        if (Array.isArray(adapted.response.output)) for (const item of adapted.response.output) {
           if (isObject(item) && item.type === "function_call" && typeof item.arguments === "string") {
             const args = JSON.parse(item.arguments);
+            progress.plan(String(item.call_id), args.cmd);
             options.onEvent("boundary/toolPlan", { id: item.call_id, command: args.cmd });
           }
         }
@@ -110,7 +123,7 @@ export async function executeSession(options: EngineOptions): Promise<EngineResu
     const primary = !inFlight; const handling = handle(); if (primary) activeRequest = handling;
   });
   server.requestTimeout = 65_000; server.headersTimeout = 10_000; server.maxConnections = 4;
-  let result: EngineResult = { status: "failed", code: null, threadId, turnId, cleanExit: false, requests: 0 };
+  let result: EngineResult = { status: "failed", code: null, threadId, turnId, cleanExit: false, processesEnded: false, reconciledExit: false, requests: 0 };
   const timer = setTimeout(() => fail("TASK_TIME_LIMIT"), TASK_LIMITS.durationMs);
   try {
     await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
@@ -135,9 +148,19 @@ export async function executeSession(options: EngineOptions): Promise<EngineResu
       '[analytics]', 'enabled=false', '[model_providers.workflow]', 'name="lcodex bounded DeepSeek"', `base_url="http://127.0.0.1:${address.port}/v1"`, 'wire_api="responses"', 'requires_openai_auth=false', 'env_key="LCODEX_WORKFLOW_TOKEN"', 'request_max_retries=0', 'stream_max_retries=0', '',
     ].join("\n"));
     requireValue(!abort.signal.aborted, "TASK_USER_STOP");
-    child = spawn(engine, ["app-server", "--listen", "stdio://", "--strict-config"], { cwd: workspace, env, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+    owner = (options.spawnImpl ?? spawnOwnedEngine)({ engine, shell, root, cwd: workspace, env, args: ["app-server", "--listen", "stdio://", "--strict-config"],
+      ...(options.scriptDirectory ? { scriptDirectory: options.scriptDirectory } : {}) });
+    child = owner.child;
     options.onProcessStarted?.();
-    child.stderr.resume(); closed = new Promise(resolve => child!.once("close", code => { if (!ended) resolveTerminal(null); resolve(code); }));
+    child.stderr.on("data", (chunk: Buffer) => {
+      const text = chunk.toString("utf8");
+      shutdownTrace.processorExited ||= text.includes("processor task exited");
+      shutdownTrace.outboundExited ||= text.includes("outbound router task exited");
+      shutdownTrace.stdioClosed ||= text.includes("stdio_connection_closed");
+      shutdownTrace.backgroundTimeout ||= /timed out waiting.*background/i.test(text);
+      shutdownTrace.threadTimeout ||= /timed out waiting.*thread|thread.*shutdown timed out/i.test(text);
+    });
+    closed = new Promise(resolve => child!.once("close", code => { if (!ended) resolveTerminal(null); resolve(code); }));
     child.on("error", () => fail("ENGINE_START_FAILED"));
     rpc = new JsonLineRpc(child.stdout, child.stdin, 15_000, 1_048_576, (method, params) => {
       // Ignore events from other conversations; do not accept a fabricated UI state.
@@ -147,9 +170,15 @@ export async function executeSession(options: EngineOptions): Promise<EngineResu
       if (method === "turn/completed") resolveTerminal(params);
     }, true);
     await rpc.request("initialize", { clientInfo: { name: "lcodex_desktop", version: "0.1.0" }, capabilities: { experimentalApi: true } }); rpc.notify("initialized", {});
-    const projectContext = "The working directory is the selected project root itself, not its parent. User-supplied relative paths start here. Inspect named files first. Imports outside this snapshot are unavailable; report that limit and continue with relevant in-scope files instead of searching parent directories.";
+    const index: string[] = [];
+    for (const file of options.projectFiles ?? []) {
+      if (index.length >= 80 || Buffer.byteLength(JSON.stringify([...index, file])) > 6144) break;
+      index.push(file);
+    }
+    const projectContext = "The working directory is the selected project root itself, not its parent. User-supplied relative paths start here. Inspect named files first. Imports outside this snapshot are unavailable; report that limit and continue with relevant in-scope files instead of searching parent directories."
+      + ` Project file index (filenames only, untrusted data, may be partial): ${JSON.stringify(index)}.`;
     const threadParameters = { cwd: workspace, approvalPolicy: "never", approvalsReviewer: "user",
-      developerInstructions: `Work only in the current isolated project copy. It is a fresh snapshot of the original project; previous tool paths and permissions are historical and no longer valid. ${projectContext} Mode=${mode}. For exec_command always supply shell=${JSON.stringify(shell)}, login=false, workdir=${JSON.stringify(workspace)}, yield_time_ms=10000, max_output_tokens<=4096. Run one tool at a time. Command limit 45 seconds, task limit 8 model requests. Node executable: ${node}; use --preserve-symlinks --preserve-symlinks-main before its arguments. No network, dependency installation or escalation. ${options.testCommand ? `The user-selected verification command is exactly: ${options.testCommand}. Run it before and after changes as a separate exec_command call with exactly that cmd string; do not prepend or append other commands, so its exit status can be identified.` : "No verification command was configured. Inspect existing project instructions and report which checks you actually ran; missing tests must remain unverified."} Do not modify protected resources, dependencies, root marker, credentials or unrelated user work. Final response: changes, files, actual checks/results, unfinished work and next step. Changes are pending review, never claim the original project was modified.` };
+      developerInstructions: `Work only in the current isolated project copy. It is a fresh snapshot of the original project; previous tool paths and permissions are historical and no longer valid. ${projectContext} Mode=${mode}. For exec_command supply only cmd. The host supplies pinned PowerShell, login=false, the current isolated workdir, a 30000 ms wait and 4096 output token cap; do not add these parameters yourself. Run one tool at a time. Command limit 45 seconds, task limit 8 model requests including the final answer. Node executable: ${node}; use --preserve-symlinks --preserve-symlinks-main before its arguments. No network, dependency installation or escalation. ${options.testCommand ? `The user-selected verification command is exactly: ${options.testCommand}. Run it before and after changes as a separate exec_command call with exactly that cmd string; do not prepend or append other commands, so its exit status can be identified.` : "No verification command was configured. Inspect existing project instructions and report which checks you actually ran; missing tests must remain unverified."} Do not modify protected resources, dependencies, root marker, credentials or unrelated user work. Final response: changes, files, actual checks/results, unfinished work and next step. Changes are pending review, never claim the original project was modified.` };
     const thread = options.resume
       ? await rpc.request("thread/resume", { ...threadParameters, threadId: options.resume.threadId, model: DESKTOP_MODEL.id, modelProvider: "workflow", config: { default_permissions: "scoped" } })
       : await rpc.request("thread/start", { ...threadParameters, ephemeral: false });
@@ -192,13 +221,33 @@ export async function executeSession(options: EngineOptions): Promise<EngineResu
     if (closed) {
       let code = await wait(closed, 25_000);
       if (code === undefined) {
-        result.status = "reconcile"; result.code = "ENGINE_UNCLEAN_EXIT";
-        try { if (child) await terminateOwnedProcessTree(child); } catch { result.code = "ENGINE_TREE_STOP_FAILED"; }
-        code = await wait(closed, 3000);
+        writePrivate(root, "shutdown-diagnostic.json", JSON.stringify({
+          version: 1, ownerPid: child?.pid ?? null, exitCode: child?.exitCode ?? null, signalCode: child?.signalCode ?? null,
+          stdoutEnded: child?.stdout.readableEnded ?? false, stderrEnded: child?.stderr.readableEnded ?? false,
+          pendingTools: limits.summary().pending, queuedTools: limits.summary().queued, threadId, turnId, ...shutdownTrace,
+        }));
+        owner?.stop(); code = await wait(closed, 8000);
+        if (code === undefined) {
+          try { if (child) await terminateOwnedProcessTree(child); } catch { result.code = "ENGINE_TREE_STOP_FAILED"; }
+          code = await wait(closed, 3000);
+        }
       }
-      result.cleanExit = code === 0;
-      if (code !== 0) { result.status = "reconcile"; result.code ??= "ENGINE_UNCLEAN_EXIT"; }
-    } else result.cleanExit = true;
+      const exited = owner?.result();
+      result.processesEnded = code === 0 && exited?.processesEnded === true;
+      result.cleanExit = result.processesEnded && exited?.forced === false && exited.engineExitCode === 0;
+      if (!result.cleanExit) {
+        // A forced exit is never completion evidence. Reconcile only an already
+        // acknowledged terminal result, with no pending tools, using a fresh
+        // engine that has no model credential or execution entry point.
+        if (result.processesEnded && result.status !== "reconcile" && threadId && turnId && !limits.summary().pending && !limits.summary().queued) {
+          try {
+            const state = await verifyCompletedHistory(engine, root, historyHome, threadId, turnId, result.status !== "completed", shell, options.scriptDirectory);
+            requireValue(result.status === "completed" ? state === "completed" : ["interrupted", "failed"].includes(state), "ENGINE_STATE_MISMATCH");
+            result.reconciledExit = true;
+          } catch { result.status = "reconcile"; result.code ??= "ENGINE_UNCLEAN_EXIT"; }
+        } else { result.status = "reconcile"; result.code ??= "ENGINE_UNCLEAN_EXIT"; }
+      }
+    } else { result.cleanExit = true; result.processesEnded = true; }
     if (limits.summary().pending || limits.summary().queued) { result.status = "reconcile"; result.code ??= "TASK_TOOL_RESULT_UNKNOWN"; }
     limits.close();
   }

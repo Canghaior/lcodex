@@ -53,7 +53,7 @@ export async function verifyRuntime(files: ReturnType<typeof runtimePaths>, reso
     for (const relative of actual) {
       if (await hash(path.join(resources, relative)) !== expected.get(relative)) throw new Error();
     }
-    if (!["windows-file-guard.ps1", "windows-file-guard.cs"].every(name => existsSync(path.join(files.guard, name)))) throw new Error();
+    if (!["windows-file-guard.ps1", "windows-file-guard.cs", "windows-process-owner.ps1", "windows-process-owner.cs"].every(name => existsSync(path.join(files.guard, name)))) throw new Error();
     return result;
   } catch { return { engine: false, shell: false, node: false }; }
 }

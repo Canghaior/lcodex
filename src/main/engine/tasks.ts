@@ -9,7 +9,7 @@ import { assertNoKnownSecrets } from "../../../validation/outbound-data.js";
 import type { BudgetInfo, Chat, Project } from "../../shared/contracts.js";
 import type { AppStore } from "../storage/store.js";
 import type { Credentials } from "../storage/credentials.js";
-import { executeSession, safeCode } from "./session.js";
+import { confirmedSessionExit, executeSession, safeCode } from "./session.js";
 import { sendBoundedDeepSeek } from "../../../validation/deepseek-request.js";
 import { DESKTOP_MODEL } from "../../../validation/deepseek-model.js";
 import { readPrivate, writePrivate } from "../../../validation/private-files.js";
@@ -22,7 +22,7 @@ import { assertProjectDataSeparation } from "../projects/projects.js";
 
 type Workspace = Awaited<ReturnType<typeof prepareReviewWorkspace>>;
 type ReviewEntry = { task: Workspace; review: Review; applying: boolean };
-type Options = { engine: string; shell: string; node: string; root: string; ledgerFile: string; budgetScope: BudgetScope; pricing: Pricing; guard: WindowsFileGuard; credentials: Credentials; store: AppStore; notify: () => void };
+type Options = { engine: string; shell: string; node: string; root: string; ledgerFile: string; budgetScope: BudgetScope; pricing: Pricing; guard: WindowsFileGuard; credentials: Credentials; store: AppStore; notify: () => void; scriptDirectory?: string };
 export class Tasks {
   private active: { chatId: string; abort: AbortController; done: Promise<void> } | undefined;
   private reviews = new Map<string, ReviewEntry>();
@@ -112,7 +112,7 @@ export class Tasks {
     let resume: { threadId: string; turnId: string } | undefined;
     if (chat.execution === "ended") {
       const previous = JSON.parse(readPrivate(this.options.root, `tasks/${chat.id}/outcome.json`));
-      if (previous.status !== "completed" || previous.cleanExit !== true || typeof previous.threadId !== "string" || typeof previous.turnId !== "string") throw new Error("ENGINE_HISTORY_MISMATCH");
+      if (previous.status !== "completed" || !confirmedSessionExit(previous) || typeof previous.threadId !== "string" || typeof previous.turnId !== "string") throw new Error("ENGINE_HISTORY_MISMATCH");
       resume = { threadId: previous.threadId, turnId: previous.turnId };
     }
     this.ledger = this.openForRequest(); this.budgetError = null;
@@ -141,14 +141,16 @@ export class Tasks {
       const prepared = task;
       const taskRecord = JSON.stringify({ chatId: chat.id, projectId: project.id, taskDirectory: task.taskDirectory, runRoot: root, previousTurnId: resume?.turnId ?? null, mode: chat.mode, state: "prepared" });
       writeFileSync(path.join(root, "task.json"), taskRecord, { flag: "wx" }); writePrivate(chatRoot, "task.json", taskRecord);
+      const captured = JSON.parse(readFileSync(path.join(task.taskDirectory, "private/baseline.json"), "utf8"));
       if (chat.mode === "write") {
-        const captured = JSON.parse(readFileSync(path.join(task.taskDirectory, "private/baseline.json"), "utf8"));
         const manifest = captured.files.find((file: { relative: string }) => file.relative === "package.json");
         if (!manifest || JSON.parse(Buffer.from(manifest.base64, "base64").toString("utf8")).workspaces) throw new Error("PROJECT_SCOPE_UNSUPPORTED");
       }
       if (abort.signal.aborted) throw new Error("TASK_USER_STOP");
       const result = await executeSession({ ...this.options, priceConfirmedOn: this.options.pricing.requireCurrent(), root, historyHome: path.join(chatRoot, "home"), ...(resume ? { resume } : {}), workspace: task.workspace, privateDir: path.join(task.taskDirectory, "private"), original: project.path,
-        rootMarker: task.rootMarker, readOnlyAssets: task.readOnlyAssets, readOnlyDirectories: task.readOnlyDirectories, mode: chat.mode, prompt, testCommand: project.testCommand ?? "", key, ledger: this.ledger!, signal: abort.signal,
+        rootMarker: task.rootMarker, readOnlyAssets: task.readOnlyAssets, readOnlyDirectories: task.readOnlyDirectories,
+        projectFiles: captured.files.map((file: { relative: string }) => file.relative),
+        mode: chat.mode, prompt, testCommand: project.testCommand ?? "", key, ledger: this.ledger!, signal: abort.signal,
         onProcessStarted: () => { processKnownEnded = false; },
         onIdentity: (threadId, turnId) => { const bytes = JSON.stringify({ threadId, turnId }); writeFileSync(path.join(root, "identity.json"), bytes, { flag: "wx" }); writePrivate(chatRoot, "identity.json", bytes); },
         onEvent: (method, params) => {
@@ -161,7 +163,9 @@ export class Tasks {
               if (existing) existing.text = sanitize(item.text); else chat.messages.push({ id: item.id, role: "assistant", text: sanitize(item.text) });
             }
             if (["commandExecution", "fileChange"].includes(String(item.type)) && typeof item.id === "string") {
-              if (method === "item/started") chat.verification = "unverified";
+              // Completion also invalidates an earlier check if a started event
+              // was unavailable; only the exact completed verification restores it.
+              chat.verification = "unverified";
               let tool = chat.tools.find(tool => tool.id === item.id);
               if (!tool) { tool = { id: item.id, title: sanitize(plannedCommands.get(item.id) ?? (typeof item.command === "string" ? item.command : "修改文件")), status: "running", output: "", exitCode: null }; chat.tools.push(tool); }
               if (typeof item.aggregatedOutput === "string") tool.output = sanitize(item.aggregatedOutput);
@@ -188,7 +192,7 @@ export class Tasks {
           this.publish(false);
         },
       });
-      processKnownEnded = result.cleanExit;
+      processKnownEnded = result.processesEnded;
       writeFileSync(path.join(root, "outcome.json"), JSON.stringify(result), { flag: "wx" });
       writePrivate(chatRoot, "outcome.json", JSON.stringify(result));
       chat.error = result.code;
@@ -250,10 +254,10 @@ export class Tasks {
       const chatRoot = path.join(this.options.root, "tasks", chat.id);
       const taskRecord = JSON.parse(readPrivate(chatRoot, "task.json")), outcome = JSON.parse(readPrivate(chatRoot, "outcome.json"));
       const identity = JSON.parse(readPrivate(chatRoot, "identity.json"));
-      if (taskRecord.chatId !== chat.id || taskRecord.projectId !== project.id || outcome.status !== "completed" || outcome.cleanExit !== true ||
+      if (taskRecord.chatId !== chat.id || taskRecord.projectId !== project.id || outcome.status !== "completed" || !confirmedSessionExit(outcome) ||
         typeof identity.threadId !== "string" || typeof identity.turnId !== "string" || identity.threadId !== outcome.threadId || identity.turnId !== outcome.turnId ||
         path.dirname(taskRecord.runRoot).toLowerCase() !== path.join(chatRoot, "turns").toLowerCase()) throw new Error("REVIEW_RECONCILE_REQUIRED");
-      await verifyCompletedHistory(this.options.engine, taskRecord.runRoot, path.join(chatRoot, "home"), identity.threadId, identity.turnId);
+      await verifyCompletedHistory(this.options.engine, taskRecord.runRoot, path.join(chatRoot, "home"), identity.threadId, identity.turnId, false, this.options.shell, this.options.scriptDirectory);
       const task = restoreReviewWorkspace(project.path, path.join(this.options.root, "reviews"), taskRecord.taskDirectory, chat.reviewId, this.options.guard);
       this.reviews.set(chat.id, { task, review: task.review, applying: false });
       // The current workspace.json display is not authority for frozen bytes or
@@ -284,7 +288,10 @@ export class Tasks {
     try {
       const chatRoot = path.join(this.options.root, "tasks", chat.id);
       const task = JSON.parse(readPrivate(chatRoot, "task.json")), outcome = JSON.parse(readPrivate(chatRoot, "outcome.json"));
-      if (task.chatId !== chat.id || task.projectId !== project.id || outcome.cleanExit !== true ||
+      // Abandonment still performs its own read-only history check below. An
+      // empty owned job establishes process exit even when the interrupted
+      // operation itself is uncertain; it does not authorize apply or replay.
+      if (task.chatId !== chat.id || task.projectId !== project.id || !(confirmedSessionExit(outcome) || outcome.processesEnded === true) ||
         typeof outcome.threadId !== "string" || !(typeof outcome.turnId === "string" || outcome.turnId === null && outcome.requests === 0) ||
         path.dirname(task.runRoot).toLowerCase() !== path.join(chatRoot, "turns").toLowerCase()) throw new Error("TASK_ABANDON_RECONCILE_REQUIRED");
       if (outcome.turnId !== null) {
@@ -295,7 +302,7 @@ export class Tasks {
       if (!/^[a-f0-9-]{36}$/.test(taskId) || path.resolve(task.taskDirectory).toLowerCase() !== path.join(this.options.root, "reviews", taskId).toLowerCase()) throw new Error("REVIEW_STORAGE_INVALID");
       const evidence = assertNeverApplied(task.taskDirectory);
       const expectedTurn = outcome.turnId ?? (typeof task.previousTurnId === "string" ? task.previousTurnId : null);
-      const terminal = await verifyCompletedHistory(this.options.engine, task.runRoot, path.join(chatRoot, "home"), outcome.threadId, expectedTurn, true);
+      const terminal = await verifyCompletedHistory(this.options.engine, task.runRoot, path.join(chatRoot, "home"), outcome.threadId, expectedTurn, true, this.options.shell, this.options.scriptDirectory);
       writePrivate(task.runRoot, "abandoned.json", JSON.stringify({ taskId, threadId: outcome.threadId, turnId: outcome.turnId, terminal, reason: "explicit-user-abandonment" }));
       const held = this.unapplied.get(chat.id);
       if (held) {

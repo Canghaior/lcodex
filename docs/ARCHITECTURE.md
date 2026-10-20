@@ -65,6 +65,8 @@ DeepSeek API
 
 DeepSeek 接入优先采用引擎原有 provider 配置；确需适配时集中在引擎连接或模型适配模块。renderer 不依赖 DeepSeek 的原始响应字段。后续增加模型或更换引擎时尽量保留界面，但不承诺任意引擎可以无成本替换。
 
+P4 的命令适配器只向模型提供命令正文，由后台固定 shell、隔离目录及输出/等待上限，继续通过 app-server 执行，不新增 Agent 循环。Windows 进程管理器在引擎运行前建立 Job 所有权，收尾核对整个进程组；强制回收与任务成功分开，必要时使用没有模型调用和执行入口的新引擎读回持久终态。实现及失败记录见 [P4 稳定性](validation/P4_STABILITY.md)。少量 C# 与 PowerShell 代码仅处理 Windows 文件和进程原生能力，应用主体技术栈不变。
+
 ## 计划目录
 
 以下为组织方向，src/main、src/preload、src/renderer、src/shared 和 tests 已建立；尚无必要时不创建空子目录。P2 复用 validation 中经过验证的保护组件，后续提取生产连接，不维护重复的执行循环。

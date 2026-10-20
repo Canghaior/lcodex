@@ -2,11 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { executeSession } from "../dist/src/main/engine/session.js";
+import { confirmedSessionExit, executeSession } from "../dist/src/main/engine/session.js";
 import { localDay } from "../dist/src/main/storage/pricing.js";
 import { BudgetLedger } from "../dist/validation/budget.js";
 import { createRunDirectory } from "../dist/validation/run-directory.js";
 import { DESKTOP_MODEL } from "../dist/validation/deepseek-model.js";
+import { spawnOwnedEngine } from "../dist/validation/owned-engine.js";
 
 function responseFor(item, n, incomplete = false) {
   const reasoning = { id: `reason-${n}`, type: "reasoning", status: "completed", summary: [], encrypted_content: null,
@@ -35,8 +36,9 @@ function responseFor(item, n, incomplete = false) {
 
 // The model is simulated. app-server, Windows MXC, commands and history are real.
 // Every ledger here is synthetic and distinct from the paid development ledger.
-for (const finalKind of ["message", "function_call", "custom_tool_call", "incomplete"]) {
-  test(`the eighth request permits only a summary: ${finalKind}`, { timeout: 120000 }, async () => {
+for (const scenario of ["message", "reaped-message", "function_call", "custom_tool_call", "incomplete", "dsml"]) {
+  const finalKind = scenario === "reaped-message" ? "message" : scenario;
+  test(`the eighth request permits only a summary: ${scenario}`, { timeout: 120000 }, async () => {
     const run = createRunDirectory("session limit 中文"), workspace = path.join(run.root, "workspace");
     const original = path.join(run.root, "original"), privateDir = path.join(run.root, "private");
     const runtimes = path.resolve(".local/releases/win-unpacked/resources/runtimes");
@@ -55,6 +57,14 @@ for (const finalKind of ["message", "function_call", "custom_tool_call", "incomp
         readOnlyAssets: [], readOnlyDirectories: [], mode: "write", prompt: "Read source.txt and report the observed evidence.",
         testCommand: "", key: "sk-synthetic-session-limit-only", ledger, signal: abort.signal, priceConfirmedOn: localDay(),
         onIdentity: () => {}, onEvent: (method, params) => events.push({ method, params }),
+        ...(scenario === "reaped-message" ? { spawnImpl: options => {
+          const owner = spawnOwnedEngine(options);
+          // Fault injection: a completed real engine never receives EOF. The
+          // production 25s deadline must reap its job, then use a separate real
+          // engine to confirm saved history without making a ninth model call.
+          owner.child.stdin.end = () => owner.child.stdin;
+          return owner;
+        } } : {}),
         fetchImpl: async (url, init) => {
           assert.equal(url, "https://api.deepseek.com/responses");
           const body = JSON.parse(init.body), n = requests.push(body);
@@ -74,15 +84,15 @@ for (const finalKind of ["message", "function_call", "custom_tool_call", "incomp
             assert.equal(body.input.at(-1).role, "system");
             assert.deepEqual(body.tools, []);
           }
-          const item = n === 8 && finalKind === "message"
+          const item = n === 8 && ["message", "dsml"].includes(finalKind)
             ? { id: `message-${n}`, type: "message", role: "assistant", status: "completed",
-                content: [{ type: "output_text", text: "Request limit reached. source.txt was read; tests remain unverified.", annotations: [] }] }
+                content: [{ type: "output_text", text: finalKind === "dsml" ? "<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name=\"exec_command\">"
+                  : "Request limit reached. source.txt was read; tests remain unverified.", annotations: [] }] }
             : n === 8 && finalKind === "custom_tool_call"
               ? { id: `item-${n}`, type: "custom_tool_call", name: "apply_patch", call_id: `call-${n}`, status: "completed",
                   input: "*** Begin Patch\n*** Add File: forbidden.txt\n+must not run\n*** End Patch" }
               : { id: `item-${n}`, type: "function_call", name: "exec_command", call_id: `call-${n}`, status: "completed",
-                  arguments: JSON.stringify({ cmd: n === 8 ? "Set-Content -LiteralPath './forbidden.txt' -Value 'must not run'" : "Get-Content -LiteralPath './source.txt' -Raw",
-                    shell, login: false, workdir: workspace, yield_time_ms: 10000, max_output_tokens: 2048 }) };
+                  arguments: JSON.stringify({ cmd: n === 8 ? "Set-Content -LiteralPath './forbidden.txt' -Value 'must not run'" : "Get-Content -LiteralPath './source.txt' -Raw" }) };
           return responseFor(item, n, n === 8 && finalKind === "incomplete");
         },
       });
@@ -92,9 +102,11 @@ for (const finalKind of ["message", "function_call", "custom_tool_call", "incomp
       }, null, 2));
       assert.equal(requests.length, 8);
       assert.equal(result.requests, 8);
-      assert.equal(result.cleanExit, true, JSON.stringify(result));
+      assert.equal(result.processesEnded, true, JSON.stringify(result));
+      assert.equal(confirmedSessionExit(result), true, JSON.stringify(result));
+      if (scenario === "reaped-message") { assert.equal(result.cleanExit, false); assert.equal(result.reconciledExit, true); }
       assert.equal(result.status, finalKind === "message" ? "completed" : "failed", JSON.stringify(result));
-      assert.equal(result.code, finalKind === "message" ? null : finalKind === "incomplete" ? "API_RESPONSE_INCOMPLETE" : "TASK_FINAL_RESPONSE_TOOL_REFUSED");
+      assert.equal(result.code, finalKind === "message" ? null : finalKind === "incomplete" ? "API_RESPONSE_INCOMPLETE" : finalKind === "dsml" ? "TASK_FINAL_ANSWER_INVALID" : "TASK_FINAL_RESPONSE_TOOL_REFUSED");
       assert.equal(events.filter(event => event.method === "boundary/toolPlan").length, 7);
       assert.equal(existsSync(path.join(workspace, "forbidden.txt")), false, "A final-call command or patch must never execute");
       assert.equal(readFileSync(path.join(original, "source.txt"), "utf8"), "ORIGINAL_UNCHANGED\n");
@@ -106,3 +118,54 @@ for (const finalKind of ["message", "function_call", "custom_tool_call", "incomp
     }
   });
 }
+
+for (const obey of [true, false]) test(`the last tool opportunity is reserved for actual verification (obey=${obey})`, { timeout: 120000 }, async () => {
+  const run = createRunDirectory("session verify 中文");
+  const workspace = path.join(run.root, "workspace"), original = path.join(run.root, "original"), privateDir = path.join(run.root, "private");
+  for (const dir of [workspace, original, privateDir]) mkdirSync(dir);
+  writeFileSync(path.join(workspace, ".lcodex-root"), ""); writeFileSync(path.join(workspace, "source.txt"), "READ_EVIDENCE");
+  writeFileSync(path.join(original, "source.txt"), "ORIGINAL");
+  const runtimes = path.resolve(".local/releases/win-unpacked/resources/runtimes");
+  const ledgerFile = path.join(privateDir, "mock-budget.jsonl"); BudgetLedger.initialize(ledgerFile);
+  const ledger = new BudgetLedger(ledgerFile), events = [], requests = [];
+  const testCommand = "if (Test-Path -LiteralPath './changed.txt') { Write-Output 'VERIFIED'; exit 0 } else { exit 1 }";
+  let clean = false;
+  try {
+    const result = await executeSession({ engine: path.join(runtimes, "codex/bin/codex.exe"), shell: path.join(runtimes, "powershell/pwsh.exe"),
+      node: path.join(runtimes, "node/node.exe"), root: run.root, workspace, original, privateDir, rootMarker: ".lcodex-root",
+      readOnlyAssets: [], readOnlyDirectories: [], mode: "write", projectFiles: ["source.txt"], prompt: "Make a small change and verify it.",
+      testCommand, key: "sk-synthetic-session-verify-only", ledger, signal: new AbortController().signal, priceConfirmedOn: localDay(),
+      onIdentity: () => {}, onEvent: (method, params) => events.push({ method, params }),
+      fetchImpl: async (_url, init) => {
+        const body = JSON.parse(init.body), n = requests.push(body);
+        if (n === 7) {
+          assert.equal(body.tools.length, 1); assert.equal(body.tools[0].name, "exec_command");
+          assert.deepEqual(body.tools[0].parameters.properties.cmd.enum, [testCommand]);
+          assert.match(body.input.at(-1).content, /Last actual verification exit code: 1/);
+        }
+        if (n === 8) {
+          assert.match(body.input.at(-1).content, /no later tool has invalidated/);
+          assert.ok(body.input.some(item => item.type === "function_call_output" && String(item.output).includes("VERIFIED")));
+        }
+        const item = n === 6 || n === 7 && !obey
+          ? { id: `i-${n}`, type: "custom_tool_call", name: "apply_patch", call_id: `c-${n}`, status: "completed",
+            input: `*** Begin Patch\n*** Add File: ${n === 6 ? "changed.txt" : "forbidden.txt"}\n+changed\n*** End Patch` }
+          : n === 8 ? { id: "answer", type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: "Actual verification completed.", annotations: [] }] }
+          : { id: `i-${n}`, type: "function_call", name: "exec_command", call_id: `c-${n}`, status: "completed",
+            arguments: JSON.stringify({ cmd: n === 1 || n === 7 ? testCommand : "Get-Content -LiteralPath './source.txt' -Raw" }) };
+        return responseFor(item, n);
+      },
+    });
+    writeFileSync(path.join(run.root, "outcome.json"), JSON.stringify({ obey, result, requests: requests.length }));
+    assert.equal(result.processesEnded, true, JSON.stringify(result));
+    assert.equal(confirmedSessionExit(result), true, JSON.stringify(result));
+    assert.equal(result.status, obey ? "completed" : "failed", JSON.stringify(result));
+    assert.equal(result.code, obey ? null : "TASK_VERIFICATION_REQUIRED");
+    assert.equal(requests.length, obey ? 8 : 7);
+    assert.equal(existsSync(path.join(workspace, "forbidden.txt")), false);
+    assert.equal(readFileSync(path.join(original, "source.txt"), "utf8"), "ORIGINAL");
+    const checks = events.filter(event => event.method === "item/completed" && event.params.item?.type === "commandExecution");
+    assert.equal(checks.at(-1).params.item.exitCode, 0);
+    clean = true;
+  } finally { ledger.close(); if (clean) run.cleanup(); else console.log("Retained verification fixture:", path.basename(run.root)); }
+});

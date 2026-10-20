@@ -70,7 +70,7 @@ for (const [relative, metadata] of Object.entries(lock.packages)) {
 writeFileSync(path.join(noticeRoot, "inventory.json"), JSON.stringify(notices, null, 2));
 const resources = [{ from: engine, to: "runtimes/codex" }, { from: shell, to: "runtimes/powershell" },
   { from: node, to: "runtimes/node", filter: ["node.exe", "LICENSE", "npm", "npm.cmd", "npm.ps1", "node_modules/npm/**/*"] },
-  { from: path.join(root, "validation"), to: "guard", filter: ["windows-file-guard.ps1", "windows-file-guard.cs"] }];
+  { from: path.join(root, "validation"), to: "guard", filter: ["windows-file-guard.ps1", "windows-file-guard.cs", "windows-process-owner.ps1", "windows-process-owner.cs"] }];
 const manifest = [], runtimeCopies = [];
 for (const resource of resources) {
   for (const file of tree(resource.from)) {
