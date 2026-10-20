@@ -31,10 +31,13 @@ protocol.registerSchemesAsPrivileged([{ scheme: "lcodex", privileges: { standard
 app.enableSandbox();
 const paths = runtimePaths(sourceRoot, process.resourcesPath, app.isPackaged, app.getPath("home"));
 const { engine, shell, node } = paths;
+let startupStage = "READY";
 
 async function main() {
   await app.whenReady();
+  startupStage = "STORE";
   const store = new AppStore(dataRoot, app.getVersion() + (app.isPackaged ? "" : "-dev"));
+  startupStage = "RUNTIME";
   const runtime = { ...await verifyRuntime(paths, process.resourcesPath, app.isPackaged), key: false, ready: false, platform: "Windows · MXC", bundled: app.isPackaged };
   const guard = runtime.shell ? new WindowsFileGuard(shell, dataRoot, paths.guard) : undefined;
   const credentials = new Credentials(dataRoot);
@@ -46,6 +49,7 @@ async function main() {
     runtime.key = credentials.present(); runtime.ready = runtime.engine && runtime.shell && runtime.node && runtime.key && !tasks?.budgetError && tasks?.budget().pending === 0 && pricing.status().current;
     return store.state({ runtime, budget: tasks?.budget() ?? { committed: 0, unknown: 0, estimated: 0, limit: 10, perTask: 1, pending: 0, pendingCost: 0, revision: "", configured: false, scope: budgetScope, error: "RUNTIME_UNAVAILABLE" }, pricing: pricing.status(), executionAvailable: !!tasks });
   };
+  startupStage = "WINDOW";
   const rendererRoot = realpathSync(path.join(sourceRoot, "dist/renderer"));
   protocol.handle("lcodex", request => {
     const url = new URL(request.url);
@@ -160,9 +164,18 @@ async function main() {
       return { ok: true, state: state() };
     } catch (error) { return { ok: false, code: error instanceof Error && /^[A-Z][A-Z0-9_]{2,80}$/.test(error.message) ? error.message : "ACTION_FAILED" }; }
   });
+  startupStage = "LOAD";
   await win.loadURL("lcodex://app/index.html");
   win.show();
 }
-if (ownsInstance) main().catch(() => { console.error("LCODEX_START_FAILED"); dialog.showErrorBox("lcodex 无法启动", "本地配置或运行文件无法读取。请保留应用数据目录供核对，不要删除任务记录。"); app.exit(1); });
+if (ownsInstance) main().catch((error: unknown) => {
+  // Fixed stages and bounded codes make a startup failure diagnosable without
+  // exposing error messages, file paths, configuration contents or credentials.
+  const code = error && typeof error === "object" && "code" in error && typeof error.code === "string" && /^[A-Z0-9_]{1,64}$/.test(error.code) ? error.code : "UNKNOWN";
+  const diagnostic = `START_${startupStage}_${code}`;
+  console.error("LCODEX_START_FAILED", diagnostic);
+  dialog.showErrorBox("lcodex 无法启动", `本地配置或运行文件无法读取。错误码：${diagnostic}。请保留应用数据目录供核对，不要删除任务记录。`);
+  app.exit(1);
+});
 else app.exit(0);
 app.on("window-all-closed", () => app.quit());

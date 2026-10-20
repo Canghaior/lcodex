@@ -14,6 +14,22 @@ test("model schema communicates the enforced envelope without granting extra too
   assert.equal(schema.additionalProperties, false); assert.equal(schema.properties.sandbox_permissions, undefined);
   assert.throws(() => policy.functionCall("exec_command", { cmd: "anything" }), /PROJECT_SHELL_REFUSED/);
 });
+test("advertised output and wait limits match enforcement even if the engine advertises larger defaults", () => {
+  const [tool] = projectModelTools([{ type: "function", name: "exec_command", parameters: { properties: {
+    cmd: { type: "string" }, max_output_tokens: { type: "number", default: 10000 }, yield_time_ms: { type: "number", maximum: 300000 },
+  } } }], root, shell);
+  const properties = (tool!.parameters as { properties: Record<string, { type: string; minimum: number; maximum: number; default?: number }> }).properties;
+  for (const field of ["max_output_tokens", "yield_time_ms"]) {
+    const limit = properties[field]!;
+    assert.equal(limit.type, "integer");
+    assert.equal(limit.minimum, 1);
+    assert.equal(limit.maximum, field === "max_output_tokens" ? 4096 : 30000);
+    assert.equal(limit.default, undefined);
+    const args = { cmd: "Get-Content ./source.txt", shell, login: false, workdir: root };
+    for (const value of [limit.minimum, limit.maximum]) policy.functionCall("exec_command", { ...args, [field]: value });
+    for (const value of [0, 1.5, limit.maximum + 1]) assert.throws(() => policy.functionCall("exec_command", { ...args, [field]: value }), /PROJECT_.*REFUSED/);
+  }
+});
 test("binary resource paths cannot be admitted through relative, absolute or move patch headers", () => {
   const assets = projectToolPolicy(root, shell, ".lcodex-root-test", ["assets/logo.png"]);
   for (const file of ["assets/logo.png", path.join(root, "assets/logo.png"), ...(process.platform === "win32" ? ["assets/LOGO.png"] : [])]) {

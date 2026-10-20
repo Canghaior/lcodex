@@ -11,6 +11,7 @@ import { isolatedEnvironment } from "../../../validation/isolated-env.js";
 import { validationCatalog } from "../../../validation/model-catalog.js";
 import { assertNoKnownSecrets } from "../../../validation/outbound-data.js";
 import { projectModelTools, projectToolPolicy } from "../../../validation/project-tool-policy.js";
+import { terminateOwnedProcessTree } from "../../../validation/process-tree-stop.js";
 import { isObject, JsonLineRpc } from "../../../validation/rpc.js";
 import { prepareSerialResponse } from "../../../validation/serial-response.js";
 import { TaskLimits, TASK_LIMITS } from "../../../validation/task-limits.js";
@@ -78,11 +79,18 @@ export async function executeSession(options: EngineOptions): Promise<EngineResu
         if (!isObject(parsed) || !Array.isArray(parsed.tools)) throw new Error("GATEWAY_REQUEST_INVALID");
         limits.request(); requests++;
         const tools = projectModelTools(parsed.tools.filter(isObject), workspace, shell).filter(tool => mode === "write" || tool.name !== "apply_patch");
-        const request = prepareEngineModelRequest(parsed, tools);
+        // Reserve the existing last request for a useful summary. Keep the cap,
+        // full history and usage accounting; do not add a ninth request.
+        const finalResponseOnly = requests === TASK_LIMITS.requests;
+        const request = prepareEngineModelRequest(parsed, tools, { finalResponseOnly });
         activeUpstream = sendBoundedDeepSeek(ledger, trial, key, request, options.fetchImpl ?? fetch, abort.signal, PROJECT_MAX_INPUT_BYTES);
         const result = await activeUpstream;
         limits.check();
+        requireValue(result.terminalType === "response.completed", result.terminalType === "response.incomplete" ? "API_RESPONSE_INCOMPLETE" : "API_RESPONSE_FAILED");
         const batch = prepareSerialResponse(result.wire, result.response, policy);
+        // tool_choice and instructions are not enforcement. Refuse all tool
+        // events before exposing any bytes if the model ignores the final call.
+        requireValue(!finalResponseOnly || batch.calls.length === 0, "TASK_FINAL_RESPONSE_TOOL_REFUSED");
         // Preserve the validated request command by call ID. The engine's display
         // command includes shell quoting and is not an exact command identity.
         if (Array.isArray(result.response.output)) for (const item of result.response.output) {
@@ -108,7 +116,7 @@ export async function executeSession(options: EngineOptions): Promise<EngineResu
     const address = server.address(); if (!address || typeof address === "string") throw new Error("GATEWAY_NO_PORT");
     const catalog = validationCatalog(true, mode === "read", mode === "write", true);
     catalog.models[0]!.display_name = "DeepSeek Flash";
-    catalog.models[0]!.base_instructions = `You are a coding assistant in an isolated project copy. ${mode === "read" ? "This task is read-only. Analyse and explain; do not modify files or install anything." : "Read relevant code, reproduce issues, implement the requested change, and verify."} Preserve unrelated files. Be concise. Report actual results and limitations, never claim tests you did not run. Reply in the user's language.`;
+    catalog.models[0]!.base_instructions = `You are a coding assistant in an isolated project copy. ${mode === "read" ? "This task is read-only. Analyse and explain; do not modify files or install anything." : "Read relevant code, reproduce issues, implement the requested change, and verify."} When the user names a source path, inspect that path first and avoid repeated directory inventories. Keep reads focused on relevant excerpts. Preserve unrelated files. Be concise. Report actual results and limitations, never claim tests you did not run. Reply in the user's language.`;
     writePrivate(historyHome, "models.json", JSON.stringify(catalog));
     writePrivate(historyHome, "config.toml", [
       'model="deepseek-flash"', 'model_provider="workflow"', 'model_reasoning_effort="none"', `model_catalog_json=${quote(path.join(historyHome, "models.json"))}`,
@@ -135,8 +143,9 @@ export async function executeSession(options: EngineOptions): Promise<EngineResu
       if (method === "turn/completed") resolveTerminal(params);
     }, true);
     await rpc.request("initialize", { clientInfo: { name: "lcodex_desktop", version: "0.1.0" }, capabilities: { experimentalApi: true } }); rpc.notify("initialized", {});
+    const projectContext = "The working directory is the selected project root itself, not its parent. User-supplied relative paths start here. Inspect named files first. Imports outside this snapshot are unavailable; report that limit and continue with relevant in-scope files instead of searching parent directories.";
     const threadParameters = { cwd: workspace, approvalPolicy: "never", approvalsReviewer: "user",
-      developerInstructions: `Work only in the current isolated project copy. It is a fresh snapshot of the original project; previous tool paths and permissions are historical and no longer valid. Mode=${mode}. For exec_command always supply shell=${JSON.stringify(shell)}, login=false, workdir=${JSON.stringify(workspace)}, yield_time_ms=10000, max_output_tokens<=4096. Run one tool at a time. Command limit 45 seconds, task limit 8 model requests. Node executable: ${node}; use --preserve-symlinks --preserve-symlinks-main before its arguments. No network, dependency installation or escalation. ${options.testCommand ? `The user-selected verification command is exactly: ${options.testCommand}. Run it before and after changes as a separate exec_command call with exactly that cmd string; do not prepend or append other commands, so its exit status can be identified.` : "No verification command was configured. Inspect existing project instructions and report which checks you actually ran; missing tests must remain unverified."} Do not modify protected resources, dependencies, root marker, credentials or unrelated user work. Final response: changes, files, actual checks/results, unfinished work and next step. Changes are pending review, never claim the original project was modified.` };
+      developerInstructions: `Work only in the current isolated project copy. It is a fresh snapshot of the original project; previous tool paths and permissions are historical and no longer valid. ${projectContext} Mode=${mode}. For exec_command always supply shell=${JSON.stringify(shell)}, login=false, workdir=${JSON.stringify(workspace)}, yield_time_ms=10000, max_output_tokens<=4096. Run one tool at a time. Command limit 45 seconds, task limit 8 model requests. Node executable: ${node}; use --preserve-symlinks --preserve-symlinks-main before its arguments. No network, dependency installation or escalation. ${options.testCommand ? `The user-selected verification command is exactly: ${options.testCommand}. Run it before and after changes as a separate exec_command call with exactly that cmd string; do not prepend or append other commands, so its exit status can be identified.` : "No verification command was configured. Inspect existing project instructions and report which checks you actually ran; missing tests must remain unverified."} Do not modify protected resources, dependencies, root marker, credentials or unrelated user work. Final response: changes, files, actual checks/results, unfinished work and next step. Changes are pending review, never claim the original project was modified.` };
     const thread = options.resume
       ? await rpc.request("thread/resume", { ...threadParameters, threadId: options.resume.threadId, model: "deepseek-flash", modelProvider: "workflow", config: { default_permissions: "scoped" } })
       : await rpc.request("thread/start", { ...threadParameters, ephemeral: false });
@@ -178,7 +187,11 @@ export async function executeSession(options: EngineOptions): Promise<EngineResu
     rpc?.abort(new Error("ENGINE_SESSION_CLOSED")); child?.stdin.end();
     if (closed) {
       let code = await wait(closed, 25_000);
-      if (code === undefined) { child?.kill(); code = await wait(closed, 3000); result.status = "reconcile"; result.code = "ENGINE_UNCLEAN_EXIT"; }
+      if (code === undefined) {
+        result.status = "reconcile"; result.code = "ENGINE_UNCLEAN_EXIT";
+        try { if (child) await terminateOwnedProcessTree(child); } catch { result.code = "ENGINE_TREE_STOP_FAILED"; }
+        code = await wait(closed, 3000);
+      }
       result.cleanExit = code === 0;
       if (code !== 0) { result.status = "reconcile"; result.code ??= "ENGINE_UNCLEAN_EXIT"; }
     } else result.cleanExit = true;

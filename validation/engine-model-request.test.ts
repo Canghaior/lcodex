@@ -21,3 +21,21 @@ test("unsupported engine continuation is rejected instead of silently losing his
     assert.throws(() => prepareEngineModelRequest({ model: "deepseek-flash", input: [], ...extra }, []), /^Error: API_/);
   }
 });
+
+test("the final permitted request keeps tool history but requires an evidence-based final answer", () => {
+  const input = [{ role: "developer", content: "Respect project boundaries" }, { role: "user", content: "Explain the code" },
+    { type: "function_call", name: "exec_command", call_id: "c1", arguments: "{}" },
+    { type: "function_call_output", call_id: "c1", output: "Observed source only; no tests ran" }];
+  const tools = [{ type: "function", name: "exec_command" }];
+  const prepared = prepareEngineModelRequest({ model: "deepseek-flash", input, instructions: "Original trusted instruction" }, tools, { finalResponseOnly: true });
+  assert.equal(prepared.tool_choice, "none");
+  assert.deepEqual(prepared.tools, []);
+  assert.deepEqual((prepared.input as unknown[]).slice(1, -1), input.slice(1));
+  assert.deepEqual((prepared.input as unknown[])[0], { role: "system", content: "Respect project boundaries" });
+  assert.equal(prepared.instructions, "Original trusted instruction");
+  const final = (prepared.input as { role: string; content: string }[]).at(-1)!;
+  assert.equal(final.role, "system");
+  assert.match(final.content, /unfinished or unverified/);
+  assert.equal(prepared.max_output_tokens, 1024);
+  assert.equal(prepared.store, false);
+});

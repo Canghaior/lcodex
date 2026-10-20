@@ -5,7 +5,7 @@ import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { _electron } from "playwright-core";
 import { createRunDirectory } from "../dist/validation/run-directory.js";
-import { stopAndCloseDesktop } from "./desktop-helpers.mjs";
+import { stopAndCloseDesktop, waitForFreshDesktop } from "./desktop-helpers.mjs";
 
 test("packaged application uses bundled runtimes with a fresh profile and no developer PATH", { timeout: 180000 }, async () => {
   const run = createRunDirectory("packaged 中文"), project = path.join(run.root, "catalog project");
@@ -28,7 +28,7 @@ test("packaged application uses bundled runtimes with a fresh profile and no dev
   let app, clean = false;
   try {
     app = await _electron.launch({ executablePath: executable, args, cwd: run.root, env, timeout: 40000 });
-    let page = await app.firstWindow(); await page.getByRole("heading", { name: "从一个本地项目开始" }).waitFor();
+    let page = await waitForFreshDesktop(app);
     const info = await app.evaluate(({ app }) => ({ packaged: app.isPackaged, data: app.getPath("userData") }));
     assert.equal(info.packaged, true); assert.ok(path.relative(run.root, info.data).startsWith("profile"));
     const initial = await page.evaluate(() => window.lcodex.request({ type: "snapshot" }));

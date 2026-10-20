@@ -12,7 +12,7 @@ import { createRunDirectory } from "../dist/validation/run-directory.js";
 import { createWorkflowSample, createWorkflowEvaluator, psQuote } from "../dist/validation/workflow-sample.js";
 import { isolatedEnvironment } from "../dist/validation/isolated-env.js";
 import { snapshot } from "../dist/validation/fixtures.js";
-import { stopAndCloseDesktop } from "./desktop-helpers.mjs";
+import { stopAndCloseDesktop, waitForFreshDesktop } from "./desktop-helpers.mjs";
 
 if (!process.argv.includes("--live")) throw new Error("LIVE_OPT_IN_REQUIRED");
 const selected = process.argv.find(arg => arg.startsWith("--kind="))?.slice(7);
@@ -52,7 +52,7 @@ try {
       const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => ["SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "APPDATA", "LOCALAPPDATA"].includes(name.toUpperCase())));
       Object.assign(env, { PATH: path.join(process.env.SystemRoot, "System32"), TEMP: path.join(run.root, "temp"), TMP: path.join(run.root, "temp") });
       app = await _electron.launch({ executablePath: executable, args: ["--user-data-dir=" + data], env, cwd: run.root, timeout: 40000 });
-      const page = await app.firstWindow(); await page.getByRole("heading", { name: "从一个本地项目开始" }).waitFor();
+      const page = await waitForFreshDesktop(app);
       // Add the non-resetting ¥10/¥1 development budget to this personal-profile
       // test. The original transport still reaches DeepSeek exactly once. Both
       // ledgers retain unknown reservations if a real request loses its result.
@@ -64,6 +64,7 @@ try {
         const { PROJECT_MAX_INPUT_BYTES, sendBoundedDeepSeek } = require("./deepseek-request.js");
         const direct = globalThis.fetch;
         globalThis.lcodexLiveRequestSizes = [];
+        globalThis.lcodexLiveResponseMetadata = [];
         globalThis.fetch = async (url, init) => {
           if (url !== "https://api.deepseek.com/responses" || init.method !== "POST") throw new Error("LIVE_UNEXPECTED_NETWORK");
           const authorization = new Headers(init.headers).get("authorization");
@@ -71,7 +72,20 @@ try {
           const ledger = new BudgetLedger(file);
           try {
             globalThis.lcodexLiveRequestSizes.push(Buffer.byteLength(init.body));
-            const result = await sendBoundedDeepSeek(ledger, trial, authorization.slice(7), JSON.parse(init.body), direct, init.signal, PROJECT_MAX_INPUT_BYTES);
+            const request = JSON.parse(init.body);
+            const result = await sendBoundedDeepSeek(ledger, trial, authorization.slice(7), request, direct, init.signal, PROJECT_MAX_INPUT_BYTES);
+            // Retain protocol/size evidence, never request text, source excerpts,
+            // tool arguments, reasoning, credentials or raw response bodies.
+            const label = value => typeof value === "string" && /^[a-z_.]{1,64}$/.test(value) ? value : "other";
+            globalThis.lcodexLiveResponseMetadata.push({
+              toolChoice: label(request.tool_choice), terminal: label(result.terminalType), status: label(result.response.status),
+              incompleteReason: label(result.response.incomplete_details?.reason), events: result.events,
+              usage: result.usage,
+              output: Array.isArray(result.response.output) ? result.response.output.map(item => ({
+                type: label(item.type), status: label(item.status),
+                textBytes: Array.isArray(item.content) ? item.content.reduce((size, part) => size + (typeof part.text === "string" ? Buffer.byteLength(part.text) : 0), 0) : 0,
+              })) : [],
+            });
             return new Response(result.wire, { headers: { "content-type": "text/event-stream" } });
           } finally { ledger.close(); }
         };
@@ -100,6 +114,7 @@ try {
       } while (Date.now() < deadline);
       Object.assign(record, { execution: chat.execution, code: chat.error, verification: chat.verification, baselineExit: chat.baselineExit, tools: chat.tools.map(tool => ({ title: tool.title, status: tool.status, exitCode: tool.exitCode })), finalText: chat.messages.filter(message => message.role === "assistant").map(message => message.text).join("\n") });
       record.requestBytes = await app.evaluate(() => globalThis.lcodexLiveRequestSizes);
+      record.responses = await app.evaluate(() => globalThis.lcodexLiveResponseMetadata);
       assert.deepEqual(snapshot(project), before, "Original project changed before explicit application");
       assert.equal(chat.execution, "ended", chat.error ?? "unfinished");
       const taskRoot = path.join(data, "tasks", chatId), outcome = JSON.parse(readFileSync(path.join(taskRoot, "outcome.json"), "utf8"));

@@ -2,6 +2,7 @@ import path from "node:path";
 import { isObject } from "./rpc.js";
 
 function requireValue(value: unknown, code = "PROJECT_TOOL_REFUSED"): asserts value { if (!value) throw new Error(code); }
+const MAX_OUTPUT_TOKENS = 4096, MAX_YIELD_MS = 30000;
 // The engine's generic schema makes these optional. Our fixed execution contract
 // requires them, so communicate that in the schema as well as checking outputs.
 // This does not fill in or rewrite a model call or weaken the execution boundary.
@@ -14,6 +15,8 @@ export function projectModelTools(tools: Record<string, unknown>[], workspace: s
     result.parameters.properties.shell = { type: "string", enum: [shell], description: "Required pinned shell executable." };
     result.parameters.properties.login = { type: "boolean", enum: [false] };
     result.parameters.properties.workdir = { type: "string", enum: [workspace] };
+    result.parameters.properties.max_output_tokens = { type: "integer", minimum: 1, maximum: MAX_OUTPUT_TOKENS, description: "Output cap, at most 4096 tokens. Read focused excerpts instead of increasing this limit." };
+    result.parameters.properties.yield_time_ms = { type: "integer", minimum: 1, maximum: MAX_YIELD_MS, description: "Wait at most 30000 ms; normally use 10000." };
     result.parameters.required = ["cmd", "shell", "login", "workdir"];
     result.parameters.additionalProperties = false;
     for (const key of Object.keys(result.parameters.properties)) if (!["cmd", "shell", "login", "workdir", "yield_time_ms", "max_output_tokens"].includes(key)) delete result.parameters.properties[key];
@@ -44,8 +47,8 @@ export function projectToolPolicy(workspace: string, shell: string, rootMarker: 
       requireValue(typeof args.cmd === "string" && args.cmd.length > 0 && Buffer.byteLength(args.cmd) <= 8192 && !args.cmd.includes("\0"), "PROJECT_COMMAND_SIZE_REFUSED");
       requireValue(args.shell === shell && args.login === false, "PROJECT_SHELL_REFUSED");
       requireValue(args.workdir === undefined || typeof args.workdir === "string" && path.isAbsolute(args.workdir) && equal(path.resolve(args.workdir), root), "PROJECT_CWD_REFUSED");
-      requireValue(args.yield_time_ms === undefined || Number.isSafeInteger(args.yield_time_ms) && Number(args.yield_time_ms) >= 1 && Number(args.yield_time_ms) <= 30_000, "PROJECT_YIELD_REFUSED");
-      requireValue(args.max_output_tokens === undefined || Number.isSafeInteger(args.max_output_tokens) && Number(args.max_output_tokens) >= 1 && Number(args.max_output_tokens) <= 4096, "PROJECT_OUTPUT_REFUSED");
+      requireValue(args.yield_time_ms === undefined || Number.isSafeInteger(args.yield_time_ms) && Number(args.yield_time_ms) >= 1 && Number(args.yield_time_ms) <= MAX_YIELD_MS, "PROJECT_YIELD_REFUSED");
+      requireValue(args.max_output_tokens === undefined || Number.isSafeInteger(args.max_output_tokens) && Number(args.max_output_tokens) >= 1 && Number(args.max_output_tokens) <= MAX_OUTPUT_TOKENS, "PROJECT_OUTPUT_REFUSED");
     },
     patch(input: string) {
       input = input.replaceAll("\r\n", "\n");
