@@ -11,6 +11,7 @@ import type { AppStore } from "../storage/store.js";
 import type { Credentials } from "../storage/credentials.js";
 import { executeSession, safeCode } from "./session.js";
 import { sendBoundedDeepSeek } from "../../../validation/deepseek-request.js";
+import { DESKTOP_MODEL } from "../../../validation/deepseek-model.js";
 import { readPrivate, writePrivate } from "../../../validation/private-files.js";
 import { verifyCompletedHistory } from "./history.js";
 import { finishChatDeletion, performChatDeletion, prepareChatDeletion } from "../storage/deletion.js";
@@ -87,8 +88,8 @@ export class Tasks {
     try {
       key = await this.options.credentials.read();
       this.ledger = this.openForRequest();
-      const result = await sendBoundedDeepSeek(this.ledger, `connect-${randomUUID()}`, key, { model: "deepseek-flash", stream: true, store: false,
-        input: [{ role: "user", content: [{ type: "input_text", text: "Reply with CONNECTION_OK." }] }], tools: [], tool_choice: "none", max_output_tokens: 32, reasoning: { effort: "none" } }, fetch, this.connectionAbort.signal);
+      const result = await sendBoundedDeepSeek(this.ledger, `connect-${randomUUID()}`, key, { model: DESKTOP_MODEL.id, stream: true, store: false,
+        input: [{ role: "user", content: [{ type: "input_text", text: "Reply with CONNECTION_OK." }] }], tools: [], tool_choice: "none", max_output_tokens: DESKTOP_MODEL.maxOutputTokens, reasoning: { effort: DESKTOP_MODEL.effort } }, fetch, this.connectionAbort.signal);
       if (result.response.status !== "completed") throw new Error("API_CONNECTION_INCOMPLETE");
       this.budgetError = null;
     } finally {

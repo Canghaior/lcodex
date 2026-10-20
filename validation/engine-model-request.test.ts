@@ -1,6 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { prepareEngineModelRequest } from "./engine-model-request.js";
+import { DESKTOP_MODEL } from "./deepseek-model.js";
+
+test("Pro high thinking keeps reasoning and tool associations through the final request", () => {
+  const input = [{ role: "developer", content: "trusted" },
+    { type: "reasoning", id: "r1", content: [{ type: "reasoning_text", text: "synthetic reasoning only" }], summary: [] },
+    { type: "function_call", id: "f1", name: "read", call_id: "call1", arguments: "{}" },
+    { type: "function_call_output", call_id: "call1", output: "actual tool result" }];
+  const prepared = prepareEngineModelRequest({ model: DESKTOP_MODEL.id, input }, [], { finalResponseOnly: true });
+  assert.equal(prepared.model, DESKTOP_MODEL.id);
+  assert.deepEqual(prepared.reasoning, { effort: "high" });
+  assert.equal(prepared.max_output_tokens, 8192);
+  assert.deepEqual((prepared.input as unknown[]).slice(1, -1), input.slice(1));
+  assert.deepEqual(prepared.tools, []);
+});
 
 test("model requests retain task semantics while excluding engine metadata and unknown fields", () => {
   const input = [{ role: "developer", content: "trusted" }, { role: "user", content: "project text" },

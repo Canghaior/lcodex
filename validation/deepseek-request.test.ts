@@ -5,11 +5,56 @@ import { BudgetLedger } from "./budget.js";
 import { createRunDirectory } from "./run-directory.js";
 import { PROJECT_MAX_INPUT_BYTES, requestDeepSeek, sendBoundedDeepSeek } from "./deepseek-request.js";
 import { ResponsesStream } from "./responses-stream.js";
+import { DESKTOP_MODEL } from "./deepseek-model.js";
 
 const fakeKey = `sk-${"synthetic".repeat(2)}`;
 const frame = (type: string, sequence_number: number, response?: unknown) =>
   `event: ${type}\r\ndata: ${JSON.stringify({ type, sequence_number, response })}\r\n\r\n`;
 const terminal = { status: "completed", usage: { input_tokens: 100, output_tokens: 20 }, output: [] };
+
+test("Pro high thinking reserves its output budget and charges reasoning tokens exactly once", async () => {
+  const run = createRunDirectory("pro thinking budget"), file = path.join(run.root, "ledger.jsonl");
+  BudgetLedger.initialize(file); const ledger = new BudgetLedger(file);
+  const body = { model: DESKTOP_MODEL.id, stream: true, store: false, tools: [],
+    input: [{ role: "user", content: "合成测试" }], reasoning: { effort: "high" }, max_output_tokens: 8192 };
+  let calls = 0;
+  const fakeFetch: typeof fetch = async (_, options) => {
+    calls++;
+    assert.deepEqual(JSON.parse(String(options?.body)), body);
+    assert.equal(ledger.pendingRequests()[0]!.maxMicros, (Buffer.byteLength(JSON.stringify(body)) + 1024) * 9 + 8192 * 27);
+    return new Response(frame("response.completed", 0, { ...terminal,
+      usage: { input_tokens: 100, output_tokens: 2000, output_tokens_details: { reasoning_tokens: 1800 } } }),
+    { headers: { "content-type": "text/event-stream" } });
+  };
+  try {
+    for (const change of [{ reasoning: { effort: "none" } }, { reasoning: undefined }, { max_output_tokens: 8193 }]) {
+      await assert.rejects(sendBoundedDeepSeek(ledger, "pro", fakeKey, { ...body, ...change }, fakeFetch), /REQUEST_BOUNDS_REQUIRED/);
+    }
+    assert.equal(calls, 0); assert.equal(ledger.summary().requests, 0);
+    const result = await sendBoundedDeepSeek(ledger, "pro", fakeKey, body, fakeFetch);
+    assert.equal(result.requestedModel, DESKTOP_MODEL.id);
+    assert.equal(result.usage.reasoningTokens, 1800);
+    assert.equal(result.usage.estimatedMicros, 54_900);
+    assert.equal(ledger.summary().estimatedMicros, 54_900);
+    assert.equal(ledger.summary().pending, 0);
+    await assert.rejects(sendBoundedDeepSeek(ledger, "pro", fakeKey,
+      { ...body, input: [{ role: "user", content: "x".repeat(90_000) }] }, fakeFetch, undefined, PROJECT_MAX_INPUT_BYTES), /BUDGET_TRIAL_LIMIT/);
+    assert.equal(calls, 1, "An unaffordable reservation cannot start HTTP or silently reduce thinking");
+  } finally { ledger.close(); run.cleanup(); }
+});
+
+test("Pro failed requests retain the model-specific reservation for reconciliation", async () => {
+  const run = createRunDirectory("pro unknown"), file = path.join(run.root, "ledger.jsonl");
+  BudgetLedger.initialize(file); const ledger = new BudgetLedger(file);
+  const body = { model: DESKTOP_MODEL.id, stream: true, store: false, tools: [],
+    input: [{ role: "user", content: "synthetic" }], reasoning: { effort: "high" }, max_output_tokens: 8192 };
+  try {
+    await assert.rejects(sendBoundedDeepSeek(ledger, "pro", fakeKey, body, async () => { throw new Error("synthetic disconnect"); }), /USAGE_UNKNOWN/);
+    assert.equal(ledger.summary().pending, 1);
+    assert.equal(ledger.summary().committedMicros, (Buffer.byteLength(JSON.stringify(body)) + 1024) * 9 + 8192 * 27);
+    assert.throws(() => ledger.reserve("later", 1), /PENDING_RECONCILIATION/);
+  } finally { ledger.close(); run.cleanup(); }
+});
 
 test("larger workflow context is explicit and still refuses oversized input before budget reservation", async () => {
   const run = createRunDirectory("workflow context"), file = path.join(run.root, "ledger.jsonl"); BudgetLedger.initialize(file);

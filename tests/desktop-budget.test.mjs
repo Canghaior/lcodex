@@ -21,7 +21,9 @@ test("desktop failed request keeps its reservation until explicit full-cost acco
     const failed = await page.evaluate(() => window.lcodex.request({ type: "check-connection" }));
     assert.deepEqual(failed, { ok: false, code: "API_HTTP_401" });
     const before = await page.evaluate(() => window.lcodex.request({ type: "snapshot" }));
-    assert.equal(before.state.budget.pending, 1); assert.equal(before.state.budget.committed, 0.25);
+    const reserved = before.state.budget.pendingCost;
+    assert.ok(reserved > 0 && reserved <= 1);
+    assert.equal(before.state.budget.pending, 1); assert.equal(before.state.budget.committed, reserved);
     const blocked = await page.evaluate(() => window.lcodex.request({ type: "check-connection" }));
     assert.equal(blocked.code, "BUDGET_PENDING_RECONCILIATION");
     const stale = await page.evaluate(() => window.lcodex.request({ type: "account-unknown", revision: "0".repeat(64) }));
@@ -33,7 +35,7 @@ test("desktop failed request keeps its reservation until explicit full-cost acco
     await page.getByRole("button", { name: "按预留全额记入未知用量", exact: true }).click();
     await page.getByRole("button", { name: "按预留全额记入未知用量", exact: true }).waitFor({ state: "hidden" });
     const after = await page.evaluate(() => window.lcodex.request({ type: "snapshot" }));
-    assert.equal(after.state.budget.pending, 0); assert.equal(after.state.budget.unknown, 0.25); assert.equal(after.state.budget.estimated, 0); assert.equal(after.state.budget.committed, 0.25);
+    assert.equal(after.state.budget.pending, 0); assert.equal(after.state.budget.unknown, reserved); assert.equal(after.state.budget.estimated, 0); assert.equal(after.state.budget.committed, reserved);
     assert.equal(await app.evaluate(() => globalThis.syntheticCalls), 1);
     const limits = await page.evaluate(() => window.lcodex.request({ type: "configure-budget", totalMicros: 20000000, trialMicros: 1000000 }));
     assert.equal(limits.code, "BUDGET_CONFIGURATION_REFUSED");
@@ -41,7 +43,7 @@ test("desktop failed request keeps its reservation until explicit full-cost acco
     await app.close(); app = await _electron.launch({ executablePath: electronPath, args: ["."], cwd: path.resolve("."), env });
     const again = await app.firstWindow(); await again.getByRole("heading", { name: "从一个本地项目开始" }).waitFor();
     const resumed = await again.evaluate(() => window.lcodex.request({ type: "snapshot" }));
-    assert.equal(resumed.state.budget.unknown, 0.25); assert.equal(resumed.state.budget.pending, 0);
+    assert.equal(resumed.state.budget.unknown, reserved); assert.equal(resumed.state.budget.pending, 0);
     assert.equal(readFileSync(path.join(run.root, "test-budget.jsonl"), "utf8"), bytes);
     clean = true;
   } finally { await stopAndCloseDesktop(app); if (clean) run.cleanup(); else console.log("Retained budget test:", path.basename(run.root)); }

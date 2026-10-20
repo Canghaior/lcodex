@@ -58,6 +58,7 @@ export function checkResponseWire(wire: string, response: Record<string, unknown
       "response.created", "response.in_progress", "response.completed",
       "response.content_part.added", "response.content_part.done", "response.output_text.delta", "response.output_text.done",
       "response.reasoning_summary_part.added", "response.reasoning_summary_part.done", "response.reasoning_summary_text.delta", "response.reasoning_summary_text.done",
+      "response.reasoning_text.delta", "response.reasoning_text.done",
     ].includes(type));
   });
   parser.push(wire);

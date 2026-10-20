@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import type { AppState, Command, Reply } from "../shared/contracts.js";
+import { DESKTOP_MODEL } from "../../validation/deepseek-model.js";
 
 export function BudgetSettings({ state, disabled, request }: { state: AppState | null; disabled: boolean; request: (command: Command) => Promise<Reply | undefined> }) {
   const [total, setTotal] = useState("10"), [trial, setTrial] = useState("1"), [busy, setBusy] = useState(false);
@@ -20,7 +21,7 @@ export function BudgetSettings({ state, disabled, request }: { state: AppState |
       {!!budget?.pending && <><p>有 {budget.pending} 笔请求用量未确认，当前禁止新调用。可以将预留 ¥{budget.pendingCost.toFixed(4)} 全额计入累计及原任务占用，再手动决定下一步；这不会重试请求，也不表示已核对账单。</p><button disabled={blocked} onClick={() => void act({ type: "account-unknown", revision: budget.revision })}>按预留全额记入未知用量</button></>}
       {budget?.error && <><p>预算暂不可用（{budget.error}）。账本和已有占用保留；仅原持有进程已退出且锁归属可验证时，才允许解除遗留锁。</p><button disabled={blocked} onClick={() => void act({ type: "recover-budget-lock" })}>核对已退出的预算进程</button></>}
     </div>
-    <div className="settings-section"><h3>价格参考</h3><p>DeepSeek Flash · DeepSeek-V4.1-Flash-1017。按高峰、无缓存价格估算：每百万输入 tokens ¥2，输出 ¥8；每次请求预留 ¥0.25。实际扣费可能较低。</p>
+    <div className="settings-section"><h3>价格参考</h3><p>{DESKTOP_MODEL.label} · {DESKTOP_MODEL.version}。按高峰、无缓存价格估算：每百万输入 tokens ¥{DESKTOP_MODEL.inputMicrosPerToken}，输出 ¥{DESKTOP_MODEL.outputMicrosPerToken}。思考也计入输出费用；每次根据请求大小和输出上限预留，余额不足时停止。实际扣费可能较低。</p>
       <p>记录日期：{state?.pricing.confirmedOn || "尚未确认"}。{state?.pricing.current ? "今日参考价格已确认。" : "请核对官方价格和对应模型。价格或模型发生变化时，请先停止使用并更新适配。"}</p>
       <button disabled={blocked} onClick={() => void act({ type: "open-pricing" })}>查看 DeepSeek 官方价格</button>
       {!state?.pricing.current && <button disabled={blocked} onClick={() => void act({ type: "confirm-price" })}>已核对今日价格与上述记录一致</button>}

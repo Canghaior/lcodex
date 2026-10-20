@@ -17,6 +17,39 @@ async function interruptible(action: () => Promise<void>, signal: AbortSignal) {
   try { await Promise.race([action(), stopped]); } finally { signal.removeEventListener("abort", cancel); }
 }
 
+// DeepSeek emits raw reasoning as content parts, not reasoning summaries.
+// Preserve it for subsequent requests, but verify every part against the final
+// item before releasing any tool. This content never grants execution rights.
+function checkReasoning(item: Record<string, unknown>, events: Record<string, unknown>[]) {
+  const relevant = events.filter(event => String(event.type).startsWith("response.reasoning_text.") || String(event.type).startsWith("response.content_part."));
+  if (!relevant.length && item.content === undefined) return;
+  requireValue(Array.isArray(item.content) && item.content.length <= 128);
+  const parts = item.content.map(part => {
+    requireValue(isObject(part) && part.type === "reasoning_text" && typeof part.text === "string");
+    return { expected: part, added: false, text: "", textDone: false, done: false };
+  });
+  for (const event of relevant) {
+    requireValue(Number.isSafeInteger(event.content_index));
+    const part = parts[Number(event.content_index)];
+    requireValue(part && !part.done);
+    switch (event.type) {
+      case "response.content_part.added":
+        requireValue(!part.added && isObject(event.part) && event.part.type === "reasoning_text" && event.part.text === "");
+        part.added = true; break;
+      case "response.reasoning_text.delta":
+        requireValue(part.added && !part.textDone && typeof event.delta === "string");
+        part.text += event.delta; break;
+      case "response.reasoning_text.done":
+        requireValue(part.added && !part.textDone && event.text === part.expected.text && part.text === part.expected.text);
+        part.textDone = true; break;
+      case "response.content_part.done":
+        requireValue(part.textDone && isDeepStrictEqual(event.part, part.expected)); part.done = true; break;
+      default: requireValue(false);
+    }
+  }
+  requireValue(parts.every(part => part.added && part.textDone && part.done));
+}
+
 // Validate the entire upstream response before releasing even its first tool.
 // Group interleaved item events without changing item IDs, call IDs or arguments.
 // The engine still owns execution and reports the actual completion; the gateway
@@ -60,7 +93,9 @@ export function prepareSerialResponse(wire: string, response: Record<string, unk
       if (type.startsWith("response.function_call_arguments.")) requireValue(group.item.type === "function_call");
       else if (type.startsWith("response.custom_tool_call_input.")) requireValue(group.item.type === "custom_tool_call");
       else if (type.startsWith("response.reasoning_summary_")) requireValue(group.item.type === "reasoning");
-      else if (type.startsWith("response.content_part.") || type.startsWith("response.output_text.")) requireValue(group.item.type === "message");
+      else if (type.startsWith("response.reasoning_text.")) requireValue(group.item.type === "reasoning");
+      else if (type.startsWith("response.content_part.")) requireValue(group.item.type === "message" || group.item.type === "reasoning");
+      else if (type.startsWith("response.output_text.")) requireValue(group.item.type === "message");
       else requireValue(false);
     }
     group.events.push(event);
@@ -70,6 +105,7 @@ export function prepareSerialResponse(wire: string, response: Record<string, unk
   // Reuse the strict single-call payload/delta checker for every item. An unsafe
   // later call prevents the whole response from being exposed to the engine.
   for (const group of groups) {
+    if (group.item.type === "reasoning") checkReasoning(group.item, group.events);
     const projected = { ...response, output: [group.item] };
     const events = [...group.events.map(event => ({ ...event, output_index: 0 })), { type: "response.completed", response: projected }];
     checkResponseWire(events.map(frame).join(""), projected, undefined, policy.patch, policy.functionCall);

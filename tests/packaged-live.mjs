@@ -62,6 +62,7 @@ try {
         const require = process.getBuiltinModule("module").createRequire(base + "p4-test.cjs");
         const { BudgetLedger } = require("./budget.js");
         const { PROJECT_MAX_INPUT_BYTES, sendBoundedDeepSeek } = require("./deepseek-request.js");
+        const { DESKTOP_MODEL } = require("./deepseek-model.js");
         const direct = globalThis.fetch;
         globalThis.lcodexLiveRequestSizes = [];
         globalThis.lcodexLiveResponseMetadata = [];
@@ -73,11 +74,13 @@ try {
           try {
             globalThis.lcodexLiveRequestSizes.push(Buffer.byteLength(init.body));
             const request = JSON.parse(init.body);
+            if (request.model !== DESKTOP_MODEL.id || request.reasoning?.effort !== DESKTOP_MODEL.effort) throw new Error("LIVE_MODEL_CONFIGURATION_MISMATCH");
             const result = await sendBoundedDeepSeek(ledger, trial, authorization.slice(7), request, direct, init.signal, PROJECT_MAX_INPUT_BYTES);
             // Retain protocol/size evidence, never request text, source excerpts,
             // tool arguments, reasoning, credentials or raw response bodies.
             const label = value => typeof value === "string" && /^[a-z_.]{1,64}$/.test(value) ? value : "other";
             globalThis.lcodexLiveResponseMetadata.push({
+              requestedModel: result.requestedModel, reasoning: label(request.reasoning?.effort),
               toolChoice: label(request.tool_choice), terminal: label(result.terminalType), status: label(result.response.status),
               incompleteReason: label(result.response.incomplete_details?.reason), events: result.events,
               usage: result.usage,

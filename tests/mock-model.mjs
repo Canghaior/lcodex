@@ -5,6 +5,7 @@ const quote = text => "'" + text.replaceAll("'", "''") + "'";
 globalThis.fetch = async (url, init) => {
   if (url !== "https://api.deepseek.com/responses") throw new Error("TEST_UNEXPECTED_NETWORK");
   const body = JSON.parse(init.body);
+  if (body.model !== "deepseek-v4-pro" || body.reasoning?.effort !== "high" || body.max_output_tokens !== 8192) throw new Error("TEST_MODEL_CONFIGURATION_MISMATCH");
   const tool = body.tools.find(tool => tool.name === "exec_command");
   const connecting = !tool;
   const cwd = tool?.parameters.properties.workdir.enum[0] ?? "connection", shell = tool?.parameters.properties.shell.enum[0] ?? "";
@@ -27,7 +28,7 @@ globalThis.fetch = async (url, init) => {
   item.id += "-" + callSuffix;
   if (item.call_id) item.call_id += "-" + callSuffix;
   if (continuing && item.type === "function_call") { const args = JSON.parse(item.arguments); args.cmd += "; Get-Content -LiteralPath './latest-note.txt' -Raw"; item.arguments = JSON.stringify(args); }
-  const response = { id: `mock-${n}-${callSuffix}`, object: "response", status: "completed", model: "deepseek-flash", output: [item], usage: { input_tokens: 50, output_tokens: connecting ? 8 : 100, total_tokens: connecting ? 58 : 150 } };
+  const response = { id: `mock-${n}-${callSuffix}`, object: "response", status: "completed", model: body.model, output: [item], usage: { input_tokens: 50, output_tokens: connecting ? 8 : 100, total_tokens: connecting ? 58 : 150 } };
   const events = [{ type: "response.created", response: { ...response, output: [], status: "in_progress" } },
     { type: "response.output_item.added", output_index: 0, item: message ? { ...item, content: [], status: "in_progress" } : item },
     ...(message ? [{ type: "response.content_part.added", item_id: item.id, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } }, { type: "response.output_text.delta", item_id: item.id, output_index: 0, content_index: 0, delta: text }, { type: "response.output_text.done", item_id: item.id, output_index: 0, content_index: 0, text }, { type: "response.content_part.done", item_id: item.id, output_index: 0, content_index: 0, part: item.content[0] }] : []),

@@ -9,6 +9,33 @@ const policy = {
 };
 const first = { id: "item-one", type: "function_call", name: "exec_command", call_id: "one", arguments: '{"cmd":"bounded"}', status: "completed" };
 const second = { id: "item-two", type: "custom_tool_call", name: "apply_patch", call_id: "two", input: "bounded patch", status: "completed" };
+
+test("thinking content is preserved and mismatched reasoning cannot release a following tool", async () => {
+  const part = { type: "reasoning_text", text: "Synthetic reasoning for an offline test." };
+  const reasoning = { type: "reasoning", id: "reason1", status: "completed", summary: [], content: [part], encrypted_content: null };
+  const response = { status: "completed", output: [reasoning, first] };
+  const events: Record<string, unknown>[] = [
+    { type: "response.output_item.added", output_index: 0, item: { ...reasoning, content: [], status: "in_progress" } },
+    { type: "response.content_part.added", output_index: 0, item_id: reasoning.id, content_index: 0, part: { ...part, text: "" } },
+    { type: "response.reasoning_text.delta", output_index: 0, item_id: reasoning.id, content_index: 0, delta: part.text },
+    { type: "response.reasoning_text.done", output_index: 0, item_id: reasoning.id, content_index: 0, text: part.text },
+    { type: "response.content_part.done", output_index: 0, item_id: reasoning.id, content_index: 0, part },
+    { type: "response.output_item.done", output_index: 0, item: reasoning },
+    { type: "response.output_item.added", output_index: 1, item: first },
+    { type: "response.output_item.done", output_index: 1, item: first },
+    { type: "response.completed", response },
+  ];
+  const wire = (items: unknown[]) => items.map((event, sequence_number) => "data: " + JSON.stringify({ ...(event as object), sequence_number }) + "\n\n").join("");
+  const prepared = prepareSerialResponse(wire(events), response, policy);
+  const chunks: string[] = [];
+  await prepared.deliver({ write: chunk => { chunks.push(chunk); }, beforeTool: () => {}, afterTool: async () => {}, signal: new AbortController().signal });
+  const parser = new ResponsesStream(); parser.push(chunks.join(""));
+  assert.deepEqual(parser.finish().response.output, response.output);
+  for (const change of [{ delta: "forged" }, { item_id: first.id }, { content_index: 1 }, { type: "response.output_text.delta" }]) {
+    const corrupted = structuredClone(events); corrupted[2] = { ...corrupted[2]!, ...change };
+    assert.throws(() => prepareSerialResponse(wire(corrupted), response, policy), /BATCH_RESPONSE_REFUSED/);
+  }
+});
 function sample(items: Record<string, unknown>[] = [first, second]) {
   const response = { id: "response-one", status: "completed", output: structuredClone(items) };
   const events: Record<string, unknown>[] = [{ type: "response.created", response: { ...response, status: "in_progress", output: [] } }];

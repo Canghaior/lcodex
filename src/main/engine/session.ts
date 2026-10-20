@@ -9,6 +9,7 @@ import { localDay } from "../storage/pricing.js";
 import { prepareEngineModelRequest } from "../../../validation/engine-model-request.js";
 import { isolatedEnvironment } from "../../../validation/isolated-env.js";
 import { validationCatalog } from "../../../validation/model-catalog.js";
+import { DESKTOP_MODEL } from "../../../validation/deepseek-model.js";
 import { assertNoKnownSecrets } from "../../../validation/outbound-data.js";
 import { projectModelTools, projectToolPolicy } from "../../../validation/project-tool-policy.js";
 import { terminateOwnedProcessTree } from "../../../validation/process-tree-stop.js";
@@ -115,11 +116,14 @@ export async function executeSession(options: EngineOptions): Promise<EngineResu
     await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
     const address = server.address(); if (!address || typeof address === "string") throw new Error("GATEWAY_NO_PORT");
     const catalog = validationCatalog(true, mode === "read", mode === "write", true);
-    catalog.models[0]!.display_name = "DeepSeek Flash";
+    catalog.models[0]!.slug = DESKTOP_MODEL.id;
+    catalog.models[0]!.display_name = `${DESKTOP_MODEL.label} · 高强度思考`;
+    catalog.models[0]!.default_reasoning_level = DESKTOP_MODEL.effort;
+    catalog.models[0]!.supported_reasoning_levels = [{ effort: DESKTOP_MODEL.effort, description: "High thinking for coding tasks" }];
     catalog.models[0]!.base_instructions = `You are a coding assistant in an isolated project copy. ${mode === "read" ? "This task is read-only. Analyse and explain; do not modify files or install anything." : "Read relevant code, reproduce issues, implement the requested change, and verify."} When the user names a source path, inspect that path first and avoid repeated directory inventories. Keep reads focused on relevant excerpts. Preserve unrelated files. Be concise. Report actual results and limitations, never claim tests you did not run. Reply in the user's language.`;
     writePrivate(historyHome, "models.json", JSON.stringify(catalog));
     writePrivate(historyHome, "config.toml", [
-      'model="deepseek-flash"', 'model_provider="workflow"', 'model_reasoning_effort="none"', `model_catalog_json=${quote(path.join(historyHome, "models.json"))}`,
+      `model=${quote(DESKTOP_MODEL.id)}`, 'model_provider="workflow"', `model_reasoning_effort=${quote(DESKTOP_MODEL.effort)}`, `model_catalog_json=${quote(path.join(historyHome, "models.json"))}`,
       `project_root_markers=[${quote(options.rootMarker)}]`, 'approval_policy="never"', 'default_permissions="scoped"', 'web_search="disabled"', 'allow_login_shell=false',
       '[windows]', 'sandbox="mxc"', '[permissions.scoped.filesystem]', '":minimal"="read"', `${quote(workspace)}="${mode === "read" ? "read" : "write"}"`,
       `${quote(original)}="deny"`, `${quote(options.privateDir)}="deny"`, `${quote(historyHome)}="deny"`, `${quote(path.join(workspace, options.rootMarker))}="read"`,
@@ -147,7 +151,7 @@ export async function executeSession(options: EngineOptions): Promise<EngineResu
     const threadParameters = { cwd: workspace, approvalPolicy: "never", approvalsReviewer: "user",
       developerInstructions: `Work only in the current isolated project copy. It is a fresh snapshot of the original project; previous tool paths and permissions are historical and no longer valid. ${projectContext} Mode=${mode}. For exec_command always supply shell=${JSON.stringify(shell)}, login=false, workdir=${JSON.stringify(workspace)}, yield_time_ms=10000, max_output_tokens<=4096. Run one tool at a time. Command limit 45 seconds, task limit 8 model requests. Node executable: ${node}; use --preserve-symlinks --preserve-symlinks-main before its arguments. No network, dependency installation or escalation. ${options.testCommand ? `The user-selected verification command is exactly: ${options.testCommand}. Run it before and after changes as a separate exec_command call with exactly that cmd string; do not prepend or append other commands, so its exit status can be identified.` : "No verification command was configured. Inspect existing project instructions and report which checks you actually ran; missing tests must remain unverified."} Do not modify protected resources, dependencies, root marker, credentials or unrelated user work. Final response: changes, files, actual checks/results, unfinished work and next step. Changes are pending review, never claim the original project was modified.` };
     const thread = options.resume
-      ? await rpc.request("thread/resume", { ...threadParameters, threadId: options.resume.threadId, model: "deepseek-flash", modelProvider: "workflow", config: { default_permissions: "scoped" } })
+      ? await rpc.request("thread/resume", { ...threadParameters, threadId: options.resume.threadId, model: DESKTOP_MODEL.id, modelProvider: "workflow", config: { default_permissions: "scoped" } })
       : await rpc.request("thread/start", { ...threadParameters, ephemeral: false });
     if (!isObject(thread) || !isObject(thread.thread) || typeof thread.thread.id !== "string") throw new Error("ENGINE_THREAD_INVALID");
     threadId = thread.thread.id;

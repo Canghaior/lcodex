@@ -2,6 +2,8 @@
 
 2026-10-20；对应 P4-02。验收标准在运行前写入 P4_PACKAGING，并随 ae8dcb0 保存。本文保留首次失败与修复复测，不以重新运行替换原记录。
 
+本文以下为 Flash 配置的历史验收。用户后来要求切换 Pro 高强度思考，新配置的协议、成品任务与首次失败单列于 [P4_THINKING](P4_THINKING.md)，不沿用本文 9/9 作为 Pro 通过证据。
+
 ## 方法
 
 `tests/packaged-live.mjs --live` 启动真实发布 EXE、真实 app-server/MXC 和捆绑的 Node/npm，通过 DeepSeek 官方 Responses API 完成任务，不模拟模型响应或工具结果。测试器在真实 HTTP 入口外叠加原有开发预算账本，每次请求仍只发送一次；应用个人预算同时工作，开发累计 10 元、每次试验 1 元不因新配置或换阶段重置。

@@ -6,22 +6,29 @@ import { executeSession } from "../dist/src/main/engine/session.js";
 import { localDay } from "../dist/src/main/storage/pricing.js";
 import { BudgetLedger } from "../dist/validation/budget.js";
 import { createRunDirectory } from "../dist/validation/run-directory.js";
+import { DESKTOP_MODEL } from "../dist/validation/deepseek-model.js";
 
 function responseFor(item, n, incomplete = false) {
-  const response = { id: `limit-response-${n}`, object: "response", status: incomplete ? "incomplete" : "completed", model: "deepseek-flash",
-    output: [item], usage: { input_tokens: 50, output_tokens: 100, total_tokens: 150 } };
-  const message = item.type === "message", text = message ? item.content[0].text : "";
-  const events = [
-    { type: "response.created", response: { ...response, output: [], status: "in_progress" } },
-    { type: "response.output_item.added", output_index: 0, item: message ? { ...item, content: [], status: "in_progress" } : item },
-    ...(message ? [
-      { type: "response.content_part.added", item_id: item.id, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } },
-      { type: "response.output_text.delta", item_id: item.id, output_index: 0, content_index: 0, delta: text },
-      { type: "response.output_text.done", item_id: item.id, output_index: 0, content_index: 0, text },
-      { type: "response.content_part.done", item_id: item.id, output_index: 0, content_index: 0, part: item.content[0] },
-    ] : []),
-    { type: "response.output_item.done", output_index: 0, item }, { type: incomplete ? "response.incomplete" : "response.completed", response },
-  ];
+  const reasoning = { id: `reason-${n}`, type: "reasoning", status: "completed", summary: [], encrypted_content: null,
+    content: [{ type: "reasoning_text", text: `Synthetic reasoning ${n}, preserve for next request.` }] };
+  const response = { id: `limit-response-${n}`, object: "response", status: incomplete ? "incomplete" : "completed", model: DESKTOP_MODEL.id,
+    output: [reasoning, item], usage: { input_tokens: 50, output_tokens: 100, total_tokens: 150, output_tokens_details: { reasoning_tokens: 10 } } };
+  const events = [{ type: "response.created", response: { ...response, output: [], status: "in_progress" } }];
+  for (const [output_index, current] of response.output.entries()) {
+    const textItem = ["message", "reasoning"].includes(current.type);
+    events.push({ type: "response.output_item.added", output_index, item: textItem ? { ...current, content: [], status: "in_progress" } : current });
+    if (textItem) {
+      const part = current.content[0], prefix = current.type === "reasoning" ? "response.reasoning_text" : "response.output_text";
+      events.push(
+        { type: "response.content_part.added", item_id: current.id, output_index, content_index: 0, part: { ...part, text: "" } },
+        { type: prefix + ".delta", item_id: current.id, output_index, content_index: 0, delta: part.text },
+        { type: prefix + ".done", item_id: current.id, output_index, content_index: 0, text: part.text },
+        { type: "response.content_part.done", item_id: current.id, output_index, content_index: 0, part },
+      );
+    }
+    events.push({ type: "response.output_item.done", output_index, item: current });
+  }
+  events.push({ type: incomplete ? "response.incomplete" : "response.completed", response });
   return new Response(events.map((event, sequence_number) => `event: ${event.type}\ndata: ${JSON.stringify({ ...event, sequence_number })}\n\n`).join(""),
     { headers: { "content-type": "text/event-stream" } });
 }
@@ -51,6 +58,11 @@ for (const finalKind of ["message", "function_call", "custom_tool_call", "incomp
         fetchImpl: async (url, init) => {
           assert.equal(url, "https://api.deepseek.com/responses");
           const body = JSON.parse(init.body), n = requests.push(body);
+          assert.equal(body.model, DESKTOP_MODEL.id);
+          assert.deepEqual(body.reasoning, { effort: "high" });
+          assert.equal(body.max_output_tokens, 8192);
+          assert.equal(body.input.filter(item => item.type === "reasoning" && JSON.stringify(item.content).includes("Synthetic reasoning")).length, n - 1,
+            "The actual engine must return all prior thinking content, not just tool results");
           assert.ok(n <= 8, "No ninth model request may be sent");
           assert.equal(body.tool_choice, n === 8 ? "none" : "auto");
           assert.match(JSON.stringify(body.input), /working directory is the selected project root itself/);
@@ -86,7 +98,7 @@ for (const finalKind of ["message", "function_call", "custom_tool_call", "incomp
       assert.equal(events.filter(event => event.method === "boundary/toolPlan").length, 7);
       assert.equal(existsSync(path.join(workspace, "forbidden.txt")), false, "A final-call command or patch must never execute");
       assert.equal(readFileSync(path.join(original, "source.txt"), "utf8"), "ORIGINAL_UNCHANGED\n");
-      assert.deepEqual(ledger.summary(), { committedMicros: 7200, estimatedMicros: 7200, unknownMicros: 0, pending: 0, overrun: false, requests: 8 });
+      assert.deepEqual(ledger.summary(), { committedMicros: 25200, estimatedMicros: 25200, unknownMicros: 0, pending: 0, overrun: false, requests: 8 });
       clean = true;
     } finally {
       ledger.close();
