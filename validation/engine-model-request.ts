@@ -1,7 +1,7 @@
 import { deepSeekModel } from "./deepseek-model.js";
 import { mapDeepSeekRoles } from "./deepseek-roles.js";
 
-const finalInstruction = "The task has reached its final permitted model request. No tools are available now. Stop planning tool calls and answer the user in plain language using only evidence already obtained. State the request limit, actual findings, unfinished or unverified work, and a next step. Do not emit tool-call markup or invent results. Keep the answer within about 450 Chinese characters or 220 English words so it fits the output budget.";
+const finalInstruction = "This is the task's final permitted model request because a request or tool limit prevents further work. No tools are available now. Stop planning tool calls and answer the user in plain language using only evidence already obtained. State the actual reached limit, findings, unfinished or unverified work, and a next step. Do not emit tool-call markup or invent results. Keep the answer within about 450 Chinese characters or 220 English words so it fits the output budget.";
 
 // Deliberately omit engine-only metadata/cache identifiers and unreviewed fields.
 export function prepareEngineModelRequest(request: Record<string, unknown>, tools: Record<string, unknown>[], options: { finalResponseOnly?: boolean; progressInstruction?: string } = {}) {

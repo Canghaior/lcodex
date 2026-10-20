@@ -14,7 +14,7 @@ export function desktopCommandContract(options: Options) {
   const native = projectToolPolicy(options.workspace, options.shell, options.rootMarker, options.readOnlyAssets);
   const commandArguments = (cmd: unknown) => ({
     cmd, shell: options.shell, login: false, workdir: options.workspace,
-    yield_time_ms: 30000, max_output_tokens: 4096,
+    yield_time_ms: 30000, max_output_tokens: 1024,
   });
   const policy = {
     functionCall(name: string, args: Record<string, unknown>) {
@@ -33,7 +33,7 @@ export function desktopCommandContract(options: Options) {
       requireValue(engineTools.some(tool => tool.type === "function" && tool.name === "exec_command"), "PROJECT_COMMAND_TOOL_MISSING");
       return [
         { type: "function", name: "exec_command",
-          description: "Run a command in the selected isolated project. The host fixes PowerShell, working directory, no login shell, 4096 output tokens and bounded execution. Supply only cmd. Read related source/test excerpts together in one bounded command; avoid repeated listings. Run the configured verification command separately, exactly as given.",
+          description: "Run a command in the selected isolated project. The host fixes PowerShell, working directory, no login shell, 1024 output tokens and bounded execution. Supply only cmd. First locate relevant functions/line numbers, then read short targeted ranges (normally at most 60 lines); never dump whole large files. Do not reread already observed ranges. Run the configured verification command separately, exactly as given.",
           parameters: { type: "object", properties: { cmd: { type: "string", maxLength: 8192,
             ...(options.verifyCommand === undefined ? {} : { enum: [options.verifyCommand] }) } },
           required: ["cmd"], additionalProperties: false } },

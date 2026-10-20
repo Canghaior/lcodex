@@ -10,6 +10,7 @@ export type BudgetScope = "development" | "personal";
 type Entry =
   | { type: "init"; version: 1 | 2; limits: BudgetLimits; scope?: BudgetScope }
   | { type: "limits"; limits: BudgetLimits }
+  | { type: "authorize-trial"; trial: string; limitMicros: number; decision: string }
   | { type: "reserve"; id: string; trial: string; maxMicros: number }
   | { type: "settle"; id: string; actualMicros: number }
   | { type: "account-unknown"; id: string };
@@ -29,6 +30,7 @@ export class BudgetLedger {
   private closed = false;
   private poisoned = false;
   private requests = new Map<string, Request>();
+  private trialAuthorizations = new Map<string, { limitMicros: number; decision: string }>();
   private currentLimits: BudgetLimits = { ...P1_LIMITS };
 
   static validLimits(limits: BudgetLimits): boolean {
@@ -74,6 +76,9 @@ export class BudgetLedger {
     if (entry.type === "limits") {
       check(this.scope === "personal" && BudgetLedger.validLimits(entry.limits) && entry.limits.totalMicros >= this.summary().committedMicros, "BUDGET_WRONG_LIMITS");
       this.currentLimits = { ...entry.limits };
+    } else if (entry.type === "authorize-trial") {
+      this.checkTrialAuthorization(entry.trial, entry.limitMicros, entry.decision);
+      this.trialAuthorizations.set(entry.trial, { limitMicros: entry.limitMicros, decision: entry.decision });
     } else if (entry.type === "reserve") {
       check(typeof entry.id === "string" && !this.requests.has(entry.id) && typeof entry.trial === "string" &&
         /^[a-z0-9-]{1,64}$/.test(entry.trial) && natural(entry.maxMicros) && entry.maxMicros > 0, "BUDGET_CORRUPT");
@@ -107,11 +112,33 @@ export class BudgetLedger {
     return { committedMicros, estimatedMicros, unknownMicros, pending, overrun, requests: this.requests.size };
   }
   limits() { return { ...this.currentLimits }; }
+  trialLimit(trial: string) { return this.trialAuthorizations.get(trial)?.limitMicros ?? this.currentLimits.trialMicros; }
   pendingRequests() { return [...this.requests.entries()].filter(([, request]) => request.actualMicros === undefined && !request.unknownAccounted).map(([id, request]) => ({ id, maxMicros: request.maxMicros })); }
   configure(limits: BudgetLimits) {
     check(!this.closed && !this.poisoned && this.scope === "personal", "BUDGET_CONFIGURATION_REFUSED");
     check(BudgetLedger.validLimits(limits) && limits.totalMicros >= this.summary().committedMicros, "BUDGET_WRONG_LIMITS");
     this.append({ type: "limits", limits }); this.currentLimits = { ...limits };
+  }
+
+  private checkTrialAuthorization(trial: string, limitMicros: number, decision: string) {
+    check(!this.closed && !this.poisoned && this.scope === "development", "BUDGET_AUTHORIZATION_REFUSED");
+    check(typeof trial === "string" && typeof decision === "string" &&
+      /^[a-z0-9-]{1,64}$/.test(trial) && /^[a-z0-9-]{1,96}$/.test(decision) &&
+      natural(limitMicros) && limitMicros > this.currentLimits.trialMicros &&
+      limitMicros <= this.currentLimits.totalMicros, "BUDGET_AUTHORIZATION_INVALID");
+    check(!this.trialAuthorizations.has(trial) && ![...this.trialAuthorizations.values()].some(item => item.decision === decision) &&
+      ![...this.requests.values()].some(item => item.trial === trial), "BUDGET_AUTHORIZATION_REUSED");
+    const state = this.summary();
+    check(state.pending === 0 && !state.overrun, "BUDGET_PENDING_RECONCILIATION");
+  }
+
+  // Supervisor-only, after explicit user approval. Not exposed by desktop IPC
+  // or model tools. A decision authorizes one new trial; neither global cost,
+  // request counts, previous trial limits nor historical usage are reset.
+  authorizeDevelopmentTrial(trial: string, limitMicros: number, decision: string) {
+    this.checkTrialAuthorization(trial, limitMicros, decision);
+    this.append({ type: "authorize-trial", trial, limitMicros, decision });
+    this.trialAuthorizations.set(trial, { limitMicros, decision });
   }
 
   private checkReservation(trial: string, maxMicros: number): void {
@@ -124,7 +151,7 @@ export class BudgetLedger {
     check(trialRequests.length < this.currentLimits.requestsPerTrial, "BUDGET_REQUEST_LIMIT");
     const trialCost = trialRequests.reduce((sum, item) => sum + (item.actualMicros ?? item.maxMicros), 0);
     check(state.committedMicros + maxMicros <= this.currentLimits.totalMicros, "BUDGET_TOTAL_LIMIT");
-    check(trialCost + maxMicros <= this.currentLimits.trialMicros, "BUDGET_TRIAL_LIMIT");
+    check(trialCost + maxMicros <= this.trialLimit(trial), "BUDGET_TRIAL_LIMIT");
   }
 
   reserve(trial: string, maxMicros: number): string {

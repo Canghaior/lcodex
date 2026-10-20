@@ -30,7 +30,7 @@ test("cmd-only model calls execute with host-owned parameters and retain exact i
   const item = (parser.finish().response.output as { id: string; call_id: string; arguments: string }[])[0]!;
   assert.equal(item.id, "item1"); assert.equal(item.call_id, "call1"); assert.deepEqual(ids, ["call1"]);
   assert.deepEqual(JSON.parse(item.arguments), { cmd: "Get-Content 'source.txt'", shell: options.shell, login: false,
-    workdir: options.workspace, yield_time_ms: 30000, max_output_tokens: 4096 });
+    workdir: options.workspace, yield_time_ms: 30000, max_output_tokens: 1024 });
   assert.deepEqual(desktopCommandHistory([item, { type: "function_call_output", call_id: "call1", output: "actual" }]),
     [data.response.output[0], { type: "function_call_output", call_id: "call1", output: "actual" }].map((v, i) => i === 0 ? { ...item, arguments: data.response.output[0]!.arguments } : v));
 });
@@ -65,6 +65,10 @@ test("verification planning uses observed completions, invalidates after tools a
   progress.completed({ id: "c", type: "fileChange", exitCode: null });
   assert.equal(progress.verificationOnly(7), true);
   assert.equal(progress.verificationOnly(8), false);
+  assert.equal(progress.verificationOnly(4, 1, 5), true);
+  assert.equal(progress.verificationOnly(4, 3, 1), true);
+  assert.equal(progress.verificationOnly(4, 0, 5), false);
+  assert.match(progress.instruction(4, 0, 5), /No further tools are available/);
   assert.equal(new SessionProgress("test", false).verificationOnly(7), false);
   assert.equal(new SessionProgress("", true).verificationOnly(7), false);
 });

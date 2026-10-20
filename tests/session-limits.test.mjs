@@ -13,7 +13,7 @@ function responseFor(item, n, incomplete = false) {
   const reasoning = { id: `reason-${n}`, type: "reasoning", status: "completed", summary: [], encrypted_content: null,
     content: [{ type: "reasoning_text", text: `Synthetic reasoning ${n}, preserve for next request.` }] };
   const response = { id: `limit-response-${n}`, object: "response", status: incomplete ? "incomplete" : "completed", model: DESKTOP_MODEL.id,
-    output: [reasoning, item], usage: { input_tokens: 50, output_tokens: 100, total_tokens: 150, output_tokens_details: { reasoning_tokens: 10 } } };
+    output: [reasoning, ...(Array.isArray(item) ? item : [item])], usage: { input_tokens: 50, output_tokens: 100, total_tokens: 150, output_tokens_details: { reasoning_tokens: 10 } } };
   const events = [{ type: "response.created", response: { ...response, output: [], status: "in_progress" } }];
   for (const [output_index, current] of response.output.entries()) {
     const textItem = ["message", "reasoning"].includes(current.type);
@@ -118,6 +118,48 @@ for (const scenario of ["message", "reaped-message", "function_call", "custom_to
     }
   });
 }
+
+for (const obey of [true, false]) test(`the tool count leaves a final summary without a thirteenth execution (obey=${obey})`, { timeout: 120000 }, async () => {
+  const run = createRunDirectory("tool count 中文"), workspace = path.join(run.root, "workspace");
+  const original = path.join(run.root, "original"), privateDir = path.join(run.root, "private");
+  for (const directory of [workspace, original, privateDir]) mkdirSync(directory);
+  const marker = ".lcodex-count-root";
+  writeFileSync(path.join(workspace, marker), "");
+  writeFileSync(path.join(workspace, "source.txt"), "TWELVE_ACTUAL_READS\n");
+  const runtimes = path.resolve(".local/releases/win-unpacked/resources/runtimes");
+  const engine = path.join(runtimes, "codex/bin/codex.exe"), shell = path.join(runtimes, "powershell/pwsh.exe"), node = path.join(runtimes, "node/node.exe");
+  const ledgerFile = path.join(privateDir, "mock-budget.jsonl");
+  BudgetLedger.initialize(ledgerFile);
+  const ledger = new BudgetLedger(ledgerFile), events = [], requests = [], abort = new AbortController();
+  let clean = false;
+  const command = index => ({ id: `item-${index}`, type: "function_call", name: "exec_command", call_id: `call-${index}`, status: "completed",
+    arguments: JSON.stringify({ cmd: index === 13 ? "Set-Content forbidden.txt unexpected" : "Get-Content source.txt" }) });
+  try {
+    const result = await executeSession({ engine, shell, node, root: run.root, workspace, privateDir, original, rootMarker: marker,
+      readOnlyAssets: [], readOnlyDirectories: [], mode: "read", prompt: "Read the source and explain observed facts.",
+      testCommand: "", key: "sk-synthetic-tool-count-only", ledger, signal: abort.signal, priceConfirmedOn: localDay(),
+      onIdentity: () => {}, onEvent: (method, params) => events.push({ method, params }),
+      fetchImpl: async (_url, init) => {
+        const body = JSON.parse(init.body), n = requests.push(body);
+        assert.ok(n <= 4, "After all twelve tools the next response must end the task");
+        assert.match(body.input.at(-1).content, new RegExp(`Remaining tool calls: ${Math.max(0, 12 - (n - 1) * 4)}/12`));
+        if (n <= 3) return responseFor(Array.from({ length: 4 }, (_, i) => command((n - 1) * 4 + i + 1)), n);
+        assert.equal(body.tool_choice, "none"); assert.deepEqual(body.tools, []);
+        const results = body.input.filter(item => item.type === "function_call_output");
+        assert.equal(results.length, 12);
+        assert.ok(results.every(item => String(item.output).includes("TWELVE_ACTUAL_READS")));
+        return responseFor(obey ? { id: "final", type: "message", role: "assistant", status: "completed",
+          content: [{ type: "output_text", text: "Twelve-tool limit reached. source.txt was read. Tests are unverified.", annotations: [] }] } : command(13), n);
+      } });
+    assert.equal(result.status, obey ? "completed" : "failed");
+    assert.equal(result.code, obey ? null : "TASK_FINAL_RESPONSE_TOOL_REFUSED");
+    assert.equal(result.requests, 4); assert.equal(confirmedSessionExit(result), true);
+    assert.equal(events.filter(event => event.method === "item/completed" && event.params?.item?.type === "commandExecution").length, 12);
+    assert.equal(existsSync(path.join(workspace, "forbidden.txt")), false);
+    assert.equal(ledger.summary().requests, 4);
+    clean = true;
+  } finally { ledger.close(); if (clean) run.cleanup(); }
+});
 
 for (const obey of [true, false]) test(`the last tool opportunity is reserved for actual verification (obey=${obey})`, { timeout: 120000 }, async () => {
   const run = createRunDirectory("session verify 中文");

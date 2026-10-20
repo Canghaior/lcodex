@@ -1,6 +1,6 @@
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
-import { writeFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { BudgetLedger } from "./budget.js";
 import { createRunDirectory } from "./run-directory.js";
@@ -140,4 +140,68 @@ test("personal budget changes preserve prior consumption while development limit
   const resumed = new BudgetLedger(personalFile, "personal");
   try { assert.equal(resumed.summary().committedMicros, 500_000); assert.equal(resumed.limits().totalMicros, 1_000_000); }
   finally { resumed.close(); }
+});
+
+test("a named development authorization survives restart without changing other trials or total usage", () => {
+  const { file, ledger } = sample();
+  ledger.settle(ledger.reserve("old", 600_000), 600_000);
+  ledger.authorizeDevelopmentTrial("approved-source", 2_000_000, "user-source-review");
+  assert.throws(() => ledger.reserve("other", 1_000_001), /TRIAL_LIMIT/);
+  assert.throws(() => ledger.reserve("old", 400_001), /TRIAL_LIMIT/);
+  ledger.settle(ledger.reserve("approved-source", 1_500_000), 1_500_000);
+  ledger.close();
+  const resumed = new BudgetLedger(file);
+  try {
+    assert.equal(resumed.summary().committedMicros, 2_100_000);
+    assert.equal(resumed.limits().totalMicros, 10_000_000);
+    assert.equal(resumed.limits().trialMicros, 1_000_000);
+    assert.equal(resumed.trialLimit("approved-source"), 2_000_000);
+    assert.throws(() => resumed.reserve("approved-source", 500_001), /TRIAL_LIMIT/);
+    resumed.accountUnknown(resumed.reserve("approved-source", 500_000));
+    assert.throws(() => resumed.reserve("approved-source", 1), /TRIAL_LIMIT/);
+  } finally { resumed.close(); }
+});
+
+test("an authorization cannot be recycled, extend an existing trial or bypass pending usage", () => {
+  const { ledger } = sample();
+  try {
+    ledger.authorizeDevelopmentTrial("approved", 2_000_000, "one-user-decision");
+    assert.throws(() => ledger.authorizeDevelopmentTrial("another", 2_000_000, "one-user-decision"), /AUTHORIZATION_REUSED/);
+    assert.throws(() => ledger.authorizeDevelopmentTrial("approved", 3_000_000, "new-decision"), /AUTHORIZATION_REUSED/);
+    assert.throws(() => ledger.authorizeDevelopmentTrial("invalid", 10_000_001, "new-decision"), /AUTHORIZATION_INVALID/);
+    const pending = ledger.reserve("old", 10);
+    assert.throws(() => ledger.authorizeDevelopmentTrial("old", 2_000_000, "new-decision"), /AUTHORIZATION_REUSED/);
+    assert.throws(() => ledger.authorizeDevelopmentTrial("new", 2_000_000, "new-decision"), /PENDING_RECONCILIATION/);
+    ledger.settle(pending, 10);
+    for (let i = 0; i < 8; i++) ledger.settle(ledger.reserve("approved", 1), 0);
+    assert.throws(() => ledger.reserve("approved", 1), /REQUEST_LIMIT/);
+  } finally { ledger.close(); }
+});
+
+test("authorized trials still share the original total ceiling", () => {
+  const { ledger } = sample();
+  try {
+    ledger.authorizeDevelopmentTrial("approved", 2_000_000, "one-user-decision");
+    ledger.settle(ledger.reserve("approved", 2_000_000), 2_000_000);
+    for (let i = 0; i < 8; i++) ledger.settle(ledger.reserve(`normal-${i}`, 1_000_000), 1_000_000);
+    assert.equal(ledger.summary().committedMicros, 10_000_000);
+    assert.throws(() => ledger.reserve("next", 1), /TOTAL_LIMIT/);
+  } finally { ledger.close(); }
+});
+
+test("development-only authorization is unavailable to personal profiles", () => {
+  const { file, ledger } = sample(); ledger.close();
+  const personalFile = file + ".personal";
+  BudgetLedger.initialize(personalFile, { totalMicros: 3_000_000, trialMicros: 1_000_000, requestsPerTrial: 8 }, "personal");
+  const personal = new BudgetLedger(personalFile, "personal");
+  try { assert.throws(() => personal.authorizeDevelopmentTrial("source", 2_000_000, "decision"), /AUTHORIZATION_REFUSED/); }
+  finally { personal.close(); }
+});
+
+test("malformed persisted authorizations cannot become implicit string IDs", () => {
+  for (const values of [{ trial: null, decision: "decision" }, { trial: "source", decision: null }, { decision: "decision" }]) {
+    const { file, ledger } = sample(); ledger.close();
+    appendFileSync(file, JSON.stringify({ type: "authorize-trial", limitMicros: 2_000_000, ...values }) + "\n");
+    assert.throws(() => new BudgetLedger(file), /CORRUPT/);
+  }
 });

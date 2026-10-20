@@ -2,7 +2,7 @@
 
 目标是开发一款接入 DeepSeek 的本地桌面编程助手：选择项目后，通过自然语言完成代码阅读、修改和测试，并能查看执行过程与文件差异。
 
-P1 已在用户确认的小型 JS/TS 项目范围内通过。桌面已走通真实 DeepSeek 修复、差异审阅、应用、重启审阅及再次续聊；只读、停止与冲突保护有实际桌面联测。P3 当前范围核心条件已通过，P4 已生成带运行时的 Windows 0.0.1 安装候选。旧 Flash 配置下三类真实任务各三次通过；当前 Pro/high 修复重复验收为 2/3，复杂源码阅读仍失败，完整交付验收尚未完成。证据见 [桌面检查](docs/validation/P2_DESKTOP.md)、[恢复检查](docs/validation/P3_RECOVERY.md)、[分发验证](docs/validation/P4_PACKAGING.md)、[历史真实模型验收](docs/validation/P4_ACCEPTANCE.md)和[思考模式验证](docs/validation/P4_THINKING.md)。首次操作见[候选版使用说明](docs/USER_GUIDE.md)。
+P1 已在用户确认的小型 JS/TS 项目范围内通过。桌面已走通真实 DeepSeek 修复、差异审阅、应用、重启审阅及再次续聊；只读、停止与冲突保护有实际桌面联测。P3 当前范围核心条件已通过，P4 已生成带运行时的 Windows 0.0.1 安装候选。当前 Pro/high 三类基础任务各三次功能验收通过；第一轮功能截图超时已零 API 补齐，旧失败保留。复杂源码阅读仍失败，完整交付验收尚未完成。证据见 [桌面检查](docs/validation/P2_DESKTOP.md)、[恢复检查](docs/validation/P3_RECOVERY.md)、[分发验证](docs/validation/P4_PACKAGING.md)、[历史真实模型验收](docs/validation/P4_ACCEPTANCE.md)和[最新思考稳定性验证](docs/validation/P4_STABILITY.md)。首次操作见[候选版使用说明](docs/USER_GUIDE.md)。
 
 - [开发方案](docs/DEVELOPMENT_PLAN.md)：产品范围、技术路线、阶段任务和验收标准。
 - [编程执行计划](docs/IMPLEMENTATION_PLAN.md)：P0 至 P4 的开发工作包、执行顺序、检查条件和 GitHub 同步规则。

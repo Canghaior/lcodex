@@ -18,6 +18,25 @@ if (!process.argv.includes("--live")) throw new Error("LIVE_OPT_IN_REQUIRED");
 const selected = process.argv.find(arg => arg.startsWith("--kind="))?.slice(7);
 assert.ok(selected === undefined || ["read", "bug", "feature", "real-read"].includes(selected));
 const kinds = selected ? [selected] : ["read", "bug", "feature"];
+const fromRepetition = Number(process.argv.find(arg => arg.startsWith("--from-repetition="))?.slice(18) ?? "1");
+assert.ok(Number.isInteger(fromRepetition) && fromRepetition >= 1 && fromRepetition <= 3);
+assert.ok(fromRepetition === 1 || selected && selected !== "real-read", "Select a task kind when continuing independent repetitions");
+const retryTrial = process.argv.find(arg => arg.startsWith("--retry-trial="))?.slice(14);
+const authorizedTrial = process.argv.find(arg => arg.startsWith("--authorized-trial="))?.slice(19);
+if (authorizedTrial) {
+  assert.equal(selected, "real-read");
+  assert.equal(retryTrial, undefined);
+  assert.match(authorizedTrial, /^p4-real-read-1-[a-f0-9-]{36}$/);
+  const ledger = new BudgetLedger(path.resolve(".local/state/p1-budget.jsonl"));
+  try { assert.equal(ledger.trialLimit(authorizedTrial), 2_000_000, "Requires an already recorded, explicit one-trial authorization"); }
+  finally { ledger.close(); }
+}
+if (retryTrial) {
+  assert.equal(selected, "real-read", "A source-task retry must reuse its one existing trial");
+  assert.match(retryTrial, /^p4-real-read-1-[a-f0-9-]{36}$/);
+  const prior = readFileSync(".local/state/p1-budget.jsonl", "utf8").trim().split("\n").map(line => JSON.parse(line));
+  assert.ok(prior.some(entry => entry.type === "reserve" && entry.trial === retryTrial), "Never manufacture a retry trial");
+}
 const suite = randomUUID(), results = [], ledgerFile = path.resolve(".local/state/p1-budget.jsonl");
 const packagedRoot = path.resolve(".local/releases/win-unpacked"), executable = path.join(packagedRoot, "lcodex.exe");
 const binary = path.join(packagedRoot, "resources/runtimes/codex/bin/codex.exe"), shell = path.join(packagedRoot, "resources/runtimes/powershell/pwsh.exe");
@@ -30,7 +49,7 @@ const reportFile = path.resolve(`.local/reports/p4-live-${suite}.json`);
 const save = () => writeFileSync(reportFile, JSON.stringify({ suite, realModel: true, packaged: true, initialBudget, finalBudget: budget(), results }, null, 2));
 let key = await readKey();
 try {
-  for (const kind of kinds) for (let repetition = 1; repetition <= (kind === "real-read" ? 1 : 3); repetition++) {
+  for (const kind of kinds) for (let repetition = fromRepetition; repetition <= (kind === "real-read" ? 1 : 3); repetition++) {
     const run = createRunDirectory(`p4 live ${kind} 中文`), data = path.join(run.root, "app data"), verification = path.join(run.root, "verification");
     const project = kind === "real-read" ? path.resolve("src") : path.join(run.root, "catalog project");
     for (const directory of [data, verification, path.join(run.root, "temp"), ...["home", "profile/roaming", "profile/local/Packages", "temp"].map(name => path.join(verification, name))]) mkdirSync(directory, { recursive: true });
@@ -43,7 +62,9 @@ try {
       writeFileSync(path.join(verification, "home/config.toml"), ['default_permissions="scoped"', '[windows]', 'sandbox="mxc"', '[permissions.scoped.filesystem]', '":minimal"="read"', `${psQuote(workspace)}="read"`, `${psQuote(path.join(workspace, ".env"))}="deny"`, `${psQuote(evaluator.file)}="read"`, `${psQuote(path.dirname(process.execPath))}="read"`, `${psQuote(path.dirname(shell))}="read"`, `${psQuote(path.dirname(process.env.COMSPEC))}="read"`, `${psQuote(path.join(verification, "profile/local/Packages"))}="write"`, '[permissions.scoped.network]', 'enabled=false', ''].join("\n"));
       return evaluator.run(binary, shell, workspace, isolatedEnvironment(verification, process.env));
     };
-    const record = { kind, repetition, status: "failed", humanContextAdditions: 0, humanPatches: 0, manualTakeovers: 0, baseline: evaluator ? verify(project) : null };
+    const trial = authorizedTrial ?? retryTrial ?? `p4-${kind}-${repetition}-${randomUUID()}`;
+    const trialLimitMicros = authorizedTrial ? 2_000_000 : 1_000_000;
+    const record = { kind, repetition, trial, trialLimitMicros, retry: !!retryTrial, status: "failed", humanContextAdditions: 0, humanPatches: 0, manualTakeovers: 0, baseline: evaluator ? verify(project) : null };
     results.push(record); const started = Date.now(), budgetBefore = budget();
     console.log(`Starting ${kind} ${repetition}; shared committed ¥${(budgetBefore.committedMicros / 1e6).toFixed(6)}`);
     let app, clean = false;
@@ -92,8 +113,8 @@ try {
             return new Response(result.wire, { headers: { "content-type": "text/event-stream" } });
           } finally { ledger.close(); }
         };
-      }, { base: developmentModuleBase, file: ledgerFile, trial: `p4-${kind}-${repetition}-${randomUUID()}` });
-      for (const command of [{ type: "set-key", key }, { type: "configure-budget", totalMicros: 1000000, trialMicros: 1000000 }, { type: "confirm-price" }]) {
+      }, { base: developmentModuleBase, file: ledgerFile, trial });
+      for (const command of [{ type: "set-key", key }, { type: "configure-budget", totalMicros: trialLimitMicros, trialMicros: trialLimitMicros }, { type: "confirm-price" }]) {
         const reply = await page.evaluate(command => window.lcodex.request(command), command); assert.equal(reply.ok, true, reply.code);
       }
       await app.evaluate(({ dialog }, project) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [project] }); }, project);
