@@ -8,17 +8,28 @@ function requireValue(value: unknown, code = "PROJECT_COMMAND_CONTRACT_REFUSED")
   if (!value) throw new Error(code);
 }
 
+function cwdPrefix(workspace: string) {
+  const quoted = "'" + workspace.replaceAll("'", "''") + "'";
+  return "# lcodex:cwd-check:v1\nif (-not [string]::Equals((Get-Location).ProviderPath, " + quoted +
+    ", [StringComparison]::OrdinalIgnoreCase)) { throw 'LCODEX_PROJECT_CWD_MISMATCH' }\n# lcodex:command\n";
+}
+
+export function guardedPowerShellCommand(command: string, workspace: string) {
+  return cwdPrefix(workspace) + command;
+}
+
 // Only the command is a model decision. Execution parameters belong to the host.
 // This contract narrows the native tool; it does not parse or grant shell rights.
 export function desktopCommandContract(options: Options) {
   const native = projectToolPolicy(options.workspace, options.shell, options.rootMarker, options.readOnlyAssets);
-  const commandArguments = (cmd: unknown) => ({
-    cmd, shell: options.shell, login: false, workdir: options.workspace,
+  const commandArguments = (cmd: string) => ({
+    cmd: guardedPowerShellCommand(cmd, options.workspace), shell: options.shell, login: false, workdir: options.workspace,
     yield_time_ms: 30000, max_output_tokens: 1024,
   });
   const policy = {
     functionCall(name: string, args: Record<string, unknown>) {
       requireValue(name === "exec_command" && Object.keys(args).length === 1 && Object.hasOwn(args, "cmd"));
+      requireValue(typeof args.cmd === "string" && args.cmd.length > 0);
       native.functionCall(name, commandArguments(args.cmd));
       requireValue(options.verifyCommand === undefined || args.cmd === options.verifyCommand, "TASK_VERIFICATION_REQUIRED");
     },
@@ -34,7 +45,7 @@ export function desktopCommandContract(options: Options) {
       return [
         { type: "function", name: "exec_command",
           description: "Run a command in the selected isolated project. The host fixes PowerShell, working directory, no login shell, 1024 output tokens and bounded execution. Supply only cmd. First locate relevant functions/line numbers, then read short targeted ranges (normally at most 60 lines); never dump whole large files. Do not reread already observed ranges. Run the configured verification command separately, exactly as given.",
-          parameters: { type: "object", properties: { cmd: { type: "string", maxLength: 8192,
+          parameters: { type: "object", properties: { cmd: { type: "string", maxLength: 8192 - Buffer.byteLength(cwdPrefix(options.workspace)),
             ...(options.verifyCommand === undefined ? {} : { enum: [options.verifyCommand] }) } },
           required: ["cmd"], additionalProperties: false } },
         ...(!options.readOnly && options.verifyCommand === undefined
@@ -50,6 +61,7 @@ export function desktopCommandContract(options: Options) {
       const output = (response.output as Record<string, unknown>[]).map(item => {
         if (item.type !== "function_call") return structuredClone(item);
         const args = JSON.parse(String(item.arguments)) as Record<string, unknown>;
+        requireValue(typeof args.cmd === "string" && args.cmd.length > 0);
         const argumentsText = JSON.stringify(commandArguments(args.cmd));
         mapped.set(String(item.id), argumentsText);
         return { ...item, arguments: argumentsText };
@@ -90,6 +102,8 @@ export function desktopCommandHistory(input: unknown) {
     requireValue(typeof item.arguments === "string", "API_COMMAND_HISTORY_INVALID");
     const args: unknown = JSON.parse(item.arguments);
     requireValue(isObject(args) && typeof args.cmd === "string", "API_COMMAND_HISTORY_INVALID");
-    return { ...item, arguments: JSON.stringify({ cmd: args.cmd }) };
+    const prefix = typeof args.workdir === "string" ? cwdPrefix(args.workdir) : "";
+    const command = prefix && args.cmd.startsWith(prefix) ? args.cmd.slice(prefix.length) : args.cmd;
+    return { ...item, arguments: JSON.stringify({ cmd: command }) };
   });
 }

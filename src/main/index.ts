@@ -11,6 +11,7 @@ import { Credentials } from "./storage/credentials.js";
 import { Tasks } from "./engine/tasks.js";
 import { Pricing, PRICE_SOURCE } from "./storage/pricing.js";
 import { runtimePaths, verifyRuntime } from "./runtime.js";
+import { privatePath } from "../../validation/private-files.js";
 
 const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 const testRoot = !app.isPackaged ? process.env.LCODEX_DESKTOP_TEST_ROOT : undefined;
@@ -20,8 +21,14 @@ if (testRoot && (path.dirname(realpathSync(testRoot)).toLowerCase() !== path.joi
 // Require an existing, non-redirected absolute directory; never infer one from a project.
 const customData = app.commandLine.getSwitchValue("user-data-dir");
 if (customData && (!path.isAbsolute(customData) || realpathSync(customData).toLowerCase() !== path.resolve(customData).toLowerCase())) throw new Error("DATA_DIRECTORY_REFUSED");
-const dataRoot = testRoot ? path.join(testRoot, "desktop") : customData || (app.isPackaged ? app.getPath("userData") : path.join(sourceRoot, ".local", "desktop"));
-mkdirSync(dataRoot, { recursive: true });
+const requestedDataRoot = testRoot ? path.join(testRoot, "desktop") : customData || (app.isPackaged ? app.getPath("userData") : path.join(sourceRoot, ".local", "desktop"));
+mkdirSync(requestedDataRoot, { recursive: true });
+// A packaged launcher can virtualize AppData without a directory junction.
+// JS realpath retains that logical path; native realpath resolves the actual
+// opened directory. All processes must use that same location before spawning
+// an isolated shell. Existing files remain in place, including key and ledger.
+privatePath(requestedDataRoot, "workspace.json");
+const dataRoot = realpathSync.native(requestedDataRoot);
 for (const relative of ["home", "profile/roaming", "profile/local/Packages", "temp"]) mkdirSync(path.join(dataRoot, relative), { recursive: true });
 app.setPath("userData", dataRoot);
 app.setPath("sessionData", path.join(dataRoot, "chromium"));

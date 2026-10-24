@@ -6,8 +6,10 @@ import path from "node:path";
 import { _electron } from "playwright-core";
 import { createRunDirectory } from "../dist/validation/run-directory.js";
 import { stopAndCloseDesktop, waitForFreshDesktop } from "./desktop-helpers.mjs";
+import { createAppDataProfile } from "./appdata-profile.mjs";
 
-test("packaged application uses bundled runtimes with a fresh profile and no developer PATH", { timeout: 180000 }, async () => {
+for (const location of ["workspace", "Windows AppData"]) {
+test(`packaged read, test, review and restart with ${location} profile and no developer PATH`, { timeout: 180000 }, async () => {
   const run = createRunDirectory("packaged 中文"), project = path.join(run.root, "catalog project");
   const executable = realpathSync(process.env.LCODEX_PACKAGE_EXECUTABLE ?? ".local/releases/win-unpacked/lcodex.exe");
   assert.ok(executable.toLowerCase().startsWith(path.resolve(".local").toLowerCase() + path.sep));
@@ -24,18 +26,24 @@ test("packaged application uses bundled runtimes with a fresh profile and no dev
   assert.notEqual(spawnSync(node, [acceptor, path.join(project, "catalog.mjs")]).status, 0, "Initial independent baseline must reproduce the defect");
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => ["SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "APPDATA", "LOCALAPPDATA"].includes(key.toUpperCase())));
   Object.assign(env, { PATH: path.join(process.env.SystemRoot, "System32"), TEMP: path.join(run.root, "temp"), TMP: path.join(run.root, "temp") });
-  const args = ["--user-data-dir=" + path.join(run.root, "profile/roaming")];
+  const roaming = location === "Windows AppData" ? createAppDataProfile(run) : undefined;
+  // Pass the logical Windows path unchanged: resolving it in the test would
+  // conceal the production bug this scenario must catch.
+  const profile = roaming?.logical ?? path.join(run.root, "profile/roaming");
+  const args = ["--user-data-dir=" + profile];
   let app, clean = false;
   try {
     app = await _electron.launch({ executablePath: executable, args, cwd: run.root, env, timeout: 40000 });
     let page = await waitForFreshDesktop(app);
     const info = await app.evaluate(({ app }) => ({ packaged: app.isPackaged, data: app.getPath("userData") }));
-    assert.equal(info.packaged, true); assert.ok(path.relative(run.root, info.data).startsWith("profile"));
+    assert.equal(info.packaged, true); assert.equal(info.data, realpathSync.native(profile));
+    console.log(JSON.stringify({ profileLocation: location, virtualized: realpathSync(profile) !== realpathSync.native(profile) }));
     const initial = await page.evaluate(() => window.lcodex.request({ type: "snapshot" }));
     assert.equal(initial.state.version, JSON.parse(readFileSync("package.json", "utf8")).version);
     assert.deepEqual([initial.state.runtime.engine, initial.state.runtime.shell, initial.state.runtime.node], [true, true, true]);
     assert.equal(initial.state.budget.scope, "personal"); assert.equal(initial.state.budget.configured, false); assert.equal(initial.state.pricing.current, false);
     await app.evaluate((_electron, command) => { globalThis.lcodexTestCommand = command; globalThis.lcodexTestReadBeforeChecks = true; }, command);
+    await app.evaluate(() => { globalThis.lcodexTestReadCommand = "Get-ChildItem -Force | Select-Object Mode,Length,Name"; });
     await app.evaluate((_electron, script) => { (0, eval)(script); }, readFileSync("tests/mock-model.mjs", "utf8"));
     await page.getByRole("button", { name: "设置", exact: true }).click();
     await page.getByLabel("DeepSeek API Key", { exact: true }).fill("sk-synthetic-packaged-not-a-real-key");
@@ -58,6 +66,27 @@ test("packaged application uses bundled runtimes with a fresh profile and no dev
     let snapshot = await page.evaluate(() => window.lcodex.request({ type: "snapshot" }));
     const chatId = snapshot.state.activeChatId, projectId = snapshot.state.chats.find(chat => chat.id === chatId).projectId;
     await page.evaluate(({projectId, command}) => window.lcodex.request({ type: "set-test-command", projectId, command }), {projectId, command});
+    await page.getByRole("textbox", { name: "输入任务" }).fill("这个项目文件夹有几个文件（模拟模型，实际命令）");
+    await page.getByRole("button", { name: "发送任务", exact: true }).click();
+    const readDeadline = Date.now() + 60000;
+    let readChat;
+    do {
+      let timer;
+      try {
+        snapshot = await Promise.race([
+          page.evaluate(() => window.lcodex.request({ type: "snapshot" })),
+          new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("PACKAGED_UI_UNRESPONSIVE")), 5000); }),
+        ]);
+      } finally { clearTimeout(timer); }
+      readChat = snapshot.state.chats.find(chat => chat.id === chatId);
+      if (["ended", "failed", "stopped", "reconcile"].includes(readChat.execution)) break;
+      await new Promise(resolve => setTimeout(resolve, 100));
+    } while (Date.now() < readDeadline);
+    assert.equal(readChat.execution, "ended", readChat.error ?? "read did not end");
+    assert.equal(readChat.tools.length, 1); assert.equal(readChat.tools[0].exitCode, 0);
+    assert.match(readChat.tools[0].output, /catalog\.mjs/);
+    assert.ok(readChat.tools[0].output.length < 2000, "List only the small project, never System32");
+    assert.doesNotMatch(readChat.tools[0].output, /specified drive root|LCODEX_PROJECT_CWD_MISMATCH|kernel32\.dll/i);
     await page.getByRole("combobox", { name: "任务方式" }).selectOption("write");
     await page.getByRole("textbox", { name: "输入任务" }).fill("修复数量计算，运行 npm 测试（模拟模型，实际发布程序）。");
     await page.getByRole("button", { name: "发送任务", exact: true }).click();
@@ -86,7 +115,12 @@ test("packaged application uses bundled runtimes with a fresh profile and no dev
     assert.equal(resumed.state.budget.limit, 2); assert.equal(resumed.state.budget.perTask, 0.5); assert.equal(resumed.state.runtime.key, true);
     assert.equal(readFileSync(".local/state/p1-budget.jsonl", "utf8"), originalBudget);
     mkdirSync(".local/reports", { recursive: true });
-    await page.screenshot({ path: ".local/reports/packaged-review.png" });
+    await page.screenshot({ path: `.local/reports/packaged-review-${location === "workspace" ? "workspace" : "appdata"}.png` });
     clean = true;
-  } finally { await stopAndCloseDesktop(app); if (clean) run.cleanup(); else console.log("Retained packaged fixture:", path.basename(run.root)); }
+  } finally {
+    await stopAndCloseDesktop(app);
+    if (clean) { roaming?.cleanup(); run.cleanup(); }
+    else console.log("Retained packaged fixture:", path.basename(run.root), roaming?.logical ?? "");
+  }
 });
+}

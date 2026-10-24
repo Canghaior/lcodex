@@ -109,7 +109,9 @@ export async function executeSession(options: EngineOptions): Promise<EngineResu
         if (finalResponseOnly) assertFinalAnswer(adapted.response.output);
         // Preserve the validated request command by call ID. The engine's display
         // command includes shell quoting and is not an exact command identity.
-        if (Array.isArray(adapted.response.output)) for (const item of adapted.response.output) {
+        // Track the validated model command, not the host's fail-closed cwd
+        // assertion prepended to the executable command.
+        if (Array.isArray(result.response.output)) for (const item of result.response.output) {
           if (isObject(item) && item.type === "function_call" && typeof item.arguments === "string") {
             const args = JSON.parse(item.arguments);
             progress.plan(String(item.call_id), args.cmd);

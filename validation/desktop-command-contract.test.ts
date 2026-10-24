@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import path from "node:path";
-import { desktopCommandContract, desktopCommandHistory } from "./desktop-command-contract.js";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { desktopCommandContract, desktopCommandHistory, guardedPowerShellCommand } from "./desktop-command-contract.js";
+import { createRunDirectory } from "./run-directory.js";
 import { ResponsesStream } from "./responses-stream.js";
 import { assertFinalAnswer, SessionProgress } from "./session-progress.js";
 
@@ -29,7 +32,7 @@ test("cmd-only model calls execute with host-owned parameters and retain exact i
   const parser = new ResponsesStream(); parser.push(chunks.join(""));
   const item = (parser.finish().response.output as { id: string; call_id: string; arguments: string }[])[0]!;
   assert.equal(item.id, "item1"); assert.equal(item.call_id, "call1"); assert.deepEqual(ids, ["call1"]);
-  assert.deepEqual(JSON.parse(item.arguments), { cmd: "Get-Content 'source.txt'", shell: options.shell, login: false,
+  assert.deepEqual(JSON.parse(item.arguments), { cmd: guardedPowerShellCommand("Get-Content 'source.txt'", options.workspace), shell: options.shell, login: false,
     workdir: options.workspace, yield_time_ms: 30000, max_output_tokens: 1024 });
   assert.deepEqual(desktopCommandHistory([item, { type: "function_call_output", call_id: "call1", output: "actual" }]),
     [data.response.output[0], { type: "function_call_output", call_id: "call1", output: "actual" }].map((v, i) => i === 0 ? { ...item, arguments: data.response.output[0]!.arguments } : v));
@@ -37,11 +40,37 @@ test("cmd-only model calls execute with host-owned parameters and retain exact i
 
 test("invalid arguments and inconsistent deltas are rejected before any adaptation", () => {
   const contract = desktopCommandContract(options);
-  for (const args of [{ cmd: "x", shell: "attacker" }, { cmd: "x", max_output_tokens: 10000 }, { cmd: "x", workdir: "../outside" }, { cmd: "x", sandbox_permissions: "require_escalated" }, { cmd: "a\0b" }, { cmd: 1 }]) {
+  for (const args of [{ cmd: "x", shell: "attacker" }, { cmd: "x", max_output_tokens: 10000 }, { cmd: "x", workdir: "../outside" }, { cmd: "x", sandbox_permissions: "require_escalated" }, { cmd: "a\0b" }, { cmd: 1 }, { cmd: "" }, { cmd: "中".repeat(2800) }]) {
     const data = sample(args); assert.throws(() => contract.response(data.wire(), data.response), /REFUSED/);
   }
   const data = sample(); data.events[1]!.delta = "different";
   assert.throws(() => contract.response(data.wire(), data.response), /REFUSED/);
+});
+
+test("history unwraps the recorded workspace across restarts and retains legacy commands", () => {
+  const command = "Get-ChildItem -Force | Select-Object Mode,Length,Name";
+  const input = [
+    { type: "function_call", name: "exec_command", arguments: JSON.stringify({ cmd: guardedPowerShellCommand(command, "C:\\old profile\\workspace"), workdir: "C:\\old profile\\workspace" }) },
+    { type: "function_call", name: "exec_command", arguments: JSON.stringify({ cmd: command, workdir: "D:\\new workspace" }) },
+  ];
+  assert.deepEqual(desktopCommandHistory(input).map(item => JSON.parse(item.arguments)), [{ cmd: command }, { cmd: command }]);
+});
+
+test("actual PowerShell refuses an unexpected starting directory before any side effect", () => {
+  const run = createRunDirectory("command cwd 中文");
+  const expected = path.join(run.root, "expected ' project"), wrong = path.join(run.root, "wrong");
+  const shell = path.join(process.env.USERPROFILE!, ".cache/codex-runtimes/codex-primary-runtime/dependencies/native/powershell/pwsh.exe");
+  mkdirSync(expected); mkdirSync(wrong);
+  try {
+    const command = guardedPowerShellCommand("Set-Content -LiteralPath './sentinel.txt' -Value 'EXECUTED' -NoNewline", expected);
+    const bad = spawnSync(shell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], { cwd: wrong, windowsHide: true, timeout: 10000, encoding: "utf8" });
+    assert.equal(bad.error, undefined); assert.equal(bad.status, 1); assert.match(bad.stderr, /LCODEX_PROJECT_CWD_MISMATCH/);
+    assert.equal(existsSync(path.join(wrong, "sentinel.txt")), false);
+    assert.equal(existsSync(path.join(expected, "sentinel.txt")), false);
+    const good = spawnSync(shell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], { cwd: expected, windowsHide: true, timeout: 10000, encoding: "utf8" });
+    assert.equal(good.error, undefined); assert.equal(good.status, 0, good.stderr);
+    assert.equal(readFileSync(path.join(expected, "sentinel.txt"), "utf8"), "EXECUTED");
+  } finally { run.cleanup(); }
 });
 
 test("reserved verification exposes only the exact configured command and rejects alternatives", () => {
