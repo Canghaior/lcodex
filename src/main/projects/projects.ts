@@ -3,6 +3,7 @@ import { realpathSync } from "node:fs";
 import path from "node:path";
 import { WindowsFileGuard } from "../../../validation/windows-file-guard.js";
 import type { Chat, Project } from "../../shared/contracts.js";
+import { providerProfile, type ProviderId } from "../../shared/providers.js";
 
 export function assertProjectDataSeparation(root: string, dataRoot: string): void {
   const project = realpathSync(root), data = realpathSync(dataRoot);
@@ -18,8 +19,8 @@ export async function inspectProject(root: string, guard: WindowsFileGuard): Pro
   const captured = await guard.capture(actual);
   return { id: randomUUID(), name: path.basename(actual), path: actual, files: captured.files.filter(file => file.kind === "text").map(file => file.relative).sort(), excluded: captured.excluded.length };
 }
-export function newChat(projectId: string): Chat {
-  return { id: randomUUID(), projectId, title: "新聊天", mode: "read", execution: "idle", verification: "unverified", messages: [], tools: [], changes: [], error: null, reviewId: null };
+export function newChat(projectId: string, provider: ProviderId = "deepseek"): Chat {
+  return { provider, model: providerProfile(provider).id, id: randomUUID(), projectId, title: "新聊天", mode: "read", execution: "idle", verification: "unverified", messages: [], tools: [], changes: [], error: null, reviewId: null };
 }
 export async function previewFile(project: Project, relative: string, guard: WindowsFileGuard) {
   // The renderer sends a selection from the registered project's captured list,

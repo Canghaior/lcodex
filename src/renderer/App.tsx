@@ -1,4 +1,4 @@
-import { DESKTOP_MODEL } from "../../validation/deepseek-model.js";
+import { PROVIDERS, providerProfile, type ProviderId } from "../shared/providers.js";
 import { BudgetSettings } from "./BudgetSettings.js";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowUp, Check, ChevronDown, ChevronRight, Code2, FileCode2, FileDiff, FileText, Folder, FolderOpen, ListChecks, Maximize2, MessageSquare, Minus, PanelLeft, PanelRight, Plus, Search, Settings2, ShieldCheck, Square, SquarePen, Terminal, Trash2, X } from "lucide-react";
@@ -37,16 +37,22 @@ function errorText(code: string) {
     ENGINE_HISTORY_UNAVAILABLE: "引擎历史暂不可读取，不能确认这次操作的结果。项目锁和副本已保留，请勿通过删除记录解除保护。",
     TASK_ISOLATED_ABANDONED: "本次隔离尝试已结束，最后操作结果仍未确认。原项目没有应用本次改动，记录已保留；可以新建聊天。",
     TASK_REVIEW_OR_RECONCILE_REQUIRED: "请先应用或放弃待审阅改动；若状态需要核对，请先完成核对，再继续对话。",
-    KEY_MISSING: "请先在设置中保存 DeepSeek API Key。",
+    PROVIDER_CHANGED: "当前聊天的厂商已变化，请重新查看设置后操作。",
+    CHAT_MODEL_LOCKED: "这个聊天已固定模型，请新建聊天后选择其他模型。",
+    CHAT_MODEL_MISMATCH: "聊天与执行记录的模型不一致，已阻止继续，请保留记录供核对。",
+    BUDGET_CURRENCY_MISMATCH: "预算币种与所选厂商不一致，未发送请求。",
+    API_HTTP_403: "当前账户无权使用该模型，请检查 OpenAI 项目权限和模型访问资格。",
+    API_HTTP_404: "未找到指定模型或当前账户无访问权限，请核对模型配置。",
+    KEY_MISSING: "请先在设置中保存当前厂商的 API Key。",
     KEY_ENCRYPTION_UNAVAILABLE: "Windows 密钥加密当前不可用。请检查登录环境后重试，不会改用明文保存。",
-    API_HTTP_401: "DeepSeek 未接受这个密钥。请检查设置；此次请求用量未知，预留预算已保留。",
-    API_HTTP_402: "DeepSeek 账户额度不足，请检查账户余额。此次请求不会自动重试。",
-    API_HTTP_429: "DeepSeek 暂时限流，请稍后检查。用量未知的预留仍保留，不会自动重试。",
+    API_HTTP_401: "模型服务未接受这个密钥。请检查设置；此次请求用量未知，预留预算已保留。",
+    API_HTTP_402: "模型服务账户额度不足，请检查账户余额。此次请求不会自动重试。",
+    API_HTTP_429: "模型服务暂时限流，请稍后检查。用量未知的预留仍保留，不会自动重试。",
     BUDGET_PENDING_RECONCILIATION: "有未确认用量的请求，预算账本已保留，核对前不会再调用模型。",
     BUDGET_LOCK_UNVERIFIED: "预算锁不存在或归属无法确认。已有账本保留，不能按零消耗重新开始。",
     BUDGET_LOCK_OWNER_ACTIVE: "持有预算锁的进程仍在运行，请先等待该任务结束。",
     BUDGET_RECONCILIATION_CHANGED: "待核对用量已变化，请重新查看设置后再操作。",
-    BUDGET_WRONG_LIMITS: "请填写有效预算：单任务至少 ¥0.25，累计上限不少于单任务限额及已有占用。",
+    BUDGET_WRONG_LIMITS: "请填写有效预算：单任务至少 0.25（当前所选币种），累计上限不少于单任务限额及已有占用。",
     BUDGET_TOTAL_LIMIT: "累计剩余预算不足以覆盖下一次请求的保守预留。已有结果保留，请先核对预算。",
     BUDGET_TRIAL_LIMIT: "本次任务剩余预算不足以覆盖下一次请求的保守预留。已有结果保留，不再发送请求。",
     TASK_REQUEST_LIMIT: "本次任务达到 8 次模型请求上限。请查看已完成内容和未完成事项。",
@@ -71,26 +77,32 @@ export function App() {
   const [state, setState] = useState<AppState | null>(null), [error, setError] = useState<string | null>(null), [busy, setBusy] = useState(false);
   const [settings, setSettings] = useState(false), [sidebar, setSidebar] = useState(true), [workspace, setWorkspace] = useState(true), [tab, setTab] = useState<"files" | "changes" | "output">("files");
   const [keyInput, setKeyInput] = useState(""), [keyBusy, setKeyBusy] = useState(false), [testCommand, setTestCommand] = useState(""), [selectedChange, setSelectedChange] = useState<string | null>(null), [applying, setApplying] = useState(false);
-  const [checkingConnection, setCheckingConnection] = useState(false), [connectionVerified, setConnectionVerified] = useState(false);
+  const [checkingConnection, setCheckingConnection] = useState(false), [connectionVerified, setConnectionVerified] = useState<ProviderId | null>(null);
   const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null), [deleting, setDeleting] = useState(false);
   const [preview, setPreview] = useState<FilePreview | null>(null), [files, setFiles] = useState<FilePreview[]>([]), [sourceView, setSourceView] = useState(false);
   const [drafts, setDrafts] = useState<Record<string, string>>({}), [query, setQuery] = useState(""), [searching, setSearching] = useState(false);
   const [chatWidth, setChatWidth] = useState(45), [dragging, setDragging] = useState(false);
   const center = useRef<HTMLDivElement>(null), composer = useRef<HTMLTextAreaElement>(null), bottom = useRef<HTMLDivElement>(null);
+  const profile = providerProfile(state?.provider);
   const chat = state?.chats.find(item => item.id === state.activeChatId);
   const project = state?.projects.find(item => item.id === chat?.projectId);
   const deleteTarget = state?.chats.find(item => item.id === deleteTargetId);
   const draft = drafts[chat?.id ?? "empty"] ?? "";
-  const request = useCallback(async (command: Command): Promise<Reply | undefined> => {
-    try { const reply = await window.lcodex.request(command); if (reply.ok) { setState(reply.state); return reply; } setError(errorText(reply.code)); }
-    catch { setError("与本地后台的连接中断，请保留窗口并重试。"); }
+  const latestState = useRef<AppState | null>(null);
+  const acceptState = useCallback((next: AppState) => {
+    if (!latestState.current || next.revision >= latestState.current.revision) { latestState.current = next; setState(next); }
   }, []);
-  useEffect(() => { void request({ type: "snapshot" }); return window.lcodex.subscribe(setState); }, [request]);
+  const request = useCallback(async (command: Command): Promise<Reply | undefined> => {
+    try { const reply = await window.lcodex.request(command); if (reply.ok) { acceptState(reply.state); return reply; } setError(errorText(reply.code)); }
+    catch { setError("与本地后台的连接中断，请保留窗口并重试。"); }
+  }, [acceptState]);
+  useEffect(() => { void request({ type: "snapshot" }); return window.lcodex.subscribe(acceptState); }, [request, acceptState]);
   useEffect(() => { setPreview(null); setFiles([]); }, [project?.id]);
   useEffect(() => { setTestCommand(project?.testCommand ?? ""); }, [project?.id, project?.testCommand]);
   useEffect(() => { if (!settings) setKeyInput(""); }, [settings]);
-  useEffect(() => { if (!state?.runtime.key) setConnectionVerified(false); }, [state?.runtime.key]);
+  useEffect(() => { if (!state?.runtime.key) setConnectionVerified(null); }, [state?.runtime.key]);
   useEffect(() => { setSelectedChange(null); }, [chat?.id]);
+  useEffect(() => { setKeyInput(""); setConnectionVerified(null); }, [state?.provider]);
   useEffect(() => { bottom.current?.scrollIntoView({ behavior: "smooth" }); }, [chat?.messages.length, chat?.tools.length]);
   useEffect(() => {
     const listener = (event: KeyboardEvent) => {
@@ -111,7 +123,7 @@ export function App() {
   async function openFile(relative: string) {
     if (!project) return;
     const reply = await request({ type: "open-file", projectId: project.id, relative });
-    if (reply?.ok && reply.file) { setPreview(reply.file); setFiles(old => [...old.filter(file => file.relative !== relative), reply.file!]); setTab("files"); setWorkspace(true); setSourceView(false); }
+    if (reply?.ok && reply.file && latestState.current?.chats.find(item => item.id === latestState.current?.activeChatId)?.projectId === project.id) { setPreview(reply.file); setFiles(old => [...old.filter(file => file.relative !== relative), reply.file!]); setTab("files"); setWorkspace(true); setSourceView(false); }
   }
   async function send() {
     if (!chat || !draft.trim()) return;
@@ -121,12 +133,12 @@ export function App() {
   }
   async function saveKey() {
     setKeyBusy(true);
-    try { const reply = await request({ type: "set-key", key: keyInput.trim() }); if (reply?.ok) { setKeyInput(""); setConnectionVerified(false); } }
+    try { const reply = await request({ type: "set-key", provider: profile.provider, key: keyInput.trim() }); if (reply?.ok) { setKeyInput(""); setConnectionVerified(null); } }
     finally { setKeyBusy(false); }
   }
   async function checkConnection() {
-    setCheckingConnection(true); setConnectionVerified(false);
-    try { const reply = await request({ type: "check-connection" }); if (reply?.ok && reply.connectionVerified) setConnectionVerified(true); }
+    setCheckingConnection(true); setConnectionVerified(null);
+    try { const reply = await request({ type: "check-connection", provider: profile.provider }); if (reply?.ok && reply.connectionVerified) setConnectionVerified(reply.connectionProvider ?? null); }
     finally { setCheckingConnection(false); }
   }
   async function applyChanges(files: string[]) {
@@ -137,7 +149,7 @@ export function App() {
   const active = chat && ["running", "waiting", "stopping"].includes(chat.execution);
   const change = chat?.changes.find(change => change.relative === selectedChange) ?? chat?.changes[0];
   const pendingChanges = chat?.changes.filter(change => change.status === "pending") ?? [];
-  const canCompose = !!chat && ["idle", "ended"].includes(chat.execution) && !chat.changes.some(change => ["pending", "needs-reconcile"].includes(change.status));
+  const canCompose = !state?.busy && !!chat && ["idle", "ended"].includes(chat.execution) && !chat.changes.some(change => ["pending", "needs-reconcile"].includes(change.status));
   return <div className={`desktop ${dragging ? "resizing" : ""}`}>
     <header className="titlebar"><div className="titlebar-left"><Terminal size={13} /><span>lcodex</span><span className="titlebar-divider">/</span><span>{project?.name ?? "本地编程助手"}</span></div><div className="window-controls">
       <IconButton label="最小化" onClick={() => void request({ type: "window", action: "minimize" })}><Minus size={14} /></IconButton>
@@ -152,7 +164,7 @@ export function App() {
         <div className="project-heading"><span>项目</span><IconButton label="添加项目" disabled={busy} onClick={() => void chooseProject()}><Plus size={15} /></IconButton></div>
         <div className="project-list">{state?.projects.map(item => <div className="project-group" key={item.id}><div className="project-row"><FolderOpen size={15} /><button title={item.path} onClick={() => { const first = state.chats.find(current => current.projectId === item.id); if (first) void request({ type: "select-chat", chatId: first.id }); else startChat(item.id); }}>{item.name}</button><IconButton label={`在 ${item.name} 中新建聊天`} onClick={() => startChat(item.id)}><Plus size={14} /></IconButton></div>{state.chats.filter(current => current.projectId === item.id && (!searching || current.title.toLowerCase().includes(query.toLowerCase()))).map(current => <button key={current.id} className={`chat-row ${current.id === chat?.id ? "selected" : ""}`} onClick={() => void request({ type: "select-chat", chatId: current.id })}><span className={`chat-dot ${current.execution}`} />{current.title}</button>)}</div>)}
           {state?.projects.length === 0 && <div className="sidebar-empty">添加一个本地项目，<br />开始你的第一段对话。</div>}
-        </div><button className="sidebar-footer" onClick={() => setSettings(true)}><ShieldCheck size={14} /><span>本地执行 · DeepSeek</span></button>
+        </div><button className="sidebar-footer" onClick={() => setSettings(true)}><ShieldCheck size={14} /><span>本地执行 · {profile.providerLabel}</span></button>
       </aside>}
       <main className="main-panels" ref={center}>
         <section className="chat-panel" style={{ flexBasis: workspace ? `${chatWidth}%` : "100%" }} aria-label="聊天区">
@@ -170,7 +182,7 @@ export function App() {
             {chat?.execution === "reconcile" && !chat.reviewId && !chat.changes.length && chat.error !== "CHAT_DELETE_INCOMPLETE" && <button className="text-link" disabled={busy} onClick={async () => { setBusy(true); try { await request({ type: "abandon-isolated", chatId: chat.id }); } finally { setBusy(false); } }}>{busy ? "正在核对…" : "核对并放弃本次隔离尝试"}</button>}
             {chat && ["stopped", "failed"].includes(chat.execution) && <button className="text-link" onClick={() => startChat(chat.projectId)}>新建聊天继续工作</button>}<div ref={bottom} />
           </div>
-          <div className="composer-area"><div className="composer"><textarea ref={composer} aria-label="输入任务" placeholder={!project ? "先选择一个本地项目" : !canCompose ? "请先处理待审阅改动或核对状态" : "描述任务，或询问这个项目…"} disabled={!project || !canCompose} value={draft} maxLength={8000} onChange={event => setDrafts(old => ({ ...old, [chat?.id ?? "empty"]: event.target.value }))} onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void send(); } }} rows={3} /><div className="composer-toolbar"><select aria-label="任务方式" value={chat?.mode ?? "read"} disabled={!canCompose} onChange={event => { if (chat) void request({ type: "set-mode", chatId: chat.id, mode: event.target.value as Chat["mode"] }); }}><option value="read">只读分析</option><option value="write">修改并验证</option></select><div className="composer-spacer" /><button className="model-picker" onClick={() => setSettings(true)}>{DESKTOP_MODEL.label} · 思考 <ChevronDown size={12} /></button>{active ? <button className="send-button stop-button" aria-label="停止任务" disabled={chat.execution === "stopping"} onClick={() => void request({ type: "stop", chatId: chat.id })}><Square size={12} fill="currentColor" /></button> : <button className="send-button" aria-label="发送任务" disabled={!state?.executionAvailable || !draft.trim() || !canCompose} title={state?.runtime.ready ? "发送（Enter）；换行（Shift+Enter）" : "先配置模型与执行环境"} onClick={() => void send()}><ArrowUp size={18} /></button>}</div></div><div className="composer-caption">{chat?.mode === "write" ? "在隔离副本中修改，审阅后应用到原项目" : "只读分析不会修改项目文件"}<span>{active ? executionLabels[chat.execution] : state?.budget.configured ? `单任务最多 ¥${state.budget.perTask}` : "请先设置预算"}</span></div></div>
+          <div className="composer-area"><div className="composer"><textarea ref={composer} aria-label="输入任务" placeholder={!project ? "先选择一个本地项目" : !canCompose ? "请先处理待审阅改动或核对状态" : "描述任务，或询问这个项目…"} disabled={!project || !canCompose} value={draft} maxLength={8000} onChange={event => setDrafts(old => ({ ...old, [chat?.id ?? "empty"]: event.target.value }))} onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void send(); } }} rows={3} /><div className="composer-toolbar"><select aria-label="任务方式" value={chat?.mode ?? "read"} disabled={!canCompose} onChange={event => { if (chat) void request({ type: "set-mode", chatId: chat.id, mode: event.target.value as Chat["mode"] }); }}><option value="read">只读分析</option><option value="write">修改并验证</option></select><div className="composer-spacer" /><button className="model-picker" onClick={() => setSettings(true)}>{profile.label} · 思考 <ChevronDown size={12} /></button>{active ? <button className="send-button stop-button" aria-label="停止任务" disabled={chat.execution === "stopping"} onClick={() => void request({ type: "stop", chatId: chat.id })}><Square size={12} fill="currentColor" /></button> : <button className="send-button" aria-label="发送任务" disabled={!state?.executionAvailable || !draft.trim() || !canCompose} title={state?.runtime.ready ? "发送（Enter）；换行（Shift+Enter）" : "先配置模型与执行环境"} onClick={() => void send()}><ArrowUp size={18} /></button>}</div></div><div className="composer-caption">{chat?.mode === "write" ? "在隔离副本中修改，审阅后应用到原项目" : "只读分析不会修改项目文件"}<span>{active ? executionLabels[chat.execution] : state?.budget.configured ? `单任务最多 ${profile.symbol}${state.budget.perTask}` : "请先设置预算"}</span></div></div>
         </section>
         {workspace && <><div className="splitter" role="separator" aria-label="调整聊天与工作区宽度" aria-orientation="vertical" tabIndex={0} onPointerDown={event => { event.preventDefault(); setDragging(true); }} onKeyDown={event => { if (event.key === "ArrowLeft") setChatWidth(value => Math.max(30, value - 2)); if (event.key === "ArrowRight") setChatWidth(value => Math.min(70, value + 2)); }} /><section className="workspace-panel" aria-label="工作区"><div className="workspace-nav"><div className="workspace-tabs">{([['files', '文件', FileText], ['changes', '改动', FileDiff], ['output', '输出', Terminal]] as const).map(([key, label, Icon]) => <button className={tab === key ? "active" : ""} key={key} onClick={() => setTab(key)}><Icon size={14} />{label}{key === "changes" && !!chat?.changes.length && <small>{chat.changes.length}</small>}</button>)}</div><IconButton label="收起工作区" onClick={() => setWorkspace(false)}><PanelRight size={16} /></IconButton></div>
           {tab === "files" && <><div className="file-tabs">{files.map(file => <div className={`file-tab ${preview?.relative === file.relative ? "active" : ""}`} key={file.relative}><button onClick={() => { setPreview(file); setSourceView(false); }}><FileCode2 size={13} />{file.relative.split("/").at(-1)}</button><IconButton label={`关闭 ${file.relative}`} onClick={() => { const next = files.filter(item => item.relative !== file.relative); setFiles(next); if (preview?.relative === file.relative) setPreview(next.at(-1) ?? null); }}><X size={12} /></IconButton></div>)}</div>
@@ -182,8 +194,8 @@ export function App() {
     </div>
     {error && <div className="toast" role="alert"><span>{error}</span><IconButton label="关闭提示" onClick={() => setError(null)}><X size={15} /></IconButton></div>}
     {deleteTarget && <div className="modal-backdrop"><section className="settings-dialog" role="dialog" aria-modal="true" aria-label="删除聊天"><div className="settings-heading"><h2>删除这个聊天？</h2><IconButton label="取消删除" disabled={deleting} onClick={() => setDeleteTargetId(null)}><X size={18} /></IconButton></div><div className="settings-section"><p>将删除“{deleteTarget.title}”的聊天、工具记录和已结束任务的本机副本。原项目文件、模型密钥和预算记录会保留。</p><p>删除后不能在应用内恢复这些聊天记录。</p><button className="primary-button" disabled={deleting} onClick={async () => { const targetId = deleteTarget.id; setDeleting(true); try { const result = await request({ type: "delete-chat", chatId: targetId }); if (result?.ok) { setDeleteTargetId(null); setDrafts(old => { const next = { ...old }; delete next[targetId]; return next; }); } } finally { setDeleting(false); } }}>{deleting ? "正在删除…" : "删除聊天和副本"}</button></div></section></div>}
-    {settings && <div className="modal-backdrop" onClick={() => setSettings(false)}><section className="settings-dialog" role="dialog" aria-modal="true" aria-label="设置" onClick={event => event.stopPropagation()}><div className="settings-heading"><h2>设置</h2><IconButton label="关闭设置" onClick={() => setSettings(false)}><X size={18} /></IconButton></div><div className="settings-section"><h3>模型与密钥</h3><div className="setting-row"><span>{DESKTOP_MODEL.label} · 思考</span><span className="subtle-badge">{state?.runtime.key ? "密钥已加密保存" : "尚未配置密钥"}</span></div><label className="setting-label" htmlFor="api-key">DeepSeek API Key</label><div className="key-field"><input id="api-key" type="password" autoComplete="off" spellCheck={false} placeholder={state?.runtime.key ? "输入新密钥以替换" : "输入 API Key"} value={keyInput} onChange={event => setKeyInput(event.target.value)} /><button disabled={keyBusy || !keyInput.trim() || !!active} onClick={() => void saveKey()}>{keyBusy ? "保存中…" : "保存密钥"}</button></div>{state?.runtime.key && <button className="text-link small" disabled={!!active} onClick={() => void request({ type: "delete-key" })}>删除本机密钥</button>}<div className="connection-check"><button disabled={!state?.runtime.key || checkingConnection || !!active} onClick={() => void checkConnection()}>{checkingConnection ? "正在验证连接…" : "验证模型连接"}</button><span>{connectionVerified ? "模型接口已响应" : "将发起一次计费请求，计入现有预算"}</span></div><p>密钥由 Windows 加密保存，保存后不回传。任务中选择的代码与工具输出会发送至 DeepSeek 官方 API；项目文件和命令在本机处理。</p></div>
-      {project && <div className="settings-section"><h3>项目验证 · {project.name}</h3><label className="setting-label" htmlFor="test-command">验证命令（可选）</label><textarea id="test-command" value={testCommand} onChange={event => setTestCommand(event.target.value)} placeholder="填写已准备好的项目测试命令" rows={2} maxLength={2048} /><button className="text-link small" disabled={!!active} onClick={() => void request({ type: "set-test-command", projectId: project.id, command: testCommand })}>保存验证命令</button><p>命令在隔离副本内运行。只有该命令实际执行并返回成功，才标记通过；它不代替人工审阅。未配置时保留实际工具记录，整体状态为尚未验证。</p></div>}
-      <BudgetSettings state={state} disabled={!!active || checkingConnection || busy} request={request} /><div className="settings-section"><h3>本地执行环境</h3>{([['engine', 'Codex 0.162.0'], ['shell', 'PowerShell 7.6.5'], ['node', 'Node 24.8.0']] as const).map(([key, label]) => <div className="setting-row" key={key}><span>{label}</span><span className={state?.runtime[key] ? "status-ok" : "status-missing"}>{state?.runtime[key] ? <><Check size={14} />版本校验通过</> : "未找到匹配版本"}</span></div>)}<p>{state?.runtime.bundled ? "运行环境随应用提供并校验；用户项目的依赖仍需提前准备。" : "开发版本使用已验证的本机运行环境。"}</p></div><div className="settings-section"><h3>首版项目范围</h3><p>Windows 小型单包 JS/TS。源码与资源合计 16 MiB，单文件 1 MiB；普通预装依赖合计 64 MiB。暂不支持链接依赖与大型多包项目。</p><div className="setting-row"><span>修改方式</span><span>隔离副本 · 审阅后应用</span></div></div><div className="settings-footer"><span>lcodex {state?.version}</span><span>个人 · 本地使用</span></div></section></div>}
+    {settings && <div className="modal-backdrop" onClick={() => setSettings(false)}><section className="settings-dialog" role="dialog" aria-modal="true" aria-label="设置" onClick={event => event.stopPropagation()}><div className="settings-heading"><h2>设置</h2><IconButton label="关闭设置" onClick={() => setSettings(false)}><X size={18} /></IconButton></div><div className="settings-section"><h3>模型与密钥</h3><label className="setting-label" htmlFor="provider">当前聊天模型</label><select id="provider" value={profile.provider} disabled={!!state?.busy || keyBusy || checkingConnection || !!chat && (chat.execution !== "idle" || chat.messages.length > 0)} onChange={event => void request({ type: "set-provider", provider: event.target.value as ProviderId })}>{PROVIDERS.map(provider => <option key={provider} value={provider}>{providerProfile(provider).label}</option>)}</select><p>新聊天可选择模型，发送后固定使用该厂商。两家的密钥与预算分别保存。</p>{chat && chat.execution !== "idle" && project && <button disabled={!!state?.busy} onClick={() => startChat(project.id)}>新建聊天选择其他模型</button>}<div className="setting-row"><span>{profile.label} · 思考</span><span className="subtle-badge">{state?.runtime.key ? "密钥已加密保存" : "尚未配置密钥"}</span></div><label className="setting-label" htmlFor="api-key">{profile.providerLabel} API Key</label><div className="key-field"><input id="api-key" type="password" autoComplete="off" spellCheck={false} placeholder={state?.runtime.key ? "输入新密钥以替换" : "输入 API Key"} value={keyInput} onChange={event => setKeyInput(event.target.value)} /><button disabled={keyBusy || !keyInput.trim() || !!state?.busy} onClick={() => void saveKey()}>{keyBusy ? "保存中…" : "保存密钥"}</button></div>{state?.runtime.key && <button className="text-link small" disabled={!!state?.busy} onClick={() => void request({ type: "delete-key", provider: profile.provider })}>删除本机密钥</button>}<div className="connection-check"><button disabled={!state?.runtime.key || checkingConnection || !!state?.busy} onClick={() => void checkConnection()}>{checkingConnection ? "正在验证连接…" : "验证模型连接"}</button><span>{connectionVerified === profile.provider ? "模型接口已响应" : "将发起一次计费请求，计入现有预算"}</span></div><p>密钥由 Windows 加密保存，保存后不回传。任务中选择的代码与工具输出会发送至 {profile.providerLabel} 官方 API；项目文件和命令在本机处理。</p></div>
+      {project && <div className="settings-section"><h3>项目验证 · {project.name}</h3><label className="setting-label" htmlFor="test-command">验证命令（可选）</label><textarea id="test-command" value={testCommand} onChange={event => setTestCommand(event.target.value)} placeholder="填写已准备好的项目测试命令" rows={2} maxLength={2048} /><button className="text-link small" disabled={!!state?.busy} onClick={() => void request({ type: "set-test-command", projectId: project.id, command: testCommand })}>保存验证命令</button><p>命令在隔离副本内运行。只有该命令实际执行并返回成功，才标记通过；它不代替人工审阅。未配置时保留实际工具记录，整体状态为尚未验证。</p></div>}
+      <BudgetSettings state={state} disabled={!!state?.busy || checkingConnection || busy} request={request} /><div className="settings-section"><h3>本地执行环境</h3>{([['engine', 'Codex 0.162.0'], ['shell', 'PowerShell 7.6.5'], ['node', 'Node 24.8.0']] as const).map(([key, label]) => <div className="setting-row" key={key}><span>{label}</span><span className={state?.runtime[key] ? "status-ok" : "status-missing"}>{state?.runtime[key] ? <><Check size={14} />版本校验通过</> : "未找到匹配版本"}</span></div>)}<p>{state?.runtime.bundled ? "运行环境随应用提供并校验；用户项目的依赖仍需提前准备。" : "开发版本使用已验证的本机运行环境。"}</p></div><div className="settings-section"><h3>首版项目范围</h3><p>Windows 小型单包 JS/TS。源码与资源合计 16 MiB，单文件 1 MiB；普通预装依赖合计 64 MiB。暂不支持链接依赖与大型多包项目。</p><div className="setting-row"><span>修改方式</span><span>隔离副本 · 审阅后应用</span></div></div><div className="settings-footer"><span>lcodex {state?.version}</span><span>个人 · 本地使用</span></div></section></div>}
   </div>;
 }

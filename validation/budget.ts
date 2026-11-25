@@ -3,12 +3,14 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { privatePath, readPrivate } from "./private-files.js";
 
-// Integer micro-yuan avoids floating-point accumulation. These limits are user-authorized.
+// Integer millionths avoid floating-point accumulation. Legacy ledgers are CNY.
+// USD is explicitly tagged and cannot be opened as a legacy development ledger.
+export type BudgetCurrency = "CNY" | "USD";
 export const P1_LIMITS = { totalMicros: 10_000_000, trialMicros: 1_000_000, requestsPerTrial: 8 } as const;
 export type BudgetLimits = { totalMicros: number; trialMicros: number; requestsPerTrial: number };
 export type BudgetScope = "development" | "personal";
 type Entry =
-  | { type: "init"; version: 1 | 2; limits: BudgetLimits; scope?: BudgetScope }
+  | { type: "init"; version: 1 | 2 | 3; limits: BudgetLimits; scope?: BudgetScope; currency?: BudgetCurrency }
   | { type: "limits"; limits: BudgetLimits }
   | { type: "authorize-trial"; trial: string; limitMicros: number; decision: string }
   | { type: "reserve"; id: string; trial: string; maxMicros: number }
@@ -39,17 +41,18 @@ export class BudgetLedger {
   }
 
   // Explicit one-time initialization. Opening or retrying never creates a missing ledger.
-  static initialize(file: string, limits: BudgetLimits = P1_LIMITS, scope: BudgetScope = "development"): void {
+  static initialize(file: string, limits: BudgetLimits = P1_LIMITS, scope: BudgetScope = "development", currency: BudgetCurrency = "CNY"): void {
+    check(currency === "CNY" || currency === "USD" && scope === "personal", "BUDGET_CURRENCY_MISMATCH");
     check(BudgetLedger.validLimits(limits) && (scope === "personal" || JSON.stringify(limits) === JSON.stringify(P1_LIMITS)), "BUDGET_WRONG_LIMITS");
     privatePath(path.dirname(file), path.basename(file));
     const fd = openSync(file, "wx", 0o600);
     try {
-      writeFileSync(fd, `${JSON.stringify(scope === "development" ? { type: "init", version: 1, limits } : { type: "init", version: 2, scope, limits })}\n`);
+      writeFileSync(fd, `${JSON.stringify(currency === "USD" ? { type: "init", version: 3, scope, currency, limits } : scope === "development" ? { type: "init", version: 1, limits } : { type: "init", version: 2, scope, limits })}\n`);
       fsyncSync(fd);
     } finally { closeSync(fd); }
   }
 
-  constructor(private file: string, private scope: BudgetScope = "development") {
+  constructor(private file: string, private scope: BudgetScope = "development", readonly currency: BudgetCurrency = "CNY") {
     check(existsSync(file), "BUDGET_LEDGER_MISSING");
     privatePath(path.dirname(file), path.basename(file));
     privatePath(path.dirname(file), path.basename(file) + ".lock");
@@ -61,7 +64,9 @@ export class BudgetLedger {
       check(contents.endsWith("\n"), "BUDGET_CORRUPT");
       const lines = contents.trimEnd().split("\n");
       const init = JSON.parse(lines.shift() ?? "null") as Record<string, unknown> | null;
-      check(init?.type === "init" && (scope === "development" ? init.version === 1 && JSON.stringify(init.limits) === JSON.stringify(P1_LIMITS) : init.version === 2 && init.scope === "personal"), "BUDGET_WRONG_LIMITS");
+      check(init?.type === "init" && (currency === "USD"
+        ? scope === "personal" && init.version === 3 && init.scope === "personal" && init.currency === "USD"
+        : currency === "CNY" && init.currency === undefined && (scope === "development" ? init.version === 1 && JSON.stringify(init.limits) === JSON.stringify(P1_LIMITS) : init.version === 2 && init.scope === "personal")), "BUDGET_WRONG_LIMITS");
       check(init.limits && BudgetLedger.validLimits(init.limits as BudgetLimits), "BUDGET_WRONG_LIMITS");
       this.currentLimits = { ...(init.limits as BudgetLimits) };
       for (const line of lines) this.replay(JSON.parse(line));

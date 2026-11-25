@@ -1,3 +1,4 @@
+import { validationShell } from "./test-runtime.js";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync, linkSync, mkdirSync, readFileSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
@@ -10,7 +11,7 @@ import { inspectApplyJournal } from "./apply-journal.js";
 import { isolatedEnvironment } from "./isolated-env.js";
 import { abandonStoppedIsolatedWorkspace } from "./abandon-isolated.js";
 
-const shell = "C:/Users/lijin/.cache/codex-runtimes/codex-primary-runtime/dependencies/native/powershell/pwsh.exe";
+const shell = validationShell;
 const options = { skip: process.platform !== "win32" || !existsSync(shell), timeout: 90_000 };
 
 test("orderly suspended review reopens frozen bytes, preserves partial outcomes and refuses replay", options, async () => {

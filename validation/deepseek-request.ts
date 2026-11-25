@@ -3,6 +3,7 @@ import { isObject } from "./rpc.js";
 import { ResponsesStream } from "./responses-stream.js";
 import { assertNoKnownSecrets } from "./outbound-data.js";
 import { deepSeekModel, FLASH_MODEL } from "./deepseek-model.js";
+import { providerProfile, validProviderKey, type ProviderId } from "../src/shared/providers.js";
 
 export const PRICE_REVIEW_DATE = "2026-10-20";
 export const REQUEST_RESERVATION_MICROS = 250_000;
@@ -26,8 +27,19 @@ export async function requestDeepSeek(
 // Callers constrain tools and set output limits before this shared, budgeted HTTP entry.
 export async function sendBoundedDeepSeek(ledger: BudgetLedger, trial: string, apiKey: string,
   request: Record<string, unknown>, fetchImpl: typeof fetch = fetch, externalSignal?: AbortSignal, maxInputBytes: 16_384 | 49_152 | typeof PROJECT_MAX_INPUT_BYTES = 16_384) {
-  if (!/^sk-[A-Za-z0-9_-]{16,200}$/.test(apiKey)) throw new Error("API_INVALID_KEY_FORMAT");
-  const model = deepSeekModel(request.model);
+  return sendBoundedModel(ledger, trial, apiKey, request, fetchImpl, externalSignal, maxInputBytes, "deepseek");
+}
+
+export async function sendBoundedModel(ledger: BudgetLedger, trial: string, apiKey: string,
+  request: Record<string, unknown>, fetchImpl: typeof fetch = fetch, externalSignal?: AbortSignal,
+  maxInputBytes: 16_384 | 49_152 | typeof PROJECT_MAX_INPUT_BYTES = 16_384, provider: ProviderId = "deepseek") {
+  const profile = providerProfile(provider);
+  if (ledger.currency !== profile.currency) throw new Error("BUDGET_CURRENCY_MISMATCH");
+  if (!validProviderKey(apiKey, provider)) throw new Error("API_INVALID_KEY_FORMAT");
+  const model = provider === "deepseek" ? deepSeekModel(request.model) : profile;
+  if (provider === "openai" && (request.model !== profile.id || request.service_tier !== "default" ||
+    !isObject(request.prompt_cache_options) || request.prompt_cache_options.mode !== "explicit" ||
+    Object.keys(request.prompt_cache_options).length !== 1)) throw new Error("API_REQUEST_BOUNDS_REQUIRED");
   if (request.stream !== true || request.store !== false ||
     !Number.isSafeInteger(request.max_output_tokens) || Number(request.max_output_tokens) <= 0 || Number(request.max_output_tokens) > model.maxOutputTokens ||
     (model.effort !== "none" && (!isObject(request.reasoning) || request.reasoning.effort !== model.effort)) ||
@@ -39,27 +51,31 @@ export async function sendBoundedDeepSeek(ledger: BudgetLedger, trial: string, a
   if (!tools.every((tool) => isObject(tool) && (tool.type === "function" || tool.type === "custom" && tool.name === "apply_patch"))) throw new Error("API_SERVER_TOOLS_REFUSED");
   if (input.some((item) => isObject(item) && item.type === "custom_tool_call" && item.name !== "apply_patch")) throw new Error("API_INPUT_TYPE_REFUSED");
   const body = JSON.stringify(request);
+  // Explicit caching with no breakpoints prevents unbudgeted cache writes.
+  if (provider === "openai" && /"prompt_cache_breakpoint"\s*:/.test(body)) throw new Error("API_CACHE_WRITE_REFUSED");
   // Keep the original probe windows; the desktop opts into 96 KiB.
   if (![16_384, 49_152, PROJECT_MAX_INPUT_BYTES].includes(maxInputBytes) || Buffer.byteLength(body) > maxInputBytes) throw new Error("API_INPUT_SIZE_LIMIT");
   assertNoKnownSecrets(body, [apiKey]);
   // The supported protocol is text-only (no image/file payloads).
   for (const item of input) {
     const value = item as Record<string, unknown>;
-    if (Array.isArray(value.content) && value.content.some((block) => !isObject(block) || !["input_text", "output_text", "reasoning_text"].includes(String(block.type)))) throw new Error("API_NON_TEXT_REFUSED");
+    if (Array.isArray(value.content) && value.content.some((block) => !isObject(block) || !["input_text", "output_text", "reasoning_text", ...(provider === "openai" ? ["refusal"] : [])].includes(String(block.type)) || block.type === "refusal" && typeof block.refusal !== "string")) throw new Error("API_NON_TEXT_REFUSED");
     if (Array.isArray(value.output)) throw new Error("API_NON_TEXT_REFUSED");
   }
   if (externalSignal?.aborted) throw new Error("API_ABORTED_BEFORE_REQUEST");
   // Pro thinking is included in output_tokens. Reserve its entire output cap
   // plus a conservative UTF-8-byte input bound and protocol allowance. Do not
   // reduce output, omit history or raise the user's budget to make a call fit.
-  const inputBound = model.id === FLASH_MODEL.id ? 100_000 : Buffer.byteLength(body) + 1024;
+  const reasoningItems = input.filter(item => isObject(item) && item.type === "reasoning").length;
+  const inputBound = model.id === FLASH_MODEL.id ? 100_000 : Buffer.byteLength(body) + 1024 + (provider === "openai" ? reasoningItems * model.maxOutputTokens : 0);
+  if (provider === "openai" && inputBound > 272_000) throw new Error("API_INPUT_SIZE_LIMIT");
   const reservation = model.id === FLASH_MODEL.id ? REQUEST_RESERVATION_MICROS
     : inputBound * model.inputMicrosPerToken + Number(request.max_output_tokens) * model.outputMicrosPerToken;
   const id = ledger.reserve(trial, reservation);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 60_000);
   try {
-    const result = await fetchImpl("https://api.deepseek.com/responses", {
+    const result = await fetchImpl(profile.endpoint, {
       method: "POST", redirect: "error", signal: externalSignal ? AbortSignal.any([controller.signal, externalSignal]) : controller.signal,
       headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" }, body,
     });
@@ -93,6 +109,8 @@ export async function sendBoundedDeepSeek(ledger: BudgetLedger, trial: string, a
     const inputTokens = Number(usage.input_tokens);
     const outputTokens = Number(usage.output_tokens);
     const reasoningTokens = isObject(usage.output_tokens_details) ? usage.output_tokens_details.reasoning_tokens : undefined;
+    if (provider === "openai" && isObject(usage.input_tokens_details) &&
+      usage.input_tokens_details.cache_write_tokens !== undefined && usage.input_tokens_details.cache_write_tokens !== 0) throw new Error("API_CACHE_USAGE_UNEXPECTED");
     if (reasoningTokens !== undefined && (!Number.isSafeInteger(reasoningTokens) || Number(reasoningTokens) < 0 || Number(reasoningTokens) > outputTokens)) throw new Error("API_USAGE_INVALID");
     const estimatedMicros = inputTokens * model.inputMicrosPerToken + outputTokens * model.outputMicrosPerToken;
     if (!Number.isSafeInteger(estimatedMicros)) throw new Error("API_USAGE_INVALID");

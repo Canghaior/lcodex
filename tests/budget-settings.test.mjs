@@ -1,3 +1,4 @@
+import { validationShell } from "../dist/validation/test-runtime.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -26,7 +27,7 @@ test("daily price confirmation is local, expires across days and rejects changed
 
 test("explicit budget crash recovery refuses active owners and retains the full pending reservation", { timeout: 30000 }, async () => {
   const run = createRunDirectory("budget crash"), file = path.join(run.root, "usage.jsonl");
-  const shell = "C:/Users/lijin/.cache/codex-runtimes/codex-primary-runtime/dependencies/native/powershell/pwsh.exe";
+  const shell = validationShell;
   const guard = new WindowsFileGuard(shell, run.root);
   BudgetLedger.initialize(file);
   const child = spawn(process.execPath, ["--input-type=module", "-e", `import {BudgetLedger} from './dist/validation/budget.js'; const b=new BudgetLedger(process.argv[1]); b.reserve('crash',250000); console.log('reserved'); process.stdin.resume();`, file], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });

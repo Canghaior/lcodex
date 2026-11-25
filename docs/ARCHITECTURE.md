@@ -4,7 +4,7 @@
 
 ## 技术栈
 
-产品在 `D:\make-codex` 内开发，第一版面向个人本地使用，只接 DeepSeek。
+产品在 `D:\make-codex` 内开发，面向个人本地使用；2026-11-25 按用户要求增加 OpenAI GPT-6.2 Astra，保留 DeepSeek。
 
 | 技术 | 职责 | 状态 |
 | --- | --- | --- |
@@ -14,7 +14,7 @@
 | Electron | 桌面窗口、菜单、应用生命周期及本地进程管理 | 用户已确认 |
 | Node.js 能力 | 在 Electron 本地后台中访问必要的系统能力 | 随 Electron 选定版本核对 |
 | Codex app-server | 首选执行引擎，作为独立本地进程集成 | P1 验证后决定实际采用版本与配置 |
-| DeepSeek API | 模型推理与代码生成服务 | 厂商已确定，具体模型待 P1 |
+| DeepSeek / OpenAI Responses API | 模型推理与代码生成服务 | 两个固定配置；新增 OpenAI 的实测边界见 OPENAI_INTEGRATION |
 
 TypeScript 是带静态类型检查的 JavaScript 扩展，构建后转换为 JavaScript 执行。TSX 是包含界面标记的 TypeScript 源文件形式，不是另一种主要语言。React 和 Electron 是开发工具与运行框架，不是编程语言。
 
@@ -37,12 +37,12 @@ Electron 本地后台
 Codex app-server 本地进程
   模型与工具循环、会话、执行状态、权限执行
         ↕ HTTP Responses
-DeepSeek API
+DeepSeek / OpenAI Responses API
 ```
 
 执行引擎在用户授权项目的隔离副本中修改文件、运行命令和测试；原项目不授予 Agent 写权限。受控后台持有基线与冻结后的审阅版本，在用户点击应用时核对冲突并写回，逐项记录结果。首版不提供一键撤回。引擎与后台能否满足权限、预算、数据和文件保护要求，仍由开发方案 P1 检验；不能以架构图代替控制点的实际能力。
 
-第一版后台运行在用户电脑上，不另设自己的云端应用服务器。模型推理通过 DeepSeek API 完成。
+第一版后台运行在用户电脑上，不另设自己的云端应用服务器。模型推理由当前聊天绑定的厂商官方 API 完成。
 
 ## 各层职责和边界
 
@@ -112,3 +112,9 @@ D:\make-codex\
 - [Electron 进程模型](https://www.electronjs.org/docs/latest/tutorial/process-model)
 
 这些文档解释技术能力；本项目的功能与兼容性证据仍以 P1 实测为准。
+
+## 2026-11-25 F02/F08/F09：OpenAI 接入
+
+共享静态配置限定两个官方端点，不允许项目指令指定自定义端点。每个聊天持久化 provider/model；旧聊天默认 DeepSeek，恢复时核对 task/outcome 与聊天一致。密钥分别以 Windows safeStorage 保存为 deepseek.bin / openai.bin，模型只能获得 loopback 网关令牌。OpenAI 采用独立 USD 版本 3 账本，旧人民币账本格式不变。界面厂商相关命令显式携带目标，后台拒绝切换后过时命令；状态 revision 拒绝过时快照。全局单任务门槛同时覆盖两家。
+
+OpenAI 原生保留 developer 角色及加密思考历史，DeepSeek 继续既有角色映射。共用原有限额、工具检查、隔离副本与审阅控制；不会另建 Agent 循环。具体协议、计费及验证边界见 [OpenAI 接入记录](validation/OPENAI_INTEGRATION.md)。

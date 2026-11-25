@@ -2,14 +2,15 @@ import { app, BrowserWindow, dialog, ipcMain, Menu, net, protocol, session, shel
 import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
-import { validCommand, type AppState, type Reply } from "../shared/contracts.js";
+import { commandProvider, validCommand, type AppState, type Reply } from "../shared/contracts.js";
 import { AppStore } from "./storage/store.js";
 import { assertProjectDataSeparation, inspectProject, newChat, previewFile } from "./projects/projects.js";
 import { WindowsFileGuard } from "../../validation/windows-file-guard.js";
 import { BudgetLedger } from "../../validation/budget.js";
 import { Credentials } from "./storage/credentials.js";
 import { Tasks } from "./engine/tasks.js";
-import { Pricing, PRICE_SOURCE } from "./storage/pricing.js";
+import { Pricing } from "./storage/pricing.js";
+import { PROVIDERS, providerProfile, type ProviderId } from "../shared/providers.js";
 import { runtimePaths, verifyRuntime } from "./runtime.js";
 import { privatePath } from "../../validation/private-files.js";
 
@@ -47,14 +48,20 @@ async function main() {
   startupStage = "RUNTIME";
   const runtime = { ...await verifyRuntime(paths, process.resourcesPath, app.isPackaged), key: false, ready: false, platform: "Windows · MXC", bundled: app.isPackaged };
   const guard = runtime.shell ? new WindowsFileGuard(shell, dataRoot, paths.guard) : undefined;
-  const credentials = new Credentials(dataRoot);
-  const pricing = new Pricing(dataRoot, !app.isPackaged), budgetScope = app.isPackaged ? "personal" : "development";
+  const credentialsByProvider = { deepseek: new Credentials(dataRoot), openai: new Credentials(dataRoot, "openai") };
+  const pricingByProvider = { deepseek: new Pricing(dataRoot, !app.isPackaged), openai: new Pricing(dataRoot, false, "openai") };
+  const budgetScope = app.isPackaged ? "personal" : "development";
   const ledgerFile = app.isPackaged ? path.join(dataRoot, "usage.jsonl") : testRoot && process.env.LCODEX_LIVE_TEST !== "1" ? path.join(testRoot, "test-budget.jsonl") : path.join(sourceRoot, ".local/state/p1-budget.jsonl");
   if (testRoot && process.env.LCODEX_LIVE_TEST !== "1" && !existsSync(ledgerFile)) BudgetLedger.initialize(ledgerFile);
-  let tasks: Tasks | undefined;
+  const tasksByProvider: Partial<Record<ProviderId, Tasks>> = {};
+  const selectedProvider = (): ProviderId => (store.activeChatId ? store.chat(store.activeChatId)?.provider ?? "deepseek" : store.defaultProvider);
+  const allBusy = () => Object.values(tasksByProvider).some(tasks => tasks.busy());
+  let stateRevision = 0;
   const state = (): AppState => {
+    const provider = selectedProvider(), profile = providerProfile(provider);
+    const tasks = tasksByProvider[provider], credentials = credentialsByProvider[provider], pricing = pricingByProvider[provider];
     runtime.key = credentials.present(); runtime.ready = runtime.engine && runtime.shell && runtime.node && runtime.key && !tasks?.budgetError && tasks?.budget().pending === 0 && pricing.status().current;
-    return store.state({ runtime, budget: tasks?.budget() ?? { committed: 0, unknown: 0, estimated: 0, limit: 10, perTask: 1, pending: 0, pendingCost: 0, revision: "", configured: false, scope: budgetScope, error: "RUNTIME_UNAVAILABLE" }, pricing: pricing.status(), executionAvailable: !!tasks });
+    return store.state({ revision: ++stateRevision, provider, busy: allBusy(), runtime, budget: tasks?.budget() ?? { currency: profile.currency, committed: 0, unknown: 0, estimated: 0, limit: 10, perTask: 1, pending: 0, pendingCost: 0, revision: "", configured: false, scope: provider === "openai" ? "personal" : budgetScope, error: "RUNTIME_UNAVAILABLE" }, pricing: pricing.status(), executionAvailable: !!tasks });
   };
   startupStage = "WINDOW";
   const rendererRoot = realpathSync(path.join(sourceRoot, "dist/renderer"));
@@ -81,25 +88,36 @@ async function main() {
   win.webContents.on("will-navigate", event => event.preventDefault());
   win.webContents.on("will-attach-webview", event => event.preventDefault());
   app.on("second-instance", () => { if (win.isMinimized()) win.restore(); win.show(); win.focus(); });
-  if (guard && runtime.engine && runtime.node) tasks = new Tasks({ root: dataRoot, engine, shell, node, scriptDirectory: paths.guard, ledgerFile, budgetScope, pricing, guard, credentials, store,
-    notify: () => { if (!win.isDestroyed()) win.webContents.send("lcodex:state", state()); } });
+  if (guard && runtime.engine && runtime.node) for (const provider of PROVIDERS) {
+    tasksByProvider[provider] = new Tasks({ provider, root: dataRoot, engine, shell, node, scriptDirectory: paths.guard,
+      ledgerFile: provider === "openai" ? path.join(dataRoot, "openai-usage-usd.jsonl") : ledgerFile,
+      budgetScope: provider === "openai" ? "personal" : budgetScope, pricing: pricingByProvider[provider], guard, credentials: credentialsByProvider[provider], store,
+      notify: () => { if (!win.isDestroyed()) win.webContents.send("lcodex:state", state()); } });
+  }
   let closePending = false;
   win.on("close", event => {
-    if (tasks?.busy()) {
+    if (allBusy()) {
       event.preventDefault();
-      if (!closePending) { closePending = true; void tasks.stopAll().then(() => {
+      if (!closePending) { closePending = true; void Promise.all(Object.values(tasksByProvider).map(tasks => tasks.stopAll())).then(() => {
         closePending = false;
         if (store.chats.some(chat => chat.execution === "reconcile")) dialog.showMessageBox(win, { type: "warning", title: "任务需要核对", message: "未能确认最后一次操作的完整结果。记录已保留，请查看任务状态后再关闭。", buttons: ["保留窗口"] });
         else win.close();
       }).catch(() => { closePending = false; }); }
       return;
     }
-    try { tasks?.suspendReviews(); }
+    try { for (const tasks of Object.values(tasksByProvider)) tasks.suspendReviews(); }
     catch { event.preventDefault(); void dialog.showMessageBox(win, { type: "warning", title: "审阅记录需要核对", message: "未能安全保存待应用改动的交接记录。窗口和文件基线已保留，请检查磁盘后重试。", buttons: ["保留窗口"] }); }
   });
-  let choosing = false;
+  let choosing = false, dispatching = false;
   ipcMain.handle("lcodex:request", async (event, command: unknown): Promise<Reply> => {
     if (event.sender !== win.webContents || event.senderFrame !== win.webContents.mainFrame || event.senderFrame?.url !== "lcodex://app/index.html" || !validCommand(command)) return { ok: false, code: "IPC_REFUSED" };
+    const provider = selectedProvider(), target = commandProvider(command);
+    if (target && target !== provider) return { ok: false, code: "PROVIDER_CHANGED" };
+    const tasks = tasksByProvider[provider];
+    const credentials = credentialsByProvider[provider], pricing = pricingByProvider[provider];
+    const serialize = !["snapshot", "open-file", "select-chat", "window", "stop"].includes(command.type);
+    if (serialize && dispatching) return { ok: false, code: "TASK_ALREADY_RUNNING" };
+    if (serialize) dispatching = true;
     try {
       if (command.type === "choose-project") {
         if (choosing) throw new Error("PROJECT_SELECTION_BUSY");
@@ -113,13 +131,20 @@ async function main() {
             const old = store.projects.find(project => project.path.toLowerCase() === candidate.path.toLowerCase());
             if (old) { old.files = candidate.files; old.excluded = candidate.excluded; }
             else store.projects.push(candidate);
-            const chat = newChat(old?.id ?? candidate.id); store.chats.push(chat); store.activeChatId = chat.id;
+            const chat = newChat(old?.id ?? candidate.id, store.defaultProvider); store.chats.push(chat); store.activeChatId = chat.id;
             store.save();
           }
         } finally { choosing = false; }
       } else if (command.type === "new-chat") {
         if (!store.projects.some(project => project.id === command.projectId)) throw new Error("PROJECT_NOT_FOUND");
-        const chat = newChat(command.projectId); store.chats.push(chat); store.activeChatId = chat.id; store.save();
+        const chat = newChat(command.projectId, store.defaultProvider); store.chats.push(chat); store.activeChatId = chat.id; store.save();
+      } else if (command.type === "set-provider") {
+        if (allBusy()) throw new Error("TASK_ALREADY_RUNNING");
+        const chat = store.activeChatId ? store.chat(store.activeChatId) : undefined;
+        if (chat && (chat.execution !== "idle" || chat.messages.length || chat.tools.length || existsSync(path.join(dataRoot, "tasks", chat.id)))) throw new Error("CHAT_MODEL_LOCKED");
+        store.defaultProvider = command.provider;
+        if (chat) { chat.provider = command.provider; chat.model = providerProfile(command.provider).id; }
+        store.save();
       } else if (command.type === "select-chat") {
         if (!store.chats.some(chat => chat.id === command.chatId)) throw new Error("CHAT_NOT_FOUND");
         store.activeChatId = command.chatId; store.save();
@@ -130,29 +155,33 @@ async function main() {
       } else if (command.type === "open-file") {
         const project = store.projects.find(project => project.id === command.projectId);
         if (!project || !guard) throw new Error("PROJECT_UNAVAILABLE");
-        return { ok: true, state: state(), file: await previewFile(project, command.relative, guard) };
+        const file = await previewFile(project, command.relative, guard);
+        return { ok: true, state: state(), file };
       } else if (command.type === "set-key" || command.type === "delete-key") {
-        if (tasks?.busy()) throw new Error("TASK_ALREADY_RUNNING");
+        if (allBusy()) throw new Error("TASK_ALREADY_RUNNING");
         if (command.type === "set-key") await credentials.save(command.key); else credentials.remove();
       } else if (command.type === "set-test-command") {
-        if (tasks?.busy()) throw new Error("TASK_ALREADY_RUNNING");
+        if (allBusy()) throw new Error("TASK_ALREADY_RUNNING");
         const project = store.projects.find(project => project.id === command.projectId); if (!project) throw new Error("PROJECT_NOT_FOUND");
         project.testCommand = command.command.trim(); store.save();
       } else if (["confirm-price", "open-pricing", "configure-budget", "account-unknown", "recover-budget-lock"].includes(command.type)) {
         if (!tasks) throw new Error("RUNTIME_UNAVAILABLE");
-        if (tasks.busy()) throw new Error("TASK_ALREADY_RUNNING");
-        if (command.type === "open-pricing") await desktopShell.openExternal(PRICE_SOURCE);
+        if (allBusy()) throw new Error("TASK_ALREADY_RUNNING");
+        if (command.type === "open-pricing") await desktopShell.openExternal(pricing.status().source);
         if (command.type === "confirm-price") pricing.confirm();
         if (command.type === "configure-budget") tasks.configureBudget(command.totalMicros, command.trialMicros);
         if (command.type === "account-unknown") tasks.accountUnknown(command.revision);
         if (command.type === "recover-budget-lock") await tasks.recoverBudget();
       } else if (command.type === "check-connection") {
         if (!tasks) throw new Error("RUNTIME_UNAVAILABLE");
+        if (allBusy()) throw new Error("TASK_ALREADY_RUNNING");
         await tasks.checkConnection();
-        return { ok: true, state: state(), connectionVerified: true };
+        return { ok: true, state: state(), connectionVerified: true, connectionProvider: provider };
       } else if (["send", "stop", "apply", "discard", "reopen-review", "delete-chat", "abandon-isolated"].includes(command.type)) {
-        if (!("chatId" in command) || !tasks) throw new Error("RUNTIME_UNAVAILABLE");
+        if (!("chatId" in command)) throw new Error("RUNTIME_UNAVAILABLE");
         const chat = store.chat(command.chatId); if (!chat) throw new Error("CHAT_NOT_FOUND");
+        const tasks = tasksByProvider[chat.provider ?? "deepseek"]; if (!tasks) throw new Error("RUNTIME_UNAVAILABLE");
+        if (command.type !== "stop" && allBusy()) throw new Error("TASK_ALREADY_RUNNING");
         const project = store.projects.find(project => project.id === chat.projectId); if (!project) throw new Error("PROJECT_NOT_FOUND");
         await store.hold(chat.id, async () => {
           if (command.type === "send") await tasks.start(chat, project, command.text);
@@ -170,6 +199,7 @@ async function main() {
       }
       return { ok: true, state: state() };
     } catch (error) { return { ok: false, code: error instanceof Error && /^[A-Z][A-Z0-9_]{2,80}$/.test(error.message) ? error.message : "ACTION_FAILED" }; }
+    finally { if (serialize) dispatching = false; }
   });
   startupStage = "LOAD";
   await win.loadURL("lcodex://app/index.html");

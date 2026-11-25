@@ -1,3 +1,4 @@
+import { validationShell } from "./test-runtime.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -11,7 +12,7 @@ import { WindowsFileGuard } from "./windows-file-guard.js";
 import { abandonStoppedIsolatedWorkspace } from "./abandon-isolated.js";
 import { prepareReviewWorkspace } from "./review-workspace.js";
 
-const shell = "C:/Users/lijin/.cache/codex-runtimes/codex-primary-runtime/dependencies/native/powershell/pwsh.exe";
+const shell = validationShell;
 test("explicit isolated abandonment requires the exact task owner to have ended and never alters the original", { skip: process.platform !== "win32" || !existsSync(shell), timeout: 35_000 }, async () => {
   const fixture = createFixture(false), state = path.join(fixture.root, "state"), original = snapshot(fixture.project); mkdirSync(state);
   const script = `

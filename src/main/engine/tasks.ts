@@ -10,8 +10,8 @@ import type { BudgetInfo, Chat, Project } from "../../shared/contracts.js";
 import type { AppStore } from "../storage/store.js";
 import type { Credentials } from "../storage/credentials.js";
 import { confirmedSessionExit, executeSession, safeCode } from "./session.js";
-import { sendBoundedDeepSeek } from "../../../validation/deepseek-request.js";
-import { DESKTOP_MODEL } from "../../../validation/deepseek-model.js";
+import { sendBoundedModel } from "../../../validation/deepseek-request.js";
+import { providerProfile, type ProviderId } from "../../shared/providers.js";
 import { readPrivate, writePrivate } from "../../../validation/private-files.js";
 import { verifyCompletedHistory } from "./history.js";
 import { finishChatDeletion, performChatDeletion, prepareChatDeletion } from "../storage/deletion.js";
@@ -22,7 +22,7 @@ import { assertProjectDataSeparation } from "../projects/projects.js";
 
 type Workspace = Awaited<ReturnType<typeof prepareReviewWorkspace>>;
 type ReviewEntry = { task: Workspace; review: Review; applying: boolean };
-type Options = { engine: string; shell: string; node: string; root: string; ledgerFile: string; budgetScope: BudgetScope; pricing: Pricing; guard: WindowsFileGuard; credentials: Credentials; store: AppStore; notify: () => void; scriptDirectory?: string };
+type Options = { provider?: ProviderId; engine: string; shell: string; node: string; root: string; ledgerFile: string; budgetScope: BudgetScope; pricing: Pricing; guard: WindowsFileGuard; credentials: Credentials; store: AppStore; notify: () => void; scriptDirectory?: string };
 export class Tasks {
   private active: { chatId: string; abort: AbortController; done: Promise<void> } | undefined;
   private reviews = new Map<string, ReviewEntry>();
@@ -32,11 +32,13 @@ export class Tasks {
   private reconciling = false;
   private lastBudget: BudgetInfo;
   budgetError: string | null = null;
+  private readonly profile;
   constructor(private readonly options: Options) {
-    this.lastBudget = { committed: 0, unknown: 0, estimated: 0, limit: 10, perTask: 1, pending: 0, pendingCost: 0, revision: "", configured: false, scope: options.budgetScope, error: null };
+    this.profile = providerProfile(options.provider);
+    this.lastBudget = { currency: this.profile.currency, committed: 0, unknown: 0, estimated: 0, limit: 10, perTask: 1, pending: 0, pendingCost: 0, revision: "", configured: false, scope: options.budgetScope, error: null };
     this.refreshBudget();
   }
-  private openLedger() { return new BudgetLedger(this.options.ledgerFile, this.options.budgetScope); }
+  private openLedger() { return new BudgetLedger(this.options.ledgerFile, this.options.budgetScope, this.profile.currency); }
   private openForRequest() {
     const ledger = this.openLedger();
     try {
@@ -50,7 +52,7 @@ export class Tasks {
   private refreshBudget() { try { const ledger = this.openLedger(); try { this.recordBudget(ledger); this.budgetError = null; } finally { ledger.close(); } } catch (error) { this.budgetError = safeCode(error, "BUDGET_UNAVAILABLE"); } }
   private recordBudget(ledger: BudgetLedger) {
     const info = ledger.summary(), limits = ledger.limits(), pending = ledger.pendingRequests();
-    this.lastBudget = { committed: info.committedMicros / 1_000_000, unknown: info.unknownMicros / 1_000_000, estimated: info.estimatedMicros / 1_000_000,
+    this.lastBudget = { currency: this.profile.currency, committed: info.committedMicros / 1_000_000, unknown: info.unknownMicros / 1_000_000, estimated: info.estimatedMicros / 1_000_000,
       limit: limits.totalMicros / 1_000_000, perTask: limits.trialMicros / 1_000_000, pending: pending.length, pendingCost: pending.reduce((sum, request) => sum + request.maxMicros, 0) / 1_000_000,
       revision: contentHash(JSON.stringify(pending)), configured: true, scope: this.options.budgetScope, error: null };
   }
@@ -59,7 +61,7 @@ export class Tasks {
     if (this.busy()) throw new Error("TASK_ALREADY_RUNNING");
     if (this.options.budgetScope !== "personal") throw new Error("BUDGET_CONFIGURATION_REFUSED");
     const limits = { totalMicros, trialMicros, requestsPerTrial: 8 };
-    if (!existsSync(this.options.ledgerFile)) BudgetLedger.initialize(this.options.ledgerFile, limits, "personal");
+    if (!existsSync(this.options.ledgerFile)) BudgetLedger.initialize(this.options.ledgerFile, limits, "personal", this.profile.currency);
     else { const ledger = this.openLedger(); try { ledger.configure(limits); } finally { ledger.close(); } }
     this.refreshBudget(); this.options.notify();
   }
@@ -88,8 +90,8 @@ export class Tasks {
     try {
       key = await this.options.credentials.read();
       this.ledger = this.openForRequest();
-      const result = await sendBoundedDeepSeek(this.ledger, `connect-${randomUUID()}`, key, { model: DESKTOP_MODEL.id, stream: true, store: false,
-        input: [{ role: "user", content: [{ type: "input_text", text: "Reply with CONNECTION_OK." }] }], tools: [], tool_choice: "none", max_output_tokens: DESKTOP_MODEL.maxOutputTokens, reasoning: { effort: DESKTOP_MODEL.effort } }, fetch, this.connectionAbort.signal);
+      const result = await sendBoundedModel(this.ledger, `connect-${randomUUID()}`, key, { model: this.profile.id, ...(this.profile.provider === "openai" ? { service_tier: "default", prompt_cache_options: { mode: "explicit" }, include: ["reasoning.encrypted_content"] } : {}), stream: true, store: false,
+        input: [{ role: "user", content: [{ type: "input_text", text: "Reply with CONNECTION_OK." }] }], tools: [], tool_choice: "none", max_output_tokens: this.profile.maxOutputTokens, reasoning: { effort: this.profile.effort } }, fetch, this.connectionAbort.signal, 16_384, this.profile.provider);
       if (result.response.status !== "completed") throw new Error("API_CONNECTION_INCOMPLETE");
       this.budgetError = null;
     } finally {
@@ -98,7 +100,17 @@ export class Tasks {
     }
   }
   private publish(save = true) { if (save) this.options.store.save(); this.options.notify(); }
+  private checkProfile(chat: Chat) {
+    if ((chat.provider ?? "deepseek") !== this.profile.provider || (chat.model ?? providerProfile("deepseek").id) !== this.profile.id) throw new Error("CHAT_MODEL_MISMATCH");
+    for (const file of ["task.json", "outcome.json"]) {
+      const relative = "tasks/" + chat.id + "/" + file;
+      if (!existsSync(path.join(this.options.root, relative))) continue;
+      const saved = JSON.parse(readPrivate(this.options.root, relative));
+      if ((saved.provider ?? "deepseek") !== this.profile.provider || (saved.model ?? providerProfile("deepseek").id) !== this.profile.id) throw new Error("CHAT_MODEL_MISMATCH");
+    }
+  }
   async start(chat: Chat, project: Project, prompt: string) {
+    this.checkProfile(chat);
     assertProjectDataSeparation(project.path, this.options.root);
     if (this.busy()) throw new Error("TASK_ALREADY_RUNNING");
     this.options.pricing.requireCurrent();
@@ -139,7 +151,7 @@ export class Tasks {
       mkdirSync(root, { recursive: true }); mkdirSync(state, { recursive: true });
       task = await prepareReviewWorkspace(project.path, state, this.options.guard);
       const prepared = task;
-      const taskRecord = JSON.stringify({ chatId: chat.id, projectId: project.id, taskDirectory: task.taskDirectory, runRoot: root, previousTurnId: resume?.turnId ?? null, mode: chat.mode, state: "prepared" });
+      const taskRecord = JSON.stringify({ provider: this.profile.provider, model: this.profile.id, chatId: chat.id, projectId: project.id, taskDirectory: task.taskDirectory, runRoot: root, previousTurnId: resume?.turnId ?? null, mode: chat.mode, state: "prepared" });
       writeFileSync(path.join(root, "task.json"), taskRecord, { flag: "wx" }); writePrivate(chatRoot, "task.json", taskRecord);
       const captured = JSON.parse(readFileSync(path.join(task.taskDirectory, "private/baseline.json"), "utf8"));
       if (chat.mode === "write") {
@@ -147,7 +159,7 @@ export class Tasks {
         if (!manifest || JSON.parse(Buffer.from(manifest.base64, "base64").toString("utf8")).workspaces) throw new Error("PROJECT_SCOPE_UNSUPPORTED");
       }
       if (abort.signal.aborted) throw new Error("TASK_USER_STOP");
-      const result = await executeSession({ ...this.options, priceConfirmedOn: this.options.pricing.requireCurrent(), root, historyHome: path.join(chatRoot, "home"), ...(resume ? { resume } : {}), workspace: task.workspace, privateDir: path.join(task.taskDirectory, "private"), original: project.path,
+      const result = await executeSession({ ...this.options, provider: this.profile.provider, priceConfirmedOn: this.options.pricing.requireCurrent(), root, historyHome: path.join(chatRoot, "home"), ...(resume ? { resume } : {}), workspace: task.workspace, privateDir: path.join(task.taskDirectory, "private"), original: project.path,
         rootMarker: task.rootMarker, readOnlyAssets: task.readOnlyAssets, readOnlyDirectories: task.readOnlyDirectories,
         projectFiles: captured.files.map((file: { relative: string }) => file.relative),
         mode: chat.mode, prompt, testCommand: project.testCommand ?? "", key, ledger: this.ledger!, signal: abort.signal,
@@ -193,8 +205,8 @@ export class Tasks {
         },
       });
       processKnownEnded = result.processesEnded;
-      writeFileSync(path.join(root, "outcome.json"), JSON.stringify(result), { flag: "wx" });
-      writePrivate(chatRoot, "outcome.json", JSON.stringify(result));
+      writeFileSync(path.join(root, "outcome.json"), JSON.stringify({ ...result, provider: this.profile.provider, model: this.profile.id }), { flag: "wx" });
+      writePrivate(chatRoot, "outcome.json", JSON.stringify({ ...result, provider: this.profile.provider, model: this.profile.id }));
       chat.error = result.code;
       finalExecution = result.status === "completed" ? "ended" : result.status === "reconcile" ? "reconcile" : result.status;
       if (result.status !== "completed") return;
@@ -220,7 +232,7 @@ export class Tasks {
       if (task && processKnownEnded && finalExecution !== "reconcile" && !this.reviews.has(chat.id)) {
         try {
           if (!existsSync(path.join(root, "outcome.json"))) {
-            const stoppedBeforeLaunch = JSON.stringify({ status: "failed", code: chat.error, threadId: null, turnId: null, cleanExit: true, requests: 0, started: false });
+            const stoppedBeforeLaunch = JSON.stringify({ provider: this.profile.provider, model: this.profile.id, status: "failed", code: chat.error, threadId: null, turnId: null, cleanExit: true, requests: 0, started: false });
             writePrivate(root, "outcome.json", stoppedBeforeLaunch); writePrivate(chatRoot, "outcome.json", stoppedBeforeLaunch);
           }
           task.close();
@@ -247,6 +259,7 @@ export class Tasks {
     this.options.store.save();
   }
   async reopenReview(chat: Chat, project: Project) {
+    this.checkProfile(chat);
     if (this.busy()) throw new Error("TASK_ALREADY_RUNNING");
     if (chat.execution !== "reconcile" || !chat.reviewId || this.reviews.has(chat.id)) throw new Error("REVIEW_UNAVAILABLE");
     this.reconciling = true;
@@ -283,6 +296,7 @@ export class Tasks {
     } finally { this.reconciling = false; }
   }
   async abandonIsolated(chat: Chat, project: Project) {
+    this.checkProfile(chat);
     if (this.busy() || this.reviews.has(chat.id) || chat.execution !== "reconcile" || chat.reviewId || chat.changes.length) throw new Error("TASK_ABANDON_RECONCILE_REQUIRED");
     this.reconciling = true;
     try {

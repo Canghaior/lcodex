@@ -1,17 +1,30 @@
 import { deepSeekModel } from "./deepseek-model.js";
 import { mapDeepSeekRoles } from "./deepseek-roles.js";
+import { providerProfile, type ProviderId } from "../src/shared/providers.js";
 
 const finalInstruction = "This is the task's final permitted model request because a request or tool limit prevents further work. No tools are available now. Stop planning tool calls and answer the user in plain language using only evidence already obtained. State the actual reached limit, findings, unfinished or unverified work, and a next step. Do not emit tool-call markup or invent results. Keep the answer within about 450 Chinese characters or 220 English words so it fits the output budget.";
 
 // Deliberately omit engine-only metadata/cache identifiers and unreviewed fields.
-export function prepareEngineModelRequest(request: Record<string, unknown>, tools: Record<string, unknown>[], options: { finalResponseOnly?: boolean; progressInstruction?: string } = {}) {
-  const model = deepSeekModel(request.model);
+export function prepareEngineModelRequest(request: Record<string, unknown>, tools: Record<string, unknown>[], options: { finalResponseOnly?: boolean; progressInstruction?: string; provider?: ProviderId } = {}) {
+  const provider = options.provider ?? "deepseek";
+  const model = provider === "deepseek" ? deepSeekModel(request.model) : providerProfile(provider);
+  if (provider === "openai" && request.model !== model.id) throw new Error("API_MODEL_MISMATCH");
   if (request.previous_response_id || request.conversation || request.background) throw new Error("API_UNSUPPORTED_ENGINE_STATE");
   if (request.instructions !== undefined && typeof request.instructions !== "string") throw new Error("API_ENGINE_INSTRUCTIONS_INVALID");
   // DeepSeek inserts `instructions` at the beginning. Put the current boundary
   // after the historical tool results as a trusted system message, and remove
   // available tools while retaining every historical call/result and its ID.
   const guidance = [options.progressInstruction, options.finalResponseOnly ? finalInstruction : undefined].filter(Boolean).join("\n");
+  if (provider === "openai") {
+    // 6.2 appends current instructions after input. Preserve all historical
+    // roles, items and encrypted reasoning; do not apply DeepSeek role mapping.
+    return { model: model.id, input: request.input, tools: options.finalResponseOnly ? [] : tools,
+      tool_choice: tools.length && !options.finalResponseOnly ? "auto" : "none", stream: true, store: false,
+      max_output_tokens: model.maxOutputTokens, reasoning: { effort: model.effort }, parallel_tool_calls: false,
+      service_tier: "default", prompt_cache_options: { mode: "explicit" },
+      include: ["reasoning.encrypted_content"],
+      ...([request.instructions, guidance].filter(Boolean).length ? { instructions: [request.instructions, guidance].filter(Boolean).join("\n") } : {}) };
+  }
   const input = guidance && Array.isArray(request.input)
     ? [...request.input, { type: "message", role: "system", content: guidance }]
     : request.input;

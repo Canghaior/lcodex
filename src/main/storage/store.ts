@@ -4,10 +4,13 @@ import { createHash } from "node:crypto";
 import type { AppState, Chat, Project } from "../../shared/contracts.js";
 import { privatePath, readPrivate, writePrivate } from "../../../validation/private-files.js";
 
-type Stored = { version: 1 | 2; projects: Project[]; chats: Chat[]; activeChatId: string | null };
+import { isProvider, providerProfile, type ProviderId } from "../../shared/providers.js";
+
+type Stored = { defaultProvider?: ProviderId; version: 1 | 2; projects: Project[]; chats: Chat[]; activeChatId: string | null };
 const idPattern = /^[a-f0-9-]{36}$/;
 const summary = (chat: Chat): Chat => ({ ...chat, messages: [], tools: [], changes: chat.changes.map(change => ({ ...change, before: "", after: "" })) });
 function validateChat(chat: Chat) {
+  if (chat?.provider !== undefined && !isProvider(chat.provider) || chat?.model !== undefined && chat.model !== providerProfile(chat.provider ?? "deepseek").id) throw new Error("STORAGE_MODEL_INVALID");
   if (!chat || !idPattern.test(chat.id) || !idPattern.test(chat.projectId) || typeof chat.title !== "string" || !["read", "write"].includes(chat.mode) ||
     !["idle", "running", "waiting", "stopping", "stopped", "failed", "reconcile", "ended"].includes(chat.execution) ||
     !Array.isArray(chat.messages) || !Array.isArray(chat.tools) || !Array.isArray(chat.changes) || chat.changes.length > 1024) throw new Error("STORAGE_INVALID");
@@ -34,6 +37,7 @@ export class AppStore {
     if (![1, 2].includes(data.version) || !Array.isArray(data.projects) || !Array.isArray(data.chats) || data.chats.length > 1000 ||
       data.projects.some(project => !idPattern.test(project.id) || typeof project.path !== "string" || !Array.isArray(project.files)) ||
       new Set(data.chats.map(chat => chat.id)).size !== data.chats.length) throw new Error("STORAGE_INVALID");
+    if (data.defaultProvider !== undefined && !isProvider(data.defaultProvider)) throw new Error("STORAGE_MODEL_INVALID");
     this.value = data;
     for (const chat of data.chats) {
       validateChat(chat); if (!data.projects.some(project => project.id === chat.projectId)) throw new Error("STORAGE_INVALID");
@@ -42,6 +46,8 @@ export class AppStore {
     }
     if (data.version === 1) this.save();
   }
+  get defaultProvider(): ProviderId { return this.value.defaultProvider ?? "deepseek"; }
+  set defaultProvider(value: ProviderId) { if (!isProvider(value)) throw new Error("MODEL_PROVIDER_INVALID"); this.value.defaultProvider = value; }
   get projects() { return this.value.projects; }
   // Inactive entries contain metadata; call chat() before accessing full content.
   get chats() { return this.value.chats; }
@@ -54,6 +60,8 @@ export class AppStore {
       const loaded = JSON.parse(readPrivate(this.directory, `chats/${id}.json`, 224 * 1024 * 1024)) as Chat;
       validateChat(loaded);
       if (loaded.id !== id || loaded.projectId !== chat.projectId) throw new Error("STORAGE_INVALID");
+      if ((loaded.provider ?? "deepseek") !== (chat.provider ?? "deepseek") ||
+        (loaded.model ?? providerProfile("deepseek").id) !== (chat.model ?? providerProfile("deepseek").id)) throw new Error("STORAGE_MODEL_INVALID");
       if (this.startupRecovery.has(id)) { recovered(loaded); this.startupRecovery.delete(id); }
       Object.assign(chat, loaded);
     }
@@ -74,7 +82,7 @@ export class AppStore {
       if (this.savedHashes.get(chat.id) !== hash) { writePrivate(this.directory, `chats/${chat.id}.json`, text); this.savedHashes.set(chat.id, hash); }
       this.loaded.add(chat.id); this.known.add(chat.id);
     }
-    const index = { version: 2, projects: this.projects, chats: this.chats.map(summary), activeChatId: this.activeChatId };
+    const index = { version: 2, defaultProvider: this.defaultProvider, projects: this.projects, chats: this.chats.map(summary), activeChatId: this.activeChatId };
     writePrivate(this.directory, "workspace.json", JSON.stringify(index)); this.value.version = 2;
   }
   forget(id: string) {

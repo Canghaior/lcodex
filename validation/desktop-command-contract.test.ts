@@ -1,3 +1,4 @@
+import { validationShell } from "./test-runtime.js";
 import assert from "node:assert/strict";
 import test from "node:test";
 import path from "node:path";
@@ -59,7 +60,7 @@ test("history unwraps the recorded workspace across restarts and retains legacy 
 test("actual PowerShell refuses an unexpected starting directory before any side effect", () => {
   const run = createRunDirectory("command cwd 中文");
   const expected = path.join(run.root, "expected ' project"), wrong = path.join(run.root, "wrong");
-  const shell = path.join(process.env.USERPROFILE!, ".cache/codex-runtimes/codex-primary-runtime/dependencies/native/powershell/pwsh.exe");
+  const shell = validationShell;
   mkdirSync(expected); mkdirSync(wrong);
   try {
     const command = guardedPowerShellCommand("Set-Content -LiteralPath './sentinel.txt' -Value 'EXECUTED' -NoNewline", expected);

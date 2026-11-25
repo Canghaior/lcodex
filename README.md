@@ -1,13 +1,13 @@
-# DeepSeek 桌面编程助手
+# lcodex 桌面编程助手
 
-目标是开发一款接入 DeepSeek 的本地桌面编程助手：选择项目后，通过自然语言完成代码阅读、修改和测试，并能查看执行过程与文件差异。
+目标是开发一款接入 DeepSeek 和 OpenAI 的本地桌面编程助手：选择项目后，通过自然语言完成代码阅读、修改和测试，并能查看执行过程与文件差异。
 
 P1 已在用户确认的小型 JS/TS 项目范围内通过。桌面已走通真实 DeepSeek 修复、差异审阅、应用、重启审阅及再次续聊；只读、停止与冲突保护有实际桌面联测。P3 当前范围核心条件已通过，P4 已生成带运行时的 Windows 0.0.1 安装候选。当前 Pro/high 三类基础任务各三次功能验收通过；第一轮功能截图超时已零 API 补齐，旧失败保留。复杂源码阅读仍失败，完整交付验收尚未完成。证据见 [桌面检查](docs/validation/P2_DESKTOP.md)、[恢复检查](docs/validation/P3_RECOVERY.md)、[分发验证](docs/validation/P4_PACKAGING.md)、[历史真实模型验收](docs/validation/P4_ACCEPTANCE.md)和[最新思考稳定性验证](docs/validation/P4_STABILITY.md)。首次操作见[候选版使用说明](docs/USER_GUIDE.md)。
 
 - [开发方案](docs/DEVELOPMENT_PLAN.md)：产品范围、技术路线、阶段任务和验收标准。
 - [编程执行计划](docs/IMPLEMENTATION_PLAN.md)：P0 至 P4 的开发工作包、执行顺序、检查条件和 GitHub 同步规则。
 - [技术架构](docs/ARCHITECTURE.md)：已确认的 TypeScript、React、CSS、Electron 技术栈，分层职责、计划目录与本地 Git 保存规则。
-- [界面要求](docs/UI_SPEC.md)：用户指定的 Codex 风格布局、视觉参考与 DeepSeek 模型区域。
+- [界面要求](docs/UI_SPEC.md)：用户指定的 Codex 风格布局、视觉参考与模型区域。
 - [补充建议评审](docs/PLAN_REVIEW.md)：逐项处理结果、官方资料核对、工作量和待决定事项。
 - [执行记录](docs/PROGRESS.md)：当前阶段、下一步、验证证据和决策记录。
 - [P1 门槛核对](docs/validation/P1_GATE_REVIEW.md)：已通过的限定样本、剩余阻塞和路线判断；避免将局部成功当作阶段完成。
@@ -24,11 +24,15 @@ P1 已在用户确认的小型 JS/TS 项目范围内通过。桌面已走通真�
 - [开发约定](AGENTS.md)：后续开发必须遵守的范围和工作流程。
 - [文件清理规则](docs/WORKSPACE_HYGIENE.md)：测试与临时数据的保留边界、磁盘检查和安全清理方式。
 
-当前方案为 0.9，优先服务已有本地项目的个人开发者，围绕代码理解、bug 修复和小功能开发。用户已明确 Codex 风格的界面方向，以及 TypeScript、React、CSS、Electron 技术栈和应用分层，模型只接 DeepSeek。首个可用版本采用已验证的原生 Windows、固定 Codex 0.162.0 与 DeepSeek 官方 API；范围外能力继续扩展。
+当前方案为 0.10，优先服务已有本地项目的个人开发者，围绕代码理解、bug 修复和小功能开发。用户已明确 Codex 风格的界面方向，以及 TypeScript、React、CSS、Electron 技术栈和应用分层，模型保留 DeepSeek，2026-11-25 按用户要求增加 GPT-6.2 Astra；已使用用户自己的 Key 通过限定真实连接、修复和重启续聊；不代表复杂源码验收通过。首个可用版本采用已验证的原生 Windows、固定 Codex 0.162.0 与 DeepSeek 官方 API；范围外能力继续扩展。
 
 初始方案已保存在本地 Git 的 `main` 分支根提交中；用户已授权同步到 [GitHub 仓库](https://github.com/Canghaior/lcodex)。每个完成并检查的小工作包或阶段提交并推送，不设定时任务；实际同步结果见执行记录。
 
 用户已恢复完整 P4，要求先稳定本机思考任务，再做虚拟机验收。桌面默认 `deepseek-v4-pro` / `high`，版本与价格已按官方资料核对；首次失败见 [思考模式验证](docs/validation/P4_THINKING.md)，本轮命令参数、验证轮次和进程收尾修正见 [稳定性检查](docs/validation/P4_STABILITY.md)。此前三类各三次 9/9 属于 Flash 配置，不当作 Pro 的通过证据。D01 隔离副本修改、审阅后应用及 D02 首版后置一键撤回保持，已验证的安全边界不能因换模型而省略。
+
+## 使用自己的 OpenAI Key
+
+双击根目录 `start-lcodex.cmd`（使用 `.local/desktop` 配置），在新聊天的“设置 → 当前聊天模型”选择 **GPT-6.2 Astra**，填入 OpenAI Key，再设定独立的美元预算并核对价格。密钥由 Windows 加密；保存设置不会调用 API，“验证模型连接”和发送任务会计费。已发送的 DeepSeek 聊天仍使用 DeepSeek。验证范围及尚未完成的实测见 [OpenAI 接入记录](docs/validation/OPENAI_INTEGRATION.md)。
 
 ## 开发检查
 
@@ -56,3 +60,5 @@ Windows 构建使用 `npm run package:win`；按[分发验证](docs/validation/P
 `node tests/packaged-live.mjs --live` 为显式计费验收，三类各三次使用新建合成项目，叠加原有开发预算账本；凭据通过隐藏输入提供。真实源码模式 `--kind=real-read` 会发送所选项目片段至 DeepSeek，必须先取得对应数据授权。当前真实源码复测、干净 Windows 和用户实际体验仍待核对，不以小样本通过代替。
 
 本地引擎握手另运行 `npm run validate:offline -- "<codex.exe 绝对路径>"`，需要 P1 环境文档中登记的引擎版本与哈希。此命令不调用模型、不开启编程任务、不验证实际沙箱权限。原始生成文件在 `.local/`，不提交到 GitHub。
+
+开发与打包优先使用 `.local/engines/powershell-7.6.5` 下的固定运行时，仍校验原 SHA-256；没有该目录才检查旧 Codex 缓存。缓存被升级时不得放宽哈希要求。历史原生单测已统一使用固定运行时定位，原断言不变；缓存漂移的首次失败与修复记录见 OpenAI 接入记录。

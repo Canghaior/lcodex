@@ -8,7 +8,8 @@ import { listPackage, statFile } from "@electron/asar";
 
 const root = realpathSync("."), stage = path.join(root, ".local/package"), output = path.join(root, ".local/releases");
 const engine = path.join(root, ".local/engines/codex-0.162.0/package/vendor/x86_64-pc-windows-msvc");
-const shell = path.join(process.env.USERPROFILE, ".cache/codex-runtimes/codex-primary-runtime/dependencies/native/powershell");
+const pinnedShell = path.join(root, ".local/engines/powershell-7.6.5");
+const shell = existsSync(path.join(pinnedShell, "pwsh.exe")) ? pinnedShell : path.join(process.env.USERPROFILE, ".cache/codex-runtimes/codex-primary-runtime/dependencies/native/powershell");
 const node = path.join(root, ".local/engines/node-24.8.0/node-v24.8.0-win-x64");
 const digest = file => createHash("sha256").update(readFileSync(file)).digest("hex");
 const ownDirectory = directory => {

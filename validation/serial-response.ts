@@ -22,7 +22,7 @@ async function interruptible(action: () => Promise<void>, signal: AbortSignal) {
 // item before releasing any tool. This content never grants execution rights.
 function checkReasoning(item: Record<string, unknown>, events: Record<string, unknown>[]) {
   const relevant = events.filter(event => String(event.type).startsWith("response.reasoning_text.") || String(event.type).startsWith("response.content_part."));
-  if (!relevant.length && item.content === undefined) return;
+  if (!relevant.length && (item.content === undefined || item.content === null)) return;
   requireValue(Array.isArray(item.content) && item.content.length <= 128);
   const parts = item.content.map(part => {
     requireValue(isObject(part) && part.type === "reasoning_text" && typeof part.text === "string");
@@ -96,6 +96,7 @@ export function prepareSerialResponse(wire: string, response: Record<string, unk
       else if (type.startsWith("response.reasoning_text.")) requireValue(group.item.type === "reasoning");
       else if (type.startsWith("response.content_part.")) requireValue(group.item.type === "message" || group.item.type === "reasoning");
       else if (type.startsWith("response.output_text.")) requireValue(group.item.type === "message");
+      else if (type === "response.refusal.delta" || type === "response.refusal.done") requireValue(group.item.type === "message");
       else requireValue(false);
     }
     group.events.push(event);

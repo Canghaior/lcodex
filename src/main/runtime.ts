@@ -13,7 +13,9 @@ export function runtimePaths(sourceRoot: string, resources: string, packaged: bo
     node: path.join(resources, "runtimes/node/node.exe"), guard: path.join(resources, "guard"),
   } : {
     engine: path.join(sourceRoot, ".local/engines/codex-0.162.0/package/vendor/x86_64-pc-windows-msvc/bin/codex.exe"),
-    shell: path.join(userHome, ".cache/codex-runtimes/codex-primary-runtime/dependencies/native/powershell/pwsh.exe"),
+    shell: existsSync(path.join(sourceRoot, ".local/engines/powershell-7.6.5/pwsh.exe"))
+      ? path.join(sourceRoot, ".local/engines/powershell-7.6.5/pwsh.exe")
+      : path.join(userHome, ".cache/codex-runtimes/codex-primary-runtime/dependencies/native/powershell/pwsh.exe"),
     node: "C:/nvm4w/nodejs/node.exe", guard: path.join(sourceRoot, "validation"),
   };
 }

@@ -4,12 +4,12 @@ import { createServer } from "node:http";
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { BudgetLedger } from "../../../validation/budget.js";
-import { PROJECT_MAX_INPUT_BYTES, sendBoundedDeepSeek } from "../../../validation/deepseek-request.js";
+import { PROJECT_MAX_INPUT_BYTES, sendBoundedModel } from "../../../validation/deepseek-request.js";
 import { localDay } from "../storage/pricing.js";
 import { prepareEngineModelRequest } from "../../../validation/engine-model-request.js";
 import { isolatedEnvironment } from "../../../validation/isolated-env.js";
 import { validationCatalog } from "../../../validation/model-catalog.js";
-import { DESKTOP_MODEL } from "../../../validation/deepseek-model.js";
+import { providerProfile, type ProviderId } from "../../shared/providers.js";
 import { assertNoKnownSecrets } from "../../../validation/outbound-data.js";
 import { desktopCommandContract, desktopCommandHistory } from "../../../validation/desktop-command-contract.js";
 import { SessionProgress, assertFinalAnswer } from "../../../validation/session-progress.js";
@@ -23,7 +23,7 @@ import { writePrivate } from "../../../validation/private-files.js";
 import { spawnOwnedEngine } from "../../../validation/owned-engine.js";
 import { verifyCompletedHistory } from "./history.js";
 
-export type EngineOptions = { engine: string; shell: string; node: string; root: string; workspace: string; privateDir: string; original: string; rootMarker: string;
+export type EngineOptions = { provider?: ProviderId; engine: string; shell: string; node: string; root: string; workspace: string; privateDir: string; original: string; rootMarker: string;
   readOnlyAssets: string[]; readOnlyDirectories: string[]; mode: TaskMode; prompt: string; testCommand: string; key: string; ledger: BudgetLedger;
   signal: AbortSignal; onEvent: (method: string, params: unknown) => void; onIdentity: (threadId: string, turnId: string) => void;
   fetchImpl?: typeof fetch; historyHome?: string; resume?: { threadId: string; turnId: string }; onProcessStarted?: () => void; priceConfirmedOn: string; projectFiles?: string[]; scriptDirectory?: string;
@@ -39,6 +39,7 @@ const wait = async <T>(promise: Promise<T>, ms: number): Promise<T | undefined> 
 // still owns the conversation/tool loop; this adapter only enforces its boundary.
 export async function executeSession(options: EngineOptions): Promise<EngineResult> {
   const { engine, shell, node, root, workspace, original, key, ledger, mode } = options;
+  const model = providerProfile(options.provider);
   const historyHome = options.historyHome ?? path.join(root, "home");
   requireValue(localDay() === options.priceConfirmedOn, "PRICE_REVIEW_REQUIRED");
   requireValue(!options.signal.aborted, "TASK_USER_STOP");
@@ -72,7 +73,7 @@ export async function executeSession(options: EngineOptions): Promise<EngineResu
   const progress = new SessionProgress(options.testCommand, mode === "write");
   const gate = new ToolResponseGate(limits, abort, { failure: fail,
     completed: result => progress.completed(result), event: kind => { if (kind === "started") progress.started(); } });
-  let activeUpstream: ReturnType<typeof sendBoundedDeepSeek> | undefined;
+  let activeUpstream: ReturnType<typeof sendBoundedModel> | undefined;
   let activeRequest: Promise<void> | undefined;
   const server = createServer((req, res) => {
     const handle = async () => {
@@ -85,7 +86,7 @@ export async function executeSession(options: EngineOptions): Promise<EngineResu
         const body = new TextDecoder("utf8", { fatal: true }).decode(Buffer.concat(chunks));
         assertNoKnownSecrets(body, [key, token]);
         const parsed: unknown = JSON.parse(body);
-        if (!isObject(parsed) || !Array.isArray(parsed.tools)) throw new Error("GATEWAY_REQUEST_INVALID");
+        if (!isObject(parsed) || parsed.model !== model.id || !Array.isArray(parsed.tools)) throw new Error("GATEWAY_REQUEST_INVALID");
         limits.request(); requests++;
         const usage = limits.summary();
         const remainingTools = TASK_LIMITS.tools - usage.tools;
@@ -97,8 +98,8 @@ export async function executeSession(options: EngineOptions): Promise<EngineResu
         // than eight model requests were used. Never permit a thirteenth tool.
         const finalResponseOnly = requests === TASK_LIMITS.requests || remainingTools === 0 || remainingRounds === 0;
         const request = prepareEngineModelRequest({ ...parsed, input: desktopCommandHistory(parsed.input) }, tools,
-          { finalResponseOnly, progressInstruction: progress.instruction(requests, remainingTools, remainingRounds) });
-        activeUpstream = sendBoundedDeepSeek(ledger, trial, key, request, options.fetchImpl ?? fetch, abort.signal, PROJECT_MAX_INPUT_BYTES);
+          { provider: model.provider, finalResponseOnly, progressInstruction: progress.instruction(requests, remainingTools, remainingRounds) });
+        activeUpstream = sendBoundedModel(ledger, trial, key, request, options.fetchImpl ?? fetch, abort.signal, PROJECT_MAX_INPUT_BYTES, model.provider);
         const result = await activeUpstream;
         limits.check();
         requireValue(result.terminalType === "response.completed", result.terminalType === "response.incomplete" ? "API_RESPONSE_INCOMPLETE" : "API_RESPONSE_FAILED");
@@ -134,14 +135,14 @@ export async function executeSession(options: EngineOptions): Promise<EngineResu
     await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
     const address = server.address(); if (!address || typeof address === "string") throw new Error("GATEWAY_NO_PORT");
     const catalog = validationCatalog(true, mode === "read", mode === "write", true);
-    catalog.models[0]!.slug = DESKTOP_MODEL.id;
-    catalog.models[0]!.display_name = `${DESKTOP_MODEL.label} · 高强度思考`;
-    catalog.models[0]!.default_reasoning_level = DESKTOP_MODEL.effort;
-    catalog.models[0]!.supported_reasoning_levels = [{ effort: DESKTOP_MODEL.effort, description: "High thinking for coding tasks" }];
+    catalog.models[0]!.slug = model.id;
+    catalog.models[0]!.display_name = `${model.label} · 高强度思考`;
+    catalog.models[0]!.default_reasoning_level = model.effort;
+    catalog.models[0]!.supported_reasoning_levels = [{ effort: model.effort, description: "High thinking for coding tasks" }];
     catalog.models[0]!.base_instructions = `You are a coding assistant in an isolated project copy. ${mode === "read" ? "This task is read-only. Analyse and explain; do not modify files or install anything." : "Read relevant code, reproduce issues, implement the requested change, and verify."} When the user names a source path, inspect that path first and avoid repeated directory inventories. Keep reads focused on relevant excerpts. Preserve unrelated files. Be concise. Report actual results and limitations, never claim tests you did not run. Reply in the user's language.`;
     writePrivate(historyHome, "models.json", JSON.stringify(catalog));
     writePrivate(historyHome, "config.toml", [
-      `model=${quote(DESKTOP_MODEL.id)}`, 'model_provider="workflow"', `model_reasoning_effort=${quote(DESKTOP_MODEL.effort)}`, `model_catalog_json=${quote(path.join(historyHome, "models.json"))}`,
+      `model=${quote(model.id)}`, 'model_provider="workflow"', `model_reasoning_effort=${quote(model.effort)}`, `model_catalog_json=${quote(path.join(historyHome, "models.json"))}`,
       `project_root_markers=[${quote(options.rootMarker)}]`, 'approval_policy="never"', 'default_permissions="scoped"', 'web_search="disabled"', 'allow_login_shell=false',
       '[windows]', 'sandbox="mxc"', '[permissions.scoped.filesystem]', '":minimal"="read"', `${quote(workspace)}="${mode === "read" ? "read" : "write"}"`,
       `${quote(original)}="deny"`, `${quote(options.privateDir)}="deny"`, `${quote(historyHome)}="deny"`, `${quote(path.join(workspace, options.rootMarker))}="read"`,
@@ -149,8 +150,8 @@ export async function executeSession(options: EngineOptions): Promise<EngineResu
       ...[".git", ".env", ".codex", ".agents"].map(relative => `${quote(path.join(workspace, relative))}="deny"`),
       `${quote(path.dirname(node))}="read"`, `${quote(path.dirname(shell))}="read"`, `${quote(path.dirname(process.env.COMSPEC ?? "C:/Windows/System32/cmd.exe"))}="read"`, `${quote(path.join(root, "profile/local/Packages"))}="write"`,
       '[permissions.scoped.network]', 'enabled=false', '[features]', 'multi_agent=false', 'apps=false', 'plugins=false', 'hooks=false', 'goals=false', 'shell_snapshot=false', 'browser_use=false', 'computer_use=false', 'image_generation=false',
-      '[shell_environment_policy]', 'inherit="all"', 'ignore_default_excludes=false', '[shell_environment_policy.filters]', 'LCODEX_WORKFLOW_TOKEN="exclude"', 'DEEPSEEK_API_KEY="exclude"',
-      '[analytics]', 'enabled=false', '[model_providers.workflow]', 'name="lcodex bounded DeepSeek"', `base_url="http://127.0.0.1:${address.port}/v1"`, 'wire_api="responses"', 'requires_openai_auth=false', 'env_key="LCODEX_WORKFLOW_TOKEN"', 'request_max_retries=0', 'stream_max_retries=0', '',
+      '[shell_environment_policy]', 'inherit="all"', 'ignore_default_excludes=false', '[shell_environment_policy.filters]', 'LCODEX_WORKFLOW_TOKEN="exclude"', 'DEEPSEEK_API_KEY="exclude"', 'OPENAI_API_KEY="exclude"',
+      '[analytics]', 'enabled=false', '[model_providers.workflow]', 'name="lcodex bounded provider"', `base_url="http://127.0.0.1:${address.port}/v1"`, 'wire_api="responses"', 'requires_openai_auth=false', 'env_key="LCODEX_WORKFLOW_TOKEN"', 'request_max_retries=0', 'stream_max_retries=0', '',
     ].join("\n"));
     requireValue(!abort.signal.aborted, "TASK_USER_STOP");
     owner = (options.spawnImpl ?? spawnOwnedEngine)({ engine, shell, root, cwd: workspace, env, args: ["app-server", "--listen", "stdio://", "--strict-config"],
@@ -188,7 +189,7 @@ export async function executeSession(options: EngineOptions): Promise<EngineResu
     const threadParameters = { cwd: workspace, approvalPolicy: "never", approvalsReviewer: "user",
       developerInstructions: `Work only in the current isolated project copy. It is a fresh snapshot of the original project; previous tool paths and permissions are historical and no longer valid. ${projectContext} Mode=${mode}. For exec_command supply only cmd. The host supplies pinned PowerShell, login=false, the current isolated workdir, a 30000 ms wait and 1024 output token cap; do not add these parameters yourself. ${toolOrder} Command limit 45 seconds, task limit 8 model requests including the final answer. Node executable: ${node}; use --preserve-symlinks --preserve-symlinks-main before its arguments. No network, dependency installation or escalation. ${options.testCommand ? `The user-selected verification command is exactly: ${options.testCommand}. Run it before and after changes as a separate exec_command call with exactly that cmd string; do not prepend or append other commands, so its exit status can be identified.` : "No verification command was configured. Inspect existing project instructions and report which checks you actually ran; missing tests must remain unverified."} Do not modify protected resources, dependencies, root marker, credentials or unrelated user work. Final response: changes, files, actual checks/results, unfinished work and next step. Changes are pending review, never claim the original project was modified.` };
     const thread = options.resume
-      ? await rpc.request("thread/resume", { ...threadParameters, threadId: options.resume.threadId, model: DESKTOP_MODEL.id, modelProvider: "workflow", config: { default_permissions: "scoped" } })
+      ? await rpc.request("thread/resume", { ...threadParameters, threadId: options.resume.threadId, model: model.id, modelProvider: "workflow", config: { default_permissions: "scoped" } })
       : await rpc.request("thread/start", { ...threadParameters, ephemeral: false });
     if (!isObject(thread) || !isObject(thread.thread) || typeof thread.thread.id !== "string") throw new Error("ENGINE_THREAD_INVALID");
     threadId = thread.thread.id;

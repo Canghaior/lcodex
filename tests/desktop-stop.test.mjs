@@ -23,6 +23,7 @@ for (const restartApplication of [false, true]) test(`desktop Stop preserves unk
     await app.evaluate(({ dialog }, directory) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [directory] }); }, original);
     await page.getByRole("button", { name: "选择项目", exact: true }).click();
     await page.getByRole("heading", { name: "一起构建 process project" }).waitFor();
+    assert.equal((await page.evaluate(() => window.lcodex.request({ type: "confirm-price", provider: "deepseek" }))).ok, true);
     const keyReply = await page.evaluate(() => window.lcodex.request({ type: "set-key", key: "sk-synthetic-stop-not-a-real-credential" }));
     assert.equal(keyReply.ok, true);
     const chatId = keyReply.state.activeChatId;

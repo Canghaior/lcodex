@@ -42,6 +42,7 @@ test("desktop real MXC tools: encrypted key, read-only mode, frozen review, appl
     await app.evaluate(({ dialog }, directory) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [directory] }); }, project);
     await page.getByRole("button", { name: "选择项目", exact: true }).click();
     await page.getByRole("heading", { name: "一起构建 catalog project" }).waitFor();
+    assert.equal((await page.evaluate(() => window.lcodex.request({ type: "confirm-price", provider: "deepseek" }))).ok, true);
     await page.getByRole("button", { name: "设置", exact: true }).click();
     await page.getByLabel("DeepSeek API Key", { exact: true }).fill(key);
     await page.getByRole("button", { name: "保存密钥", exact: true }).click();

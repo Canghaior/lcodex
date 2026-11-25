@@ -1,3 +1,4 @@
+import { validationShell } from "./test-runtime.js";
 import assert from "node:assert/strict";
 import test from "node:test";
 import path from "node:path";
@@ -9,7 +10,7 @@ import { createRunDirectory } from "./run-directory.js";
 import { isolatedEnvironment } from "./isolated-env.js";
 import { createProcessTreeFixture, verifyTreeStopped, waitForProcessTree } from "./workflow-lifecycle.js";
 
-const shell = path.join(process.env.USERPROFILE!, ".cache/codex-runtimes/codex-primary-runtime/dependencies/native/powershell/pwsh.exe");
+const shell = validationShell;
 for (const mode of ["explicit-stop", "owner-crash", "parent-exit"] as const) test(`owned job ends all descendants after ${mode}`, { timeout: 20000 }, async () => {
   const run = createRunDirectory("job owner 中文");
   for (const name of ["temp", "profile/local", "profile/roaming"]) mkdirSync(path.join(run.root, name), { recursive: true });
