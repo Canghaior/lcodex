@@ -2,7 +2,7 @@
 
 目标是开发一款接入 DeepSeek 和 OpenAI 的本地桌面编程助手：选择项目后，通过自然语言完成代码阅读、修改和测试，并能查看执行过程与文件差异。
 
-**2026-11-28 当前安排：先审阅剩余工作方案，再由用户另行决定开工时间。** [详细架构与实现方案（草案）](docs/design/REMAINING_WORK_REVIEW.md)覆盖 34 项待办、模块设计、工作包、依赖和验收。方案保存不代表功能完成或已开始开发；以下已有功能与验证状态保持。
+**2026-11-28 已按双窗口方案开工，首项是默认 AppData 下的 npm 超时。** 开发窗口交付候选，独立验收后逐项推进。[34 项工作总览](docs/design/REMAINING_WORK_REVIEW.md) · [双窗口协作](docs/design/DUAL_WINDOW_DELIVERY.md) · [当前进度](docs/PROGRESS.md)
 
 P1 已在用户确认的小型 JS/TS 项目范围内通过。桌面已走通真实 DeepSeek 修复、差异审阅、应用、重启审阅及再次续聊；只读、停止与冲突保护有实际桌面联测。P3 当前范围核心条件已通过，P4 已生成带运行时的 Windows 0.0.1 安装候选。当前 Pro/high 三类基础任务各三次功能验收通过；第一轮功能截图超时已零 API 补齐，旧失败保留。复杂源码阅读仍失败，完整交付验收尚未完成。证据见 [桌面检查](docs/validation/P2_DESKTOP.md)、[恢复检查](docs/validation/P3_RECOVERY.md)、[分发验证](docs/validation/P4_PACKAGING.md)、[历史真实模型验收](docs/validation/P4_ACCEPTANCE.md)和[最新思考稳定性验证](docs/validation/P4_STABILITY.md)。首次操作见[候选版使用说明](docs/USER_GUIDE.md)。
 

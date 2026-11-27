@@ -27,7 +27,7 @@ export type EngineOptions = { provider?: ProviderId; engine: string; shell: stri
   readOnlyAssets: string[]; readOnlyDirectories: string[]; mode: TaskMode; prompt: string; testCommand: string; key: string; ledger: BudgetLedger;
   signal: AbortSignal; onEvent: (method: string, params: unknown) => void; onIdentity: (threadId: string, turnId: string) => void;
   fetchImpl?: typeof fetch; historyHome?: string; resume?: { threadId: string; turnId: string }; onProcessStarted?: () => void; priceConfirmedOn: string; projectFiles?: string[]; scriptDirectory?: string;
-  spawnImpl?: typeof spawnOwnedEngine };
+  runtimeRoot?: string; spawnImpl?: typeof spawnOwnedEngine };
 export type EngineResult = { status: "completed" | "stopped" | "failed" | "reconcile"; code: string | null; threadId: string | null; turnId: string | null; cleanExit: boolean; processesEnded: boolean; reconciledExit: boolean; requests: number };
 export const confirmedSessionExit = (value: Record<string, unknown>) => value.cleanExit === true || value.processesEnded === true && value.reconciledExit === true;
 export const safeCode = (error: unknown, fallback: string) => error instanceof Error && /^[A-Z][A-Z0-9_-]{2,80}$/.test(error.message) ? error.message : fallback;
@@ -41,20 +41,28 @@ export async function executeSession(options: EngineOptions): Promise<EngineResu
   const { engine, shell, node, root, workspace, original, key, ledger, mode } = options;
   const model = providerProfile(options.provider);
   const historyHome = options.historyHome ?? path.join(root, "home");
+  // MXC places its AppContainer temp tree below the isolated profile. Keep
+  // that profile out of the deeper per-chat turn journal on Windows AppData.
+  const runtimeRoot = options.runtimeRoot ?? root;
+  const packages = path.join(runtimeRoot, "profile/local/Packages");
   requireValue(localDay() === options.priceConfirmedOn, "PRICE_REVIEW_REQUIRED");
   requireValue(!options.signal.aborted, "TASK_USER_STOP");
   assertNoKnownSecrets(options.prompt, [key]);
-  for (const relative of ["home", "profile/roaming", "profile/local/Packages", "temp"]) mkdirSync(path.join(root, relative), { recursive: true });
+  // Keep the original turn environment available to history-only recovery,
+  // whose persisted runRoot and process-ownership records remain unchanged.
+  for (const directory of new Set([root, runtimeRoot])) {
+    for (const relative of ["profile/roaming", "profile/local/Packages", "temp"]) mkdirSync(path.join(directory, relative), { recursive: true });
+  }
   mkdirSync(historyHome, { recursive: true });
   const token = randomUUID(), trial = `desktop-${randomUUID()}`;
-  const env: NodeJS.ProcessEnv = { ...isolatedEnvironment(root, process.env), CODEX_HOME: historyHome, LCODEX_WORKFLOW_TOKEN: token };
+  const env: NodeJS.ProcessEnv = { ...isolatedEnvironment(runtimeRoot, process.env), CODEX_HOME: historyHome, LCODEX_WORKFLOW_TOKEN: token };
   env.PATH = [path.dirname(node), path.dirname(shell), path.join(process.env.SystemRoot ?? "C:/Windows", "System32"), process.env.SystemRoot ?? "C:/Windows"].join(path.delimiter);
   env.NODE_OPTIONS = "--preserve-symlinks --preserve-symlinks-main";
   // npm 11 enables Node's disk compile cache on startup. In the fixed MXC
   // profile that path can stall before any command output; no cache is needed
   // for a bounded task. Do not broaden filesystem grants to accommodate it.
   env.NODE_DISABLE_COMPILE_CACHE = "1";
-  env.NPM_CONFIG_CACHE = path.join(root, "profile/local/Packages/npm-cache");
+  env.NPM_CONFIG_CACHE = path.join(packages, "npm-cache");
   env.NPM_CONFIG_UPDATE_NOTIFIER = "false";
   env.NPM_CONFIG_FUND = "false";
   // Retain only fixed lifecycle flags, never engine stderr text or tool data.
@@ -148,7 +156,7 @@ export async function executeSession(options: EngineOptions): Promise<EngineResu
       `${quote(original)}="deny"`, `${quote(options.privateDir)}="deny"`, `${quote(historyHome)}="deny"`, `${quote(path.join(workspace, options.rootMarker))}="read"`,
       ...options.readOnlyAssets.map(relative => `${quote(path.join(workspace, relative))}="read"`), ...options.readOnlyDirectories.map(relative => `${quote(path.join(workspace, relative))}="read"`),
       ...[".git", ".env", ".codex", ".agents"].map(relative => `${quote(path.join(workspace, relative))}="deny"`),
-      `${quote(path.dirname(node))}="read"`, `${quote(path.dirname(shell))}="read"`, `${quote(path.dirname(process.env.COMSPEC ?? "C:/Windows/System32/cmd.exe"))}="read"`, `${quote(path.join(root, "profile/local/Packages"))}="write"`,
+      `${quote(path.dirname(node))}="read"`, `${quote(path.dirname(shell))}="read"`, `${quote(path.dirname(process.env.COMSPEC ?? "C:/Windows/System32/cmd.exe"))}="read"`, `${quote(packages)}="write"`,
       '[permissions.scoped.network]', 'enabled=false', '[features]', 'multi_agent=false', 'apps=false', 'plugins=false', 'hooks=false', 'goals=false', 'shell_snapshot=false', 'browser_use=false', 'computer_use=false', 'image_generation=false',
       '[shell_environment_policy]', 'inherit="all"', 'ignore_default_excludes=false', '[shell_environment_policy.filters]', 'LCODEX_WORKFLOW_TOKEN="exclude"', 'DEEPSEEK_API_KEY="exclude"', 'OPENAI_API_KEY="exclude"',
       '[analytics]', 'enabled=false', '[model_providers.workflow]', 'name="lcodex bounded provider"', `base_url="http://127.0.0.1:${address.port}/v1"`, 'wire_api="responses"', 'requires_openai_auth=false', 'env_key="LCODEX_WORKFLOW_TOKEN"', 'request_max_retries=0', 'stream_max_retries=0', '',

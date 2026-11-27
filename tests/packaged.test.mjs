@@ -8,7 +8,7 @@ import { createRunDirectory } from "../dist/validation/run-directory.js";
 import { stopAndCloseDesktop, waitForFreshDesktop } from "./desktop-helpers.mjs";
 import { createAppDataProfile } from "./appdata-profile.mjs";
 
-for (const location of ["workspace", "Windows AppData"]) {
+for (const location of ["workspace", "Windows AppData", "Windows AppData historical depth"]) {
 test(`packaged read, test, review and restart with ${location} profile and no developer PATH`, { timeout: 180000 }, async () => {
   const run = createRunDirectory("packaged 中文"), project = path.join(run.root, "catalog project");
   const executable = realpathSync(process.env.LCODEX_PACKAGE_EXECUTABLE ?? ".local/releases/win-unpacked/lcodex.exe");
@@ -26,7 +26,7 @@ test(`packaged read, test, review and restart with ${location} profile and no de
   assert.notEqual(spawnSync(node, [acceptor, path.join(project, "catalog.mjs")]).status, 0, "Initial independent baseline must reproduce the defect");
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => ["SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "APPDATA", "LOCALAPPDATA"].includes(key.toUpperCase())));
   Object.assign(env, { PATH: path.join(process.env.SystemRoot, "System32"), TEMP: path.join(run.root, "temp"), TMP: path.join(run.root, "temp") });
-  const roaming = location === "Windows AppData" ? createAppDataProfile(run) : undefined;
+  const roaming = location === "workspace" ? undefined : createAppDataProfile(run, location === "Windows AppData" ? 0 : 104);
   // Pass the logical Windows path unchanged: resolving it in the test would
   // conceal the production bug this scenario must catch.
   const profile = roaming?.logical ?? path.join(run.root, "profile/roaming");
@@ -37,7 +37,7 @@ test(`packaged read, test, review and restart with ${location} profile and no de
     let page = await waitForFreshDesktop(app);
     const info = await app.evaluate(({ app }) => ({ packaged: app.isPackaged, data: app.getPath("userData") }));
     assert.equal(info.packaged, true); assert.equal(info.data, realpathSync.native(profile));
-    console.log(JSON.stringify({ profileLocation: location, virtualized: realpathSync(profile) !== realpathSync.native(profile) }));
+    console.log(JSON.stringify({ profileLocation: location, virtualized: realpathSync(profile) !== info.data, nativeLength: info.data.length }));
     const initial = await page.evaluate(() => window.lcodex.request({ type: "snapshot" }));
     assert.equal(initial.state.version, JSON.parse(readFileSync("package.json", "utf8")).version);
     assert.deepEqual([initial.state.runtime.engine, initial.state.runtime.shell, initial.state.runtime.node], [true, true, true]);
@@ -115,7 +115,8 @@ test(`packaged read, test, review and restart with ${location} profile and no de
     assert.equal(resumed.state.budget.limit, 2); assert.equal(resumed.state.budget.perTask, 0.5); assert.equal(resumed.state.runtime.key, true);
     assert.equal(readFileSync(".local/state/p1-budget.jsonl", "utf8"), originalBudget);
     mkdirSync(".local/reports", { recursive: true });
-    await page.screenshot({ path: `.local/reports/packaged-review-${location === "workspace" ? "workspace" : "appdata"}.png` });
+    const screenshotVariant = location === "workspace" ? "workspace" : location === "Windows AppData" ? "appdata" : "appdata-deep";
+    await page.screenshot({ path: `.local/reports/packaged-review-${screenshotVariant}.png` });
     clean = true;
   } finally {
     await stopAndCloseDesktop(app);

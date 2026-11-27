@@ -57,7 +57,7 @@ for (const scenario of ["message", "reaped-message", "function_call", "custom_to
         readOnlyAssets: [], readOnlyDirectories: [], mode: "write", prompt: "Read source.txt and report the observed evidence.",
         testCommand: "", key: "sk-synthetic-session-limit-only", ledger, signal: abort.signal, priceConfirmedOn: localDay(),
         onIdentity: () => {}, onEvent: (method, params) => events.push({ method, params }),
-        ...(scenario === "reaped-message" ? { spawnImpl: options => {
+        ...(scenario === "reaped-message" ? { runtimeRoot: path.join(run.root, "runtime"), spawnImpl: options => {
           const owner = spawnOwnedEngine(options);
           // Fault injection: a completed real engine never receives EOF. The
           // production 25s deadline must reap its job, then use a separate real

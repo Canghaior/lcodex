@@ -159,7 +159,8 @@ export class Tasks {
         if (!manifest || JSON.parse(Buffer.from(manifest.base64, "base64").toString("utf8")).workspaces) throw new Error("PROJECT_SCOPE_UNSUPPORTED");
       }
       if (abort.signal.aborted) throw new Error("TASK_USER_STOP");
-      const result = await executeSession({ ...this.options, provider: this.profile.provider, priceConfirmedOn: this.options.pricing.requireCurrent(), root, historyHome: path.join(chatRoot, "home"), ...(resume ? { resume } : {}), workspace: task.workspace, privateDir: path.join(task.taskDirectory, "private"), original: project.path,
+      const result = await executeSession({ ...this.options, provider: this.profile.provider, priceConfirmedOn: this.options.pricing.requireCurrent(), root,
+        runtimeRoot: task.taskDirectory, historyHome: path.join(chatRoot, "home"), ...(resume ? { resume } : {}), workspace: task.workspace, privateDir: path.join(task.taskDirectory, "private"), original: project.path,
         rootMarker: task.rootMarker, readOnlyAssets: task.readOnlyAssets, readOnlyDirectories: task.readOnlyDirectories,
         projectFiles: captured.files.map((file: { relative: string }) => file.relative),
         mode: chat.mode, prompt, testCommand: project.testCommand ?? "", key, ledger: this.ledger!, signal: abort.signal,
