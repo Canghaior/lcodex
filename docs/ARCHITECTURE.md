@@ -1,5 +1,7 @@
 # 技术栈与代码架构
 
+2026-11-28：本文件继续作为已确认技术栈与分层基线。针对未完成事项新增[核心架构草案](design/REMAINING_WORK_ARCHITECTURE.md)和[扩展设计](design/REMAINING_WORK_EXTENSIONS.md)，均待用户审阅；批准方案与另行开工分开，不把拟新增模块记作现有实现。
+
 日期：2026 年 10 月 20 日。状态：P1–P3 当前范围核心条件通过；P4 使用独立捆绑运行时与严格打包清单，已有 0.0.1 Windows 候选。完整安装与用户验收仍按 P4 执行，依据见 validation/P4_PACKAGING.md。
 
 ## 技术栈
